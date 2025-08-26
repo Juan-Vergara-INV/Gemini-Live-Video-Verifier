@@ -1,7 +1,3 @@
-# System packages for Streamlit Cloud deployment
-# These will be installed with apt-get
-
-# Tesseract OCR engine and language packs
 tesseract-ocr
 tesseract-ocr-eng
 tesseract-ocr-spa
@@ -17,17 +13,13 @@ tesseract-ocr-ind
 tesseract-ocr-fra
 tesseract-ocr-rus
 
-# FFmpeg for audio/video processing
 ffmpeg
 
-# Image processing libraries
 libgl1-mesa-glx
 libglib2.0-0
 
-# Audio processing dependencies
 libsndfile1
 libasound2-dev
 portaudio19-dev
 
-# Performance optimization
 build-essential
