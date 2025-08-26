@@ -1,2 +1,71 @@
+# Streamlit Configuration for Video Analysis Performance Optimization
+# Optimized for Streamlit Cloud deployment with video processing workloads
+
 [server]
-maxUploadSize = 2000
+# Increase upload limit for large video files
+maxUploadSize = 2000  # 2GB limit for video files
+
+# Performance optimizations
+headless = true
+enableCORS = true
+enableXsrfProtection = false
+
+# Threading and concurrency
+runOnSave = false
+fileWatcherType = "none"
+
+# Address and port configuration
+address = "0.0.0.0"
+port = 8501
+
+[browser]
+# Disable automatic browser opening in production
+gatherUsageStats = false
+serverAddress = "0.0.0.0"
+
+[client]
+# Optimize client-side performance
+caching = true
+displayEnabled = true
+showErrorDetails = true
+
+# Timeout configurations for long-running video analysis
+toolbarMode = "minimal"
+
+[runner]
+# Optimize script runner for video processing
+magicEnabled = true
+installTracer = false
+fixMatplotlib = true
+
+# Memory and performance settings
+enforceSerializableSessionState = false
+enumCoercion = "off"
+
+[mapbox]
+# Disable mapbox if not needed (saves memory)
+token = ""
+
+[deprecation]
+# Handle deprecation warnings efficiently
+showPyplotGlobalUse = false
+showImageFormat = false
+
+# Additional performance settings for video analysis
+[server.fileWatcher]
+blacklist = ["*.tmp", "*.temp", "*~", ".#*", "temp/*", "analysis_output/*", "backups/*"]
+
+# Global settings for better performance
+[global]
+# Reduce overhead for video processing apps
+developmentMode = false
+logLevel = "error"
+suppressDeprecationWarnings = true
+
+# Custom settings for our video analyzer
+[custom]
+# These are read by our application code
+enableParallelProcessing = true
+maxConcurrentAnalyses = 3
+enableAudioCaching = true
+optimizeForStreamlitCloud = true

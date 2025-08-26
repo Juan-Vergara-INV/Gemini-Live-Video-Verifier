@@ -63,12 +63,44 @@ class Config:
     ANNOTATION_FONT_SCALE: float = 0.6
     ANNOTATION_THICKNESS: int = 2
     
-    # Resource limits
+    # Resource limits (optimized for Streamlit Cloud)
     MAX_FILE_SIZE: int = 500 * 1024 * 1024 # 500MB
     MAX_VIDEO_DURATION: int = 1200  # 20 minutes
-    MAX_CONCURRENT_ANALYSES: int = 10
+    MAX_CONCURRENT_ANALYSES: int = 3  # Reduced for Streamlit Cloud
     SESSION_TIMEOUT: int = 3600  # 1 hour
     
+    # Streamlit Cloud optimizations
+    STREAMLIT_CLOUD_MODE: bool = True
+    ENABLE_PERFORMANCE_MONITORING: bool = True
+    AGGRESSIVE_MEMORY_CLEANUP: bool = True
+    
+    @staticmethod
+    def detect_streamlit_cloud() -> bool:
+        """Detect if running on Streamlit Cloud and adjust settings accordingly."""
+        try:
+            import os
+            # Check for Streamlit Cloud environment indicators
+            streamlit_indicators = [
+                os.getenv('STREAMLIT_SHARING_MODE'),
+                os.getenv('STREAMLIT_SERVER_HEADLESS'),
+                os.getenv('STREAMLIT_CLOUD'),
+                'streamlit' in os.getenv('HOME', '').lower(),
+                'app' in os.getenv('USER', '').lower()
+            ]
+            
+            is_cloud = any(indicator for indicator in streamlit_indicators)
+            
+            if is_cloud:
+                logger.info("Streamlit Cloud environment detected - applying optimizations")
+                # Override settings for cloud environment
+                Config.MAX_CONCURRENT_ANALYSES = 2  # More conservative for cloud
+                Config.AGGRESSIVE_MEMORY_CLEANUP = True
+                
+            return is_cloud
+        except Exception as e:
+            logger.warning(f"Could not detect environment: {e}")
+            return False
+
     # Memory limits calculated dynamically based on system capacity
     @staticmethod
     def get_memory_limits() -> Dict[str, float]:
@@ -78,39 +110,48 @@ class Config:
             total_memory_gb = psutil.virtual_memory().total / (1024**3)
             available_memory_gb = psutil.virtual_memory().available / (1024**3)
             
-            if available_memory_gb >= 4.0:  # If we have 4GB+ available
+            # Detect if we're on Streamlit Cloud (typically has ~1GB memory limit)
+            is_cloud = Config.detect_streamlit_cloud()
+            
+            if is_cloud or total_memory_gb <= 2:  # Streamlit Cloud or very limited environment
+                return {
+                    "min_available_gb": 0.1,
+                    "max_usage_percent": 85,
+                    "per_session_gb": min(0.8, available_memory_gb * 0.8)  # Conservative for cloud
+                }
+            elif available_memory_gb >= 4.0:  # If we have 4GB+ available
                 per_session_gb = min(2.0, available_memory_gb * 0.6)  # Use up to 60% of available
             elif available_memory_gb >= 3.0:  # If we have 3-4GB available
                 per_session_gb = min(1.5, available_memory_gb * 0.65)  # Use up to 65% of available
             elif available_memory_gb >= 2.0:  # If we have 2-3GB available
                 per_session_gb = min(1.2, available_memory_gb * 0.7)  # Use up to 70% of available
             else:  # Less than 2GB available
-                per_session_gb = max(1.0, available_memory_gb * 0.75)  # Use up to 75% of available
+                per_session_gb = max(0.8, available_memory_gb * 0.75)  # Use up to 75% of available
             
-            if total_memory_gb <= 8:  # Small dev container
+            if total_memory_gb <= 8:  # Small dev container or cloud
                 return {
-                    "min_available_gb": 0.2,
-                    "max_usage_percent": 97,
+                    "min_available_gb": 0.15,
+                    "max_usage_percent": 90,
                     "per_session_gb": per_session_gb
                 }
             elif total_memory_gb <= 16:  # Medium dev/test environment
                 return {
                     "min_available_gb": 0.3,
-                    "max_usage_percent": 93,
+                    "max_usage_percent": 88,
                     "per_session_gb": per_session_gb
                 }
             else:  # Production environment
                 return {
                     "min_available_gb": 0.5,
-                    "max_usage_percent": 88,
+                    "max_usage_percent": 85,
                     "per_session_gb": per_session_gb
                 }
         except:
-            # Fallback
+            # Fallback for Streamlit Cloud
             return {
-                "min_available_gb": 0.2,
-                "max_usage_percent": 95,
-                "per_session_gb": 1.8
+                "min_available_gb": 0.1,
+                "max_usage_percent": 85,
+                "per_session_gb": 0.8
             }
     
     # Security validation
@@ -2055,6 +2096,12 @@ class FileManager:
 class AudioAnalyzer:
     """Audio processing for voice and language detection with voice separation capabilities."""
     
+    # Class-level shared Whisper model to prevent concurrent loading issues
+    _shared_whisper_model = None
+    _whisper_model_lock = threading.RLock()
+    _model_loading_condition = threading.Condition(_whisper_model_lock)
+    _model_loading = False
+    
     def __init__(self):
         self.whisper_model = None
         self.speech_recognizer = sr.Recognizer()
@@ -2062,22 +2109,63 @@ class AudioAnalyzer:
         self.voice_features_cache = {}
         # Performance optimization: cache loaded audio data
         self._audio_cache = {}
-        self._audio_cache_max_size = 3  # Limit cache size to prevent memory issues
+        
+        # Adaptive cache size based on environment
+        if Config.detect_streamlit_cloud():
+            self._audio_cache_max_size = 1  # Minimal cache for cloud
+            logger.info("Streamlit Cloud detected: using minimal audio cache")
+        else:
+            self._audio_cache_max_size = 3  # Standard cache for local/dev
     
     def load_whisper_model(self, model_size: str = "tiny") -> bool:
-        """Load Whisper transcription model with optimization."""
+        """Load Whisper transcription model with thread-safe shared loading."""
         try:
             # Optimization: Use tiny model by default for faster processing
-            # User can override if higher accuracy is needed
-            if model_size == "base":
+            # Force tiny model on Streamlit Cloud for performance
+            if Config.detect_streamlit_cloud():
+                model_size = "tiny"  # Always use fastest model on cloud
+                logger.info("Streamlit Cloud: forced tiny Whisper model for optimal performance")
+            elif model_size == "base":
                 model_size = "tiny"  # Default to faster model
                 logger.info("Using 'tiny' Whisper model for faster processing")
             
-            self.whisper_model = whisper.load_model(model_size)
-            logger.info(f"Whisper model '{model_size}' loaded successfully")
-            return True
+            # Use shared model to prevent concurrent loading issues
+            with AudioAnalyzer._model_loading_condition:
+                # If shared model is already loaded, use it
+                if AudioAnalyzer._shared_whisper_model is not None:
+                    self.whisper_model = AudioAnalyzer._shared_whisper_model
+                    logger.info(f"Using existing shared Whisper model '{model_size}'")
+                    return True
+                
+                # If another thread is loading, wait for it to complete
+                while AudioAnalyzer._model_loading:
+                    logger.info("Whisper model loading in progress, waiting...")
+                    AudioAnalyzer._model_loading_condition.wait()
+                    
+                    # Check if model was loaded by other thread
+                    if AudioAnalyzer._shared_whisper_model is not None:
+                        self.whisper_model = AudioAnalyzer._shared_whisper_model
+                        logger.info("Using Whisper model loaded by another thread")
+                        return True
+                
+                # Load the model (only one thread will do this)
+                AudioAnalyzer._model_loading = True
+                try:
+                    logger.info(f"Loading Whisper model '{model_size}'...")
+                    AudioAnalyzer._shared_whisper_model = whisper.load_model(model_size)
+                    self.whisper_model = AudioAnalyzer._shared_whisper_model
+                    logger.info(f"Whisper model '{model_size}' loaded successfully")
+                    return True
+                finally:
+                    AudioAnalyzer._model_loading = False
+                    # Notify all waiting threads that loading is complete
+                    AudioAnalyzer._model_loading_condition.notify_all()
+                    
         except Exception as e:
             logger.error(f"Whisper model load failed: {e}")
+            with AudioAnalyzer._model_loading_condition:
+                AudioAnalyzer._model_loading = False
+                AudioAnalyzer._model_loading_condition.notify_all()
             return False
     
     def extract_audio(self, video_path: str, output_path: str) -> bool:
@@ -2285,7 +2373,8 @@ class AudioAnalyzer:
 
     def _get_cached_audio(self, audio_path: str) -> Tuple[np.ndarray, int]:
         """Get cached audio data or load and cache it."""
-        cache_key = os.path.abspath(audio_path)
+        # Create session-aware cache key to prevent conflicts between concurrent sessions
+        cache_key = f"{os.path.abspath(audio_path)}_{os.path.getsize(audio_path)}_{os.path.getmtime(audio_path)}"
         
         if cache_key in self._audio_cache:
             return self._audio_cache[cache_key]
@@ -3308,9 +3397,9 @@ class VideoContentAnalyzer:
         from pydub import AudioSegment
         import tempfile
         
-        # Optimization: Use memory-efficient temporary files
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-            segment_path = temp_file.name
+        # Optimization: Use memory-efficient temporary files with session isolation
+        segment_filename = FileManager.sanitize_filename(f"audio_segment_{timestamp:.2f}_{os.getpid()}.wav")
+        segment_path = os.path.join(self.temp_dir, segment_filename)
         
         try:
             # Optimization: Load audio data once and reuse from cache
