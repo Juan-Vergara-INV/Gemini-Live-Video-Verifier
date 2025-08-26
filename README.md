@@ -332,7 +332,7 @@ brew install ffmpeg
 
 **Analysis failures**:
 
-- Check video file format (must be MP4, AVI, MOV, or MKV)
+- Check video file format (must be MP4)
 - Verify file size (must be ≤500MB)
 - Ensure good video quality for text detection
 - Check audio clarity for language analysis

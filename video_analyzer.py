@@ -56,7 +56,7 @@ class Config:
     # Directory structure
     OUTPUT_DIR: str = "analysis_output"
     TEMP_DIR: str = "temp"
-    SUPPORTED_VIDEO_FORMATS: List[str] = ['.mp4', '.avi', '.mov', '.mkv']
+    SUPPORTED_VIDEO_FORMATS: List[str] = ['.mp4']
     
     # UI annotation settings
     ANNOTATION_FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -129,18 +129,38 @@ class Config:
     
     # Supported languages for audio analysis
     SUPPORTED_LANGUAGES: Dict[str, str] = {
-        'en-US': 'English (United States)', 'es-MX': 'Spanish (Mexico)', 'es-ES': 'Spanish (Spain)',
-        'de-DE': 'German (Germany)', 'it-IT': 'Italian (Italy)', 'pt-BR': 'Portuguese (Brazil)',
-        'pt-PT': 'Portuguese (Portugal)', 'ja-JP': 'Japanese (Japan)', 'ko-KR': 'Korean (South Korea)',
-        'zh-CN': 'Chinese (China)', 'ar-SA': 'Arabic (Saudi Arabia)', 'hi-IN': 'Hindi (India)',
-        'id-ID': 'Indonesian (Indonesia)', 'fr-FR': 'French (France)', 'ru-RU': 'Russian (Russia)'
+        'es-419': 'es-419',
+        'hi-IN': 'hi-IN',
+        'ja-JP': 'ja-JP',
+        'ko-KR': 'ko-KR',
+        'de-DE': 'de-DE',
+        'en-IN': 'en-IN',
+        'fr-FR': 'fr-FR',
+        'ar-EG': 'ar-EG',
+        'pt-BR': 'pt-BR',
+        'id-ID': 'id-ID',
+        'ko-JA': 'ko-JA',
+        'zh-CN': 'zh-CN',
+        'ru-RU': 'ru-RU',
+        'ml-IN': 'ml-IN',
+        'sv-SE': 'sv-SE',
+        'te-IN': 'te-IN',
+        'vi-VN': 'vi-VN',
+        'tr-TR': 'tr-TR',
+        'bn-IN': 'bn-IN',
+        'it-IT': 'it-IT',
+        'zh-TW': 'zh-TW',
+        'pl-PL': 'pl-PL',
+        'nl-NL': 'nl-NL',
+        'th-TH': 'th-TH',
+        'ko-ZH': 'ko-ZH',
     }
     
     @staticmethod
     def get_language_options() -> Dict[str, str]:
         """Get language options for UI selectors."""
         return Config.SUPPORTED_LANGUAGES.copy()
-    
+
     @staticmethod
     def get_language_display_name(language_code: str) -> str:
         """Get display name for a language code."""
@@ -148,14 +168,35 @@ class Config:
     
     @staticmethod
     def locale_to_whisper_language(locale_code: str) -> str:
-        """Convert locale code (e.g., 'en-US') to Whisper language code (e.g., 'en')."""
+        """Convert locale code (e.g., 'en-US') to Whisper language code (e.g., 'en'). Only supports configured languages."""
         locale_to_whisper = {
-            'en-US': 'en', 'es-MX': 'es', 'fr-FR': 'fr',
-            'de-DE': 'de', 'it-IT': 'it', 'pt-BR': 'pt',
-            'ru-RU': 'ru', 'ja-JP': 'ja', 'ko-KR': 'ko',
-            'zh-CN': 'zh', 'ar-SA': 'ar', 'hi-IN': 'hi',
-            'id-ID': 'id'
+            'es-419': 'es',
+            'hi-IN': 'hi',
+            'ja-JP': 'ja',
+            'ko-KR': 'ko',
+            'de-DE': 'de',
+            'en-IN': 'en',
+            'fr-FR': 'fr',
+            'ar-EG': 'ar',
+            'pt-BR': 'pt',
+            'id-ID': 'id',
+            'ko-JA': 'ko',
+            'zh-CN': 'zh',
+            'ru-RU': 'ru',
+            'ml-IN': 'ml',
+            'sv-SE': 'sv',
+            'te-IN': 'te',
+            'vi-VN': 'vi',
+            'tr-TR': 'tr',
+            'bn-IN': 'bn',
+            'it-IT': 'it',
+            'zh-TW': 'zh',
+            'pl-PL': 'pl',
+            'nl-NL': 'nl',
+            'th-TH': 'th',
+            'ko-ZH': 'ko',
         }
+        # Return mapped value if present, else fallback to language part
         return locale_to_whisper.get(locale_code, locale_code.split('-')[0] if '-' in locale_code else locale_code)
 
 
@@ -396,8 +437,8 @@ class GoogleSheetsVerifier:
                 return False, "Language ID is required and cannot be empty"
             clean_language_id = InputValidator.sanitize_user_input(language_id.strip())
             # Validate language ID format
-            if not re.match(r'^[a-z]{2,3}-[A-Z]{2}$', clean_language_id):
-                return False, f"Invalid language ID format: {language_id}. Expected format: 'en-US', 'id-ID', 'es-MX', etc."
+            if not re.match(r'^[a-z]{2,3}-[A-Z0-9]{2,4}$', clean_language_id):
+                return False, f"Invalid language ID format: {language_id}. Expected format: 'en-US', 'id-ID', 'es-419', etc."
             
             # Sanitize inputs
             clean_question_id = InputValidator.sanitize_user_input(question_id.strip())
@@ -3700,11 +3741,17 @@ class InputScreen:
         col1, col2 = st.columns(2)
         with col1:
             language_options = InputScreen._get_language_options()
+            language_keys = list(language_options.keys())
+            # Use the first supported language as default if current is not in the list
+            current_language = st.session_state.get('selected_language')
+            if current_language not in language_keys:
+                current_language = language_keys[0]
+                st.session_state.selected_language = current_language
             selected_language = st.selectbox(
                 "Target Language *",
-                options=list(language_options.keys()),
+                options=language_keys,
                 format_func=lambda x: language_options[x],
-                index=list(language_options.keys()).index(st.session_state.selected_language),
+                index=language_keys.index(current_language),
                 help="Expected language for fluency analysis and SoT verification",
                 disabled=st.session_state.get('analysis_in_progress', False)
             )
@@ -5191,15 +5238,15 @@ class ApplicationRunner:
             
             **Step 1: Input Parameters**
             - Enter a unique **Question ID** for identification
-            - Provide your **Email Address** for session tracking
+            - Provide the respective **Alias Email Address** for the Question ID
             - Enter a **QA Email Address** for quality assurance
-            - **Upload a video file** (supported formats: MP4, AVI, MOV, MKV)
+            - **Upload a video file** (supported format: MP4)
             - Select the **target language** for analysis
             - Adjust the **frame interval** (time between analyzed frames)
             
             **Step 2: Video Analysis**
             - The system will automatically process your video
-            - **Text detection** will look for specific content (e.g., "2.5 Flash", "Eval Mode")
+            - **Text detection** will look for specific content ("2.5 Flash", "Eval Mode")
             - **Audio analysis** will check language fluency and voice audibility
             - **Screenshots** will be captured at detection points
             - Progress will be displayed in real-time
@@ -5219,7 +5266,7 @@ class ApplicationRunner:
             
             **Audio Analysis:**
             - Language detection and fluency scoring
-            - Voice audibility (user vs model voices)
+            - Voice audibility (user and model voices)
             - Speech quality assessment
             
             **Quality Assurance:**
@@ -5245,7 +5292,7 @@ class ApplicationRunner:
             - Use **high-quality video files** (good resolution, clear audio)
             - Ensure **proper lighting** for text detection
             - Choose the **correct target language** for analysis
-            - Use **shorter frame intervals** for more detailed analysis
+            - Use **shorter frame intervals** for more accurate analysis
             - Verify all **input parameters** before starting analysis
             """)
     
