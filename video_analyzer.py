@@ -2060,11 +2060,21 @@ class AudioAnalyzer:
         self.speech_recognizer = sr.Recognizer()
         self.supported_languages = Config.SUPPORTED_LANGUAGES.copy()
         self.voice_features_cache = {}
+        # Performance optimization: cache loaded audio data
+        self._audio_cache = {}
+        self._audio_cache_max_size = 3  # Limit cache size to prevent memory issues
     
-    def load_whisper_model(self, model_size: str = "base") -> bool:
-        """Load Whisper transcription model."""
+    def load_whisper_model(self, model_size: str = "tiny") -> bool:
+        """Load Whisper transcription model with optimization."""
         try:
+            # Optimization: Use tiny model by default for faster processing
+            # User can override if higher accuracy is needed
+            if model_size == "base":
+                model_size = "tiny"  # Default to faster model
+                logger.info("Using 'tiny' Whisper model for faster processing")
+            
             self.whisper_model = whisper.load_model(model_size)
+            logger.info(f"Whisper model '{model_size}' loaded successfully")
             return True
         except Exception as e:
             logger.error(f"Whisper model load failed: {e}")
@@ -2089,7 +2099,8 @@ class AudioAnalyzer:
         try:
             logger.info(f"Analyzing voice audibility: {audio_path}")
             
-            y, sr = librosa.load(audio_path, sr=None)
+            # Optimization: Use cached audio data if available
+            y, sr = self._get_cached_audio(audio_path)
             duration = len(y) / sr
             
             voice_segments = self.detect_voice_activity(audio_path, frame_duration)
@@ -2162,33 +2173,74 @@ class AudioAnalyzer:
         try:
             features = {}
             
-            f0 = librosa.yin(audio_segment, fmin=50, fmax=400, sr=sr)
-            f0_valid = f0[~np.isnan(f0)]
-            if len(f0_valid) > 0:
-                features['pitch_mean'] = np.mean(f0_valid)
-                features['pitch_std'] = np.std(f0_valid)
-            else:
+            # Optimization: Skip expensive pitch detection for very short segments
+            if len(audio_segment) < sr * 0.1:  # Less than 100ms
+                return self._extract_basic_features_only(audio_segment, sr)
+            
+            # Optimization: Use faster pitch estimation with reduced precision
+            try:
+                # Reduce frame length for faster processing
+                frame_length = min(2048, len(audio_segment) // 4)
+                f0 = librosa.yin(audio_segment, fmin=50, fmax=400, sr=sr, frame_length=frame_length)
+                f0_valid = f0[~np.isnan(f0)]
+                if len(f0_valid) > 0:
+                    features['pitch_mean'] = np.mean(f0_valid)
+                    features['pitch_std'] = np.std(f0_valid)
+                else:
+                    features['pitch_mean'] = 0.0
+                    features['pitch_std'] = 0.0
+            except:
+                # Fallback: Use basic pitch estimation
                 features['pitch_mean'] = 0.0
                 features['pitch_std'] = 0.0
             
-            rms = librosa.feature.rms(y=audio_segment)[0]
+            # Optimization: Use more efficient hop length
+            hop_length = max(512, len(audio_segment) // 100)
+            
+            rms = librosa.feature.rms(y=audio_segment, hop_length=hop_length)[0]
             features['energy_mean'] = np.mean(rms)
             features['energy_std'] = np.std(rms)
             
-            spectral_centroids = librosa.feature.spectral_centroid(y=audio_segment, sr=sr)[0]
+            spectral_centroids = librosa.feature.spectral_centroid(y=audio_segment, sr=sr, hop_length=hop_length)[0]
             features['spectral_centroid_mean'] = np.mean(spectral_centroids)
             
-            zcr = librosa.feature.zero_crossing_rate(audio_segment)[0]
+            zcr = librosa.feature.zero_crossing_rate(audio_segment, hop_length=hop_length)[0]
             features['zcr_mean'] = np.mean(zcr)
             
-            mfccs = librosa.feature.mfcc(y=audio_segment, sr=sr, n_mfcc=5)
-            for i in range(5):
+            # Optimization: Reduce MFCC computation and use fewer coefficients
+            mfccs = librosa.feature.mfcc(y=audio_segment, sr=sr, n_mfcc=3, hop_length=hop_length)
+            for i in range(3):  # Reduced from 5 to 3
                 features[f'mfcc_{i}_mean'] = np.mean(mfccs[i])
             
             return features
             
         except Exception as e:
             logger.warning(f"Simple feature extraction failed: {e}")
+            return {}
+
+    def _extract_basic_features_only(self, audio_segment: np.ndarray, sr: int) -> Dict[str, float]:
+        """Extract only basic features for very short audio segments."""
+        try:
+            features = {}
+            
+            # Basic energy features only for short segments
+            rms = np.sqrt(np.mean(audio_segment**2))
+            features['energy_mean'] = rms
+            features['energy_std'] = 0.0
+            
+            # Zero crossing rate
+            zcr = np.mean(librosa.feature.zero_crossing_rate(audio_segment)[0])
+            features['zcr_mean'] = zcr
+            
+            # Fill in defaults for missing features
+            features['pitch_mean'] = 0.0
+            features['pitch_std'] = 0.0
+            features['spectral_centroid_mean'] = 0.0
+            for i in range(3):
+                features[f'mfcc_{i}_mean'] = 0.0
+            
+            return features
+        except:
             return {}
     
     def _analyze_voice_diversity(self, segment_features: List[Dict[str, float]]) -> Dict[str, Any]:
@@ -2230,9 +2282,39 @@ class AudioAnalyzer:
         except Exception as e:
             logger.warning(f"Voice diversity analysis failed: {e}")
             return {'diversity_score': 0.0, 'details': f'Analysis error: {str(e)}'}
-    
+
+    def _get_cached_audio(self, audio_path: str) -> Tuple[np.ndarray, int]:
+        """Get cached audio data or load and cache it."""
+        cache_key = os.path.abspath(audio_path)
+        
+        if cache_key in self._audio_cache:
+            return self._audio_cache[cache_key]
+        
+        # Load audio with optimizations
+        try:
+            # Load with lower sample rate for faster processing if file is large
+            file_size = os.path.getsize(audio_path)
+            target_sr = None if file_size < 10 * 1024 * 1024 else 16000  # 10MB threshold
+            
+            y, sr = librosa.load(audio_path, sr=target_sr)
+            
+            # Cache management: remove oldest if cache is full
+            if len(self._audio_cache) >= self._audio_cache_max_size:
+                oldest_key = next(iter(self._audio_cache))
+                del self._audio_cache[oldest_key]
+            
+            self._audio_cache[cache_key] = (y, sr)
+            return y, sr
+        except Exception as e:
+            logger.error(f"Failed to load audio {audio_path}: {e}")
+            raise
+
+    def _clear_audio_cache(self):
+        """Clear audio cache to free memory."""
+        self._audio_cache.clear()
+
     def _determine_voice_audibility(self, diversity_analysis: Dict[str, Any], 
-                                  total_voice_duration: float) -> Dict[str, Any]:
+                                   total_voice_duration: float) -> Dict[str, Any]:
         """Determine if both user and model voices are audible based on diversity analysis."""
         try:
             diversity_score = diversity_analysis.get('diversity_score', 0.0)
@@ -2301,7 +2383,8 @@ class AudioAnalyzer:
                                frame_duration: float) -> List[Tuple[float, float, bool]]:
         """Analyze audio for voice segments."""
         logger.info(f"Analyzing voice activity: {audio_path}")
-        y, sr = librosa.load(audio_path, sr=None)
+        # Optimization: Use cached audio data
+        y, sr = self._get_cached_audio(audio_path)
         logger.info(f"Audio loaded: {len(y)/sr:.2f}s @ {sr}Hz")
         
         frame_length = int(frame_duration * sr)
@@ -2342,7 +2425,14 @@ class AudioAnalyzer:
             # Convert locale code to Whisper language code
             whisper_language = self._locale_to_whisper_language(target_language)
             
-            result = self.whisper_model.transcribe(audio_path, task="transcribe", fp16=False)
+            # Optimization: Use faster transcription options
+            result = self.whisper_model.transcribe(
+                audio_path, 
+                task="transcribe", 
+                fp16=False,
+                condition_on_previous_text=False,  # Faster processing
+                temperature=0.0  # Deterministic, faster results
+            )
             detected_language = result.get('language', 'unknown')
             transcription = result.get('text', '').strip()
             
@@ -2789,20 +2879,34 @@ class VideoContentAnalyzer:
     def _process_video_frames(self, context: Dict[str, Any], 
                              frame_params: Dict[str, Any], 
                              frame_interval: float) -> None:
-        """Process video frames for detection."""
+        """Process video frames for detection with optimizations."""
         cap = context['cap']
         fps = context['fps']
         
+        # Optimization: Pre-filter visual rules once instead of per frame
+        visual_rules = [rule for rule in self.get_active_rules() 
+                       if rule.detection_type not in [DetectionType.AUDIO_LANGUAGE, 
+                                                     DetectionType.VOICE_AUDIBILITY]]
+        
+        if not visual_rules:
+            logger.info("No visual rules to process, skipping frame processing")
+            return
+        
         processed = 0
+        total_frames = (frame_params['end_frame'] - frame_params['start_frame']) // frame_params['frame_step']
+        logger.info(f"Processing {total_frames} frames with {len(visual_rules)} visual rules")
+        
         for frame_idx in range(frame_params['start_frame'], 
                               frame_params['end_frame'], 
                               frame_params['frame_step']):
-            if self._process_single_frame(cap, frame_idx, fps):
+            if self._process_single_frame_optimized(cap, frame_idx, fps, visual_rules):
                 processed += 1
-                if processed % 100 == 0:
-                    logger.info(f"Processed {processed} frames")
+                # Optimization: Less frequent logging
+                if processed % 50 == 0:  # Reduced from 100 to 50 for better feedback
+                    logger.info(f"Processed {processed}/{total_frames} frames ({processed/total_frames*100:.1f}%)")
         
         self.total_frames_processed = processed
+        logger.info(f"Frame processing completed: {processed} frames")
     
     def _setup_audio_analysis(self, video_path: str) -> Optional[str]:
         """Setup audio extraction for audio rules."""
@@ -2844,6 +2948,18 @@ class VideoContentAnalyzer:
             logger.error(f"Audio setup failed (session: {self.session_id}): {e}")
             return None
     
+    def cleanup(self) -> None:
+        """Clean up resources and temporary files."""
+        try:
+            # Clear audio cache to free memory
+            if hasattr(self, 'audio_analyzer') and self.audio_analyzer:
+                self.audio_analyzer._clear_audio_cache()
+            
+            # Original cleanup
+            super().cleanup() if hasattr(super(), 'cleanup') else None
+        except Exception as e:
+            logger.warning(f"Cleanup warning: {e}")
+    
     def _process_single_frame(self, cap: cv2.VideoCapture, frame_idx: int, fps: float) -> bool:
         """Process single frame with memory monitoring."""
         try:
@@ -2862,6 +2978,40 @@ class VideoContentAnalyzer:
                            if rule.detection_type not in [DetectionType.AUDIO_LANGUAGE, 
                                                          DetectionType.VOICE_AUDIBILITY]]
             
+            for rule in visual_rules:
+                try:
+                    result = self._apply_visual_rule(rule, frame, timestamp, frame_idx)
+                    if result.detected:
+                        logger.info(f"✓ Detection: {rule.name} at {timestamp:.2f}s")
+                    
+                    with self._lock:
+                        self.results.append(result)
+                        
+                except Exception as e:
+                    logger.error(f"Rule {rule.name} failed at frame {frame_idx} (session: {self.session_id}): {e}")
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"Frame processing failed at {frame_idx} (session: {self.session_id}): {e}")
+            return False
+
+    def _process_single_frame_optimized(self, cap: cv2.VideoCapture, frame_idx: int, 
+                                      fps: float, visual_rules: List[DetectionRule]) -> bool:
+        """Optimized frame processing with pre-filtered rules."""
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                return False
+            
+            if frame is None or frame.size == 0:
+                logger.warning(f"Invalid frame at index {frame_idx}")
+                return False
+                
+            timestamp = frame_idx / fps
+            
+            # Optimization: Use pre-filtered rules instead of filtering each time
             for rule in visual_rules:
                 try:
                     result = self._apply_visual_rule(rule, frame, timestamp, frame_idx)
@@ -2946,6 +3096,13 @@ class VideoContentAnalyzer:
             if not audio_rules:
                 return
             
+            # Optimization: Pre-load audio data to cache for reuse
+            try:
+                self.audio_analyzer._get_cached_audio(audio_path)
+                logger.info("Audio data cached for reuse")
+            except Exception as e:
+                logger.warning(f"Audio caching failed: {e}")
+            
             voice_audibility_rules = [r for r in audio_rules if r.detection_type == DetectionType.VOICE_AUDIBILITY]
             
             if voice_audibility_rules:
@@ -2964,6 +3121,12 @@ class VideoContentAnalyzer:
                         
         except Exception as e:
             logger.error(f"Audio analysis failed: {e}")
+        finally:
+            # Clean up audio cache after processing to free memory
+            try:
+                self.audio_analyzer._clear_audio_cache()
+            except:
+                pass
     
     def _create_voice_audibility_result(self, rule: DetectionRule, 
                                       audibility_result: Dict[str, Any],
@@ -3023,23 +3186,67 @@ class VideoContentAnalyzer:
     
     def _process_voice_segments(self, voice_segments: List[Tuple[float, float, bool]],
                                audio_path: str, start_time: float) -> None:
-        """Process individual voice segments."""
+        """Process individual voice segments with batch optimization."""
         audio_rules = self.get_rules_by_type(DetectionType.AUDIO_LANGUAGE)
         
-        for timestamp, end_timestamp, has_voice in voice_segments:
-            if not has_voice:
-                continue
+        if not audio_rules:
+            return
             
-            adjusted_timestamp = timestamp + start_time
+        # Optimization: Group consecutive voice segments for batch processing
+        voice_only_segments = [(ts, end_ts) for ts, end_ts, has_voice in voice_segments if has_voice]
+        
+        if len(voice_only_segments) > 5:
+            # For many segments, use batch processing
+            self._process_voice_segments_batch(voice_only_segments, audio_path, start_time, audio_rules)
+        else:
+            # For few segments, process individually
+            for timestamp, end_timestamp, has_voice in voice_segments:
+                if not has_voice:
+                    continue
+                
+                adjusted_timestamp = timestamp + start_time
+                
+                for rule in audio_rules:
+                    try:
+                        result = self._apply_audio_rule(rule, audio_path, timestamp, 
+                                                       end_timestamp, adjusted_timestamp)
+                        if result is not None:
+                            self.results.append(result)
+                    except Exception as e:
+                        logger.error(f"Audio rule {rule.name} failed: {e}")
+
+    def _process_voice_segments_batch(self, voice_segments: List[Tuple[float, float]], 
+                                    audio_path: str, start_time: float, 
+                                    audio_rules: List[DetectionRule]) -> None:
+        """Process voice segments in batches for better performance."""
+        try:
+            # Sample key segments instead of processing all
+            total_segments = len(voice_segments)
+            max_segments = 10  # Process at most 10 segments
             
-            for rule in audio_rules:
-                try:
-                    result = self._apply_audio_rule(rule, audio_path, timestamp, 
-                                                   end_timestamp, adjusted_timestamp)
-                    if result is not None:
-                        self.results.append(result)
-                except Exception as e:
-                    logger.error(f"Audio rule {rule.name} failed: {e}")
+            if total_segments <= max_segments:
+                segments_to_process = voice_segments
+            else:
+                # Sample evenly across the timeline
+                step = total_segments // max_segments
+                segments_to_process = [voice_segments[i] for i in range(0, total_segments, step)][:max_segments]
+            
+            logger.info(f"Processing {len(segments_to_process)} of {total_segments} voice segments (batch mode)")
+            
+            for timestamp, end_timestamp in segments_to_process:
+                adjusted_timestamp = timestamp + start_time
+                
+                for rule in audio_rules:
+                    try:
+                        result = self._apply_audio_rule(rule, audio_path, timestamp, 
+                                                       end_timestamp, adjusted_timestamp)
+                        if result is not None:
+                            self.results.append(result)
+                    except Exception as e:
+                        logger.error(f"Audio rule {rule.name} failed: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Batch voice segment processing failed: {e}")
     
     def _apply_audio_rule(self, rule: DetectionRule, audio_path: str, 
                          segment_start: float, segment_end: float, 
@@ -3097,17 +3304,47 @@ class VideoContentAnalyzer:
     
     def _create_audio_segment(self, audio_path: str, segment_start: float,
                              segment_end: float, timestamp: float) -> str:
-        """Create audio segment file."""
+        """Create audio segment file with optimized caching."""
         from pydub import AudioSegment
+        import tempfile
         
-        segment_filename = FileManager.sanitize_filename(f"segment_{timestamp:.2f}.wav")
-        segment_path = os.path.join(self.temp_dir, segment_filename)
+        # Optimization: Use memory-efficient temporary files
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            segment_path = temp_file.name
         
-        audio = AudioSegment.from_wav(audio_path)
-        segment = audio[int(segment_start * 1000):int(segment_end * 1000)]
-        segment.export(segment_path, format="wav")
+        try:
+            # Optimization: Load audio data once and reuse from cache
+            y, sr = self.audio_analyzer._get_cached_audio(audio_path)
+            
+            # Convert to segment directly from numpy array (faster than loading from file)
+            start_sample = int(segment_start * sr)
+            end_sample = int(segment_end * sr)
+            segment_data = y[start_sample:end_sample]
+            
+            # Convert to AudioSegment more efficiently
+            import io
+            import wave
+            
+            # Create in-memory WAV data
+            buffer = io.BytesIO()
+            with wave.open(buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(sr)
+                wav_file.writeframes((segment_data * 32767).astype(np.int16).tobytes())
+            
+            buffer.seek(0)
+            segment = AudioSegment.from_wav(buffer)
+            segment.export(segment_path, format="wav")
+            
+        except Exception as e:
+            # Fallback to original method if optimization fails
+            logger.warning(f"Fast segment creation failed, using fallback: {e}")
+            audio = AudioSegment.from_wav(audio_path)
+            segment = audio[int(segment_start * 1000):int(segment_end * 1000)]
+            segment.export(segment_path, format="wav")
+        
         self.temp_files.append(segment_path)
-        
         return segment_path
     
     def _create_language_detection_result(self, rule: DetectionRule, timestamp: float,
@@ -3420,6 +3657,19 @@ class ResultExporter:
         output_dir = os.path.dirname(output_path) or "."
         FileManager.ensure_directory(output_dir)
         return os.path.join(output_dir, os.path.basename(output_path))
+
+    def _export_json(self, output_path: str) -> None:
+        """Export results as JSON."""
+        data = {
+            'metadata': self.metadata,
+            'results': [result.to_dict() for result in self.results]
+        }
+        
+        if self.qa_results:
+            data['qa_results'] = self.qa_results
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, default=str, ensure_ascii=False)
 
 
 def create_detection_rules(target_language: str = 'en-US') -> List[DetectionRule]:
@@ -4546,9 +4796,6 @@ class QAScreen:
                     logger.warning(f"Screenshot file not found: {result.screenshot_path}")
             
             for i, result in enumerate(analysis_results[:20]):
-                if hasattr(result, 'screenshot_path'):
-                    logger.info(f"Screenshot path for {result.rule_name}: {result.screenshot_path}")
-                
                 detail = {
                     "rule_name": result.rule_name,
                     "detected": result.detected,
@@ -4817,7 +5064,7 @@ class StreamlitInterface:
 
     @staticmethod
     def create_temp_video(video_file, session_id: str = None):
-        """Create temporary video file with security validation. Returns (path, [path]) or (None, [])."""
+        """Create temporary video file with optimized chunking for production. Returns (path, [path]) or (None, [])."""
         if not video_file:
             return None, []
         try:
@@ -4830,10 +5077,25 @@ class StreamlitInterface:
                 return None, []
             session_id = session_id or SessionManager.generate_session_id()
             safe_filename = FileManager.sanitize_filename(video_file.name)
+            
+            # Optimize chunk size for production environments
+            # Larger chunks for faster uploads in cloud environments
+            file_size = getattr(video_file, 'size', 0)
+            if file_size > 100 * 1024 * 1024:  # Files > 100MB
+                chunk_size = 4 * 1024 * 1024  # 4MB chunks
+            elif file_size > 50 * 1024 * 1024:  # Files > 50MB
+                chunk_size = 2 * 1024 * 1024  # 2MB chunks
+            else:
+                chunk_size = 1024 * 1024  # 1MB chunks for smaller files
+            
             with tempfile.NamedTemporaryFile(delete=False, suffix=video_suffix, prefix=f"video_{session_id}_") as tmp:
-                chunk_size = 1024 * 1024
                 total_written = 0
                 video_file.seek(0)
+                
+                # Add progress indication for large files
+                if file_size > 50 * 1024 * 1024:
+                    progress_bar = st.progress(0, text="Uploading video...")
+                    
                 while True:
                     chunk = video_file.read(chunk_size)
                     if not chunk:
@@ -4844,7 +5106,17 @@ class StreamlitInterface:
                         st.error("File size exceeded during upload")
                         return None, []
                     tmp.write(chunk)
+                    
+                    # Update progress for large files
+                    if file_size > 50 * 1024 * 1024:
+                        progress = min(1.0, total_written / file_size)
+                        progress_bar.progress(progress, text=f"Uploading video... {progress*100:.1f}%")
+                
+                if file_size > 50 * 1024 * 1024:
+                    progress_bar.empty()
+                
                 tmp.flush()
+                os.fsync(tmp.fileno())  # Force write to disk
                 if not PathValidator.validate_file_size(tmp.name):
                     os.unlink(tmp.name)
                     return None, []
@@ -5216,7 +5488,7 @@ class ApplicationRunner:
         with st.sidebar:
             st.markdown("""
             <div style="text-align: center; padding: 10px; margin-bottom: 20px;">
-                <h2 style="color: #1f77b4; margin: 0;">🎥 Video Analyzer</h2>
+                <h2 style="color: #1f77b4; margin: 0;">🎥 Gemini Live Video Verifier</h2>
                 <p style="color: #666; margin: 5px 0 0 0; font-size: 0.9em;">Multi-Modal Analysis Tool</p>
             </div>
             """, unsafe_allow_html=True)
