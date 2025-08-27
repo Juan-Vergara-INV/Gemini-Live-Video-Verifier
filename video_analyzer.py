@@ -5600,7 +5600,7 @@ class ApplicationRunner:
             **Step 1: Input Parameters**
             - Enter a unique **Question ID** for identification
             - Provide the respective **Alias Email Address** for the Question ID
-            - Enter a **QA Email Address** for quality assurance
+            - As a QA, enter your **Invisible Email Address** to assign yourself to the task
             - **Upload a video file** (supported format: MP4)
             - Select the **target language** for analysis
             - Adjust the **frame interval** (time between analyzed frames)
@@ -5616,7 +5616,6 @@ class ApplicationRunner:
             - Review automated **quality assurance checks**
             - View **detailed detection results** with screenshots
             - **Export results** to Google Sheets if needed
-            - Download analysis data in various formats
             
             ### 🎯 What Gets Analyzed
             
