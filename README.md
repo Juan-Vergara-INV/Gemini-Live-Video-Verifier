@@ -79,6 +79,19 @@ sheet_id = "YOUR_SHEET_ID"
 default_sheet_name = "Submissions"
 max_retries = 2
 timeout_base = 45
+
+[performance]
+enable_gpu_acceleration = false
+max_memory_usage_mb = 1800
+enable_concurrent_analysis = true
+whisper_model_size = "tiny"
+audio_cache_size = 2
+
+[cloud]
+environment = "streamlit_cloud"
+enable_memory_monitoring = true
+aggressive_cleanup = true
+reduce_logging = true
 ```
 
 ### 2. Language Configuration
