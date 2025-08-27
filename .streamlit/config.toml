@@ -1,45 +1,31 @@
-# Streamlit Configuration for Video Analysis Performance Optimization
-# Optimized for Streamlit Cloud deployment with video processing workloads
-
 [server]
-# Increase upload limit for large video files
-maxUploadSize = 2000  # 2GB limit for video files
+maxUploadSize = 2000
 
-# Performance optimizations
 headless = true
 enableCORS = true
 enableXsrfProtection = false
 
-# Threading and concurrency
 runOnSave = false
 fileWatcherType = "none"
 
-# Address and port configuration
 address = "0.0.0.0"
 port = 8501
 
 [browser]
-# Disable automatic browser opening in production
 gatherUsageStats = false
 serverAddress = "0.0.0.0"
 
 [client]
-# Optimize client-side performance
 showErrorDetails = true
 
-# Timeout configurations for long-running video analysis
 toolbarMode = "minimal"
 
 [runner]
-# Optimize script runner for video processing
 magicEnabled = true
 
-# Memory and performance settings
 enforceSerializableSessionState = false
 enumCoercion = "off"
 
-# Global settings for better performance
 [global]
-# Reduce overhead for video processing apps
 developmentMode = false
 suppressDeprecationWarnings = true
