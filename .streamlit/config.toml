@@ -1,5 +1,5 @@
 [server]
-maxUploadSize = 2000
+maxUploadSize = 1000
 
 headless = true
 enableCORS = true
@@ -29,3 +29,4 @@ enumCoercion = "off"
 [global]
 developmentMode = false
 suppressDeprecationWarnings = true
+
