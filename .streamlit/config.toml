@@ -25,8 +25,6 @@ serverAddress = "0.0.0.0"
 
 [client]
 # Optimize client-side performance
-caching = true
-displayEnabled = true
 showErrorDetails = true
 
 # Timeout configurations for long-running video analysis
@@ -35,37 +33,13 @@ toolbarMode = "minimal"
 [runner]
 # Optimize script runner for video processing
 magicEnabled = true
-installTracer = false
-fixMatplotlib = true
 
 # Memory and performance settings
 enforceSerializableSessionState = false
 enumCoercion = "off"
 
-[mapbox]
-# Disable mapbox if not needed (saves memory)
-token = ""
-
-[deprecation]
-# Handle deprecation warnings efficiently
-showPyplotGlobalUse = false
-showImageFormat = false
-
-# Additional performance settings for video analysis
-[server.fileWatcher]
-blacklist = ["*.tmp", "*.temp", "*~", ".#*", "temp/*", "analysis_output/*", "backups/*"]
-
 # Global settings for better performance
 [global]
 # Reduce overhead for video processing apps
 developmentMode = false
-logLevel = "error"
 suppressDeprecationWarnings = true
-
-# Custom settings for our video analyzer
-[custom]
-# These are read by our application code
-enableParallelProcessing = true
-maxConcurrentAnalyses = 3
-enableAudioCaching = true
-optimizeForStreamlitCloud = true
