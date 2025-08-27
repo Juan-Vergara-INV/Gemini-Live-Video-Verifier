@@ -3495,13 +3495,11 @@ class VideoContentAnalyzer:
             detection_result = self._analyze_text_detection(ocr_results, params, roi_info['offset'])
             
             screenshot_path = None
-            if params.get('save_screenshot', True):
+            if params.get('save_screenshot', True) and detection_result['detected']:
                 screenshot_path = self._create_text_screenshot(
                     frame, detection_result['text_bounding_box'], 
                     detection_result['expected_text'], rule.name, timestamp
                 )
-            else:
-                pass
             
             return DetectionResult(
                 rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
@@ -4464,7 +4462,7 @@ class AnalysisScreen:
             st.markdown("**Screenshot**")
             st.write("❌ *Not generated*")
             if not result.detected:
-                st.caption("No detection = no screenshot")
+                st.caption("No detection found")
             else:
                 st.caption("Detection found but screenshot missing")
 
