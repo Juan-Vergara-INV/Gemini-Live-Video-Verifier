@@ -53,7 +53,7 @@ The Gemini Live Video Verifier is designed for analyzing video content to detect
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Juan-Vergara-INV/Gemini-Live-Video-Verifier.git
 cd video-analyzer
 ```
 
