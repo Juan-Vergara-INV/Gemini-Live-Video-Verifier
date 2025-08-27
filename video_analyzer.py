@@ -63,61 +63,32 @@ class Config:
     ANNOTATION_FONT_SCALE: float = 0.6
     ANNOTATION_THICKNESS: int = 2
     
-    # Resource limits (optimized for Streamlit Cloud)
+    # Resource limits (always optimized)
     MAX_FILE_SIZE: int = 500 * 1024 * 1024 # 500MB
     MAX_VIDEO_DURATION: int = 1200  # 20 minutes
-    MAX_CONCURRENT_ANALYSES: int = 3  # Reduced for Streamlit Cloud
+    MAX_CONCURRENT_ANALYSES: int = 2  # Optimized for performance
     SESSION_TIMEOUT: int = 3600  # 1 hour
     
-    # Streamlit Cloud optimizations
+    # Performance optimizations (always enabled)
     STREAMLIT_CLOUD_MODE: bool = True
     ENABLE_PERFORMANCE_MONITORING: bool = True
     AGGRESSIVE_MEMORY_CLEANUP: bool = True
-    
-    @staticmethod
-    def detect_streamlit_cloud() -> bool:
-        """Detect if running on Streamlit Cloud and adjust settings accordingly."""
-        try:
-            import os
-            # Check for Streamlit Cloud environment indicators
-            streamlit_indicators = [
-                os.getenv('STREAMLIT_SHARING_MODE'),
-                os.getenv('STREAMLIT_SERVER_HEADLESS'),
-                os.getenv('STREAMLIT_CLOUD'),
-                'streamlit' in os.getenv('HOME', '').lower(),
-                'app' in os.getenv('USER', '').lower()
-            ]
-            
-            is_cloud = any(indicator for indicator in streamlit_indicators)
-            
-            if is_cloud:
-                logger.info("Streamlit Cloud environment detected - applying optimizations")
-                # Override settings for cloud environment
-                Config.MAX_CONCURRENT_ANALYSES = 2  # More conservative for cloud
-                Config.AGGRESSIVE_MEMORY_CLEANUP = True
-                
-            return is_cloud
-        except Exception as e:
-            logger.warning(f"Could not detect environment: {e}")
-            return False
 
-    # Memory limits calculated dynamically based on system capacity
+    # Memory limits calculated dynamically based on system capacity (always optimized)
     @staticmethod
     def get_memory_limits() -> Dict[str, float]:
-        """Get memory limits appropriate for the current system."""
+        """Get memory limits appropriate for the current system with optimizations always enabled."""
         try:
             import psutil
             total_memory_gb = psutil.virtual_memory().total / (1024**3)
             available_memory_gb = psutil.virtual_memory().available / (1024**3)
             
-            # Detect if we're on Streamlit Cloud (typically has ~1GB memory limit)
-            is_cloud = Config.detect_streamlit_cloud()
-            
-            if is_cloud or total_memory_gb <= 2:  # Streamlit Cloud or very limited environment
+            # Always use optimized settings regardless of environment
+            if total_memory_gb <= 2:  # Very limited environment
                 return {
                     "min_available_gb": 0.1,
                     "max_usage_percent": 85,
-                    "per_session_gb": min(0.8, available_memory_gb * 0.8)  # Conservative for cloud
+                    "per_session_gb": min(0.8, available_memory_gb * 0.8)  # Conservative
                 }
             elif available_memory_gb >= 4.0:  # If we have 4GB+ available
                 per_session_gb = min(2.0, available_memory_gb * 0.6)  # Use up to 60% of available
@@ -128,26 +99,26 @@ class Config:
             else:  # Less than 2GB available
                 per_session_gb = max(0.8, available_memory_gb * 0.75)  # Use up to 75% of available
             
-            if total_memory_gb <= 8:  # Small dev container or cloud
+            if total_memory_gb <= 8:  # Small environment (always use optimized settings)
                 return {
                     "min_available_gb": 0.15,
                     "max_usage_percent": 90,
                     "per_session_gb": per_session_gb
                 }
-            elif total_memory_gb <= 16:  # Medium dev/test environment
+            elif total_memory_gb <= 16:  # Medium environment (always use optimized settings)
                 return {
                     "min_available_gb": 0.3,
                     "max_usage_percent": 88,
                     "per_session_gb": per_session_gb
                 }
-            else:  # Production environment
+            else:  # Large environment (always use optimized settings)
                 return {
                     "min_available_gb": 0.5,
                     "max_usage_percent": 85,
                     "per_session_gb": per_session_gb
                 }
         except:
-            # Fallback for Streamlit Cloud
+            # Fallback - always use optimized settings
             return {
                 "min_available_gb": 0.1,
                 "max_usage_percent": 85,
@@ -2110,24 +2081,16 @@ class AudioAnalyzer:
         # Performance optimization: cache loaded audio data
         self._audio_cache = {}
         
-        # Adaptive cache size based on environment
-        if Config.detect_streamlit_cloud():
-            self._audio_cache_max_size = 1  # Minimal cache for cloud
-            logger.info("Streamlit Cloud detected: using minimal audio cache")
-        else:
-            self._audio_cache_max_size = 3  # Standard cache for local/dev
+        # Always use minimal cache size for optimal performance
+        self._audio_cache_max_size = 1  # Minimal cache for optimal performance
+        logger.info("Using minimal audio cache for optimal performance")
     
     def load_whisper_model(self, model_size: str = "tiny") -> bool:
         """Load Whisper transcription model with thread-safe shared loading."""
         try:
-            # Optimization: Use tiny model by default for faster processing
-            # Force tiny model on Streamlit Cloud for performance
-            if Config.detect_streamlit_cloud():
-                model_size = "tiny"  # Always use fastest model on cloud
-                logger.info("Streamlit Cloud: forced tiny Whisper model for optimal performance")
-            elif model_size == "base":
-                model_size = "tiny"  # Default to faster model
-                logger.info("Using 'tiny' Whisper model for faster processing")
+            # Always use tiny model for optimal performance
+            model_size = "tiny"  # Always use fastest model for optimal performance
+            logger.info("Using 'tiny' Whisper model for optimal performance")
             
             # Use shared model to prevent concurrent loading issues
             with AudioAnalyzer._model_loading_condition:
@@ -4128,7 +4091,7 @@ class InputScreen:
         with col2:
             # Check if analysis is already in progress
             is_disabled = bool(errors) or st.session_state.get('analysis_in_progress', False)
-            button_text = "🔄 Validating..." if st.session_state.get('analysis_in_progress', False) else "🚀 Start Analysis"
+            button_text = "Validating..." if st.session_state.get('analysis_in_progress', False) else "Start Analysis"
             
             if st.button(button_text, type="primary", use_container_width=True, disabled=is_disabled, key="input_start_analysis_btn"):
                 st.session_state.analysis_in_progress = True
