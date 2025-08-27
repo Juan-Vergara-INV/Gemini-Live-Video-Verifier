@@ -1,35 +1,24 @@
-# Streamlit Cloud Performance Optimized Requirements
-# Updated for faster deployment and reduced memory usage
-
-# Computer Vision and Image Processing
-opencv-python-headless==4.8.1.78  # Headless version for cloud deployment
+opencv-python-headless==4.8.1.78
 pytesseract>=0.3.10
-numpy>=1.24.0,<2.0.0  # Version constraint for stability
+numpy>=1.24.0,<2.0.0
 Pillow>=9.5.0,<11.0.0
 
-# Web Framework - Latest stable version
 streamlit>=1.29.0
 
-# HTTP Requests (for Google Sheets export)
 requests>=2.31.0
 
-# Data Processing and Export
 pandas>=2.0.0
 openpyxl>=3.1.0
 
-# Audio Processing (optimized for cloud deployment)
-librosa>=0.10.0,<0.11.0  # Pin version for stability
+librosa>=0.10.0,<0.11.0
 SpeechRecognition>=3.10.0
 pydub>=0.25.0,<1.0.0
 openai-whisper>=20231117
-scipy>=1.10.0,<1.12.0  # Optimized for cloud
+scipy>=1.10.0,<1.12.0
 
-# Machine Learning (minimal footprint)
-scikit-learn>=1.3.0,<1.4.0  # Constrained for faster installation
+scikit-learn>=1.3.0,<1.4.0
 
-# Audio backend dependencies (cloud optimized)
 ffmpeg-python>=0.2.0
 
-# System Resource Monitoring and Security
-psutil>=5.9.0  # For memory and CPU monitoring
-uuid  # Built-in but explicit for session management
+psutil>=5.9.0
+uuid
