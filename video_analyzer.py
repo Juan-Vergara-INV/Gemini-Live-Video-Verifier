@@ -64,7 +64,7 @@ class Config:
     ANNOTATION_THICKNESS: int = 2
     
     # Resource limits (always optimized)
-    MAX_FILE_SIZE: int = 500 * 1024 * 1024 # 500MB
+    MAX_FILE_SIZE: int = 1024 * 1024 * 1024 # 1GB
     MAX_VIDEO_DURATION: int = 1200  # 20 minutes
     MAX_CONCURRENT_ANALYSES: int = 2  # Optimized for performance
     SESSION_TIMEOUT: int = 3600  # 1 hour
