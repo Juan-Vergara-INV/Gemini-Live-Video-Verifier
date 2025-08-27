@@ -63,18 +63,18 @@ class Config:
     ANNOTATION_FONT_SCALE: float = 0.6
     ANNOTATION_THICKNESS: int = 2
     
-    # Resource limits (always optimized)
+    # Resource limits
     MAX_FILE_SIZE: int = 1024 * 1024 * 1024 # 1GB
     MAX_VIDEO_DURATION: int = 1200  # 20 minutes
-    MAX_CONCURRENT_ANALYSES: int = 2  # Optimized for performance
+    MAX_CONCURRENT_ANALYSES: int = 10
     SESSION_TIMEOUT: int = 3600  # 1 hour
     
-    # Performance optimizations (always enabled)
+    # Performance optimizations
     STREAMLIT_CLOUD_MODE: bool = True
     ENABLE_PERFORMANCE_MONITORING: bool = True
     AGGRESSIVE_MEMORY_CLEANUP: bool = True
 
-    # Memory limits calculated dynamically based on system capacity (always optimized)
+    # Memory limits calculated dynamically based on system capacity
     @staticmethod
     def get_memory_limits() -> Dict[str, float]:
         """Get memory limits appropriate for the current system with optimizations always enabled."""
@@ -83,7 +83,6 @@ class Config:
             total_memory_gb = psutil.virtual_memory().total / (1024**3)
             available_memory_gb = psutil.virtual_memory().available / (1024**3)
             
-            # Always use optimized settings regardless of environment
             if total_memory_gb <= 2:  # Very limited environment
                 return {
                     "min_available_gb": 0.1,
@@ -99,26 +98,26 @@ class Config:
             else:  # Less than 2GB available
                 per_session_gb = max(0.8, available_memory_gb * 0.75)  # Use up to 75% of available
             
-            if total_memory_gb <= 8:  # Small environment (always use optimized settings)
+            if total_memory_gb <= 8:  # Small environment
                 return {
                     "min_available_gb": 0.15,
                     "max_usage_percent": 90,
                     "per_session_gb": per_session_gb
                 }
-            elif total_memory_gb <= 16:  # Medium environment (always use optimized settings)
+            elif total_memory_gb <= 16:  # Medium environment
                 return {
                     "min_available_gb": 0.3,
                     "max_usage_percent": 88,
                     "per_session_gb": per_session_gb
                 }
-            else:  # Large environment (always use optimized settings)
+            else:  # Large environment
                 return {
                     "min_available_gb": 0.5,
                     "max_usage_percent": 85,
                     "per_session_gb": per_session_gb
                 }
         except:
-            # Fallback - always use optimized settings
+            # Fallback
             return {
                 "min_available_gb": 0.1,
                 "max_usage_percent": 85,
@@ -2078,17 +2077,15 @@ class AudioAnalyzer:
         self.speech_recognizer = sr.Recognizer()
         self.supported_languages = Config.SUPPORTED_LANGUAGES.copy()
         self.voice_features_cache = {}
-        # Performance optimization: cache loaded audio data
+        # Cache loaded audio data
         self._audio_cache = {}
         
-        # Always use minimal cache size for optimal performance
         self._audio_cache_max_size = 1  # Minimal cache for optimal performance
         logger.info("Using minimal audio cache for optimal performance")
     
     def load_whisper_model(self, model_size: str = "tiny") -> bool:
         """Load Whisper transcription model with thread-safe shared loading."""
         try:
-            # Always use tiny model for optimal performance
             model_size = "tiny"  # Always use fastest model for optimal performance
             logger.info("Using 'tiny' Whisper model for optimal performance")
             
@@ -2150,7 +2147,6 @@ class AudioAnalyzer:
         try:
             logger.info(f"Analyzing voice audibility: {audio_path}")
             
-            # Optimization: Use cached audio data if available
             y, sr = self._get_cached_audio(audio_path)
             duration = len(y) / sr
             
@@ -2224,13 +2220,10 @@ class AudioAnalyzer:
         try:
             features = {}
             
-            # Optimization: Skip expensive pitch detection for very short segments
             if len(audio_segment) < sr * 0.1:  # Less than 100ms
                 return self._extract_basic_features_only(audio_segment, sr)
             
-            # Optimization: Use faster pitch estimation with reduced precision
             try:
-                # Reduce frame length for faster processing
                 frame_length = min(2048, len(audio_segment) // 4)
                 f0 = librosa.yin(audio_segment, fmin=50, fmax=400, sr=sr, frame_length=frame_length)
                 f0_valid = f0[~np.isnan(f0)]
@@ -2245,7 +2238,6 @@ class AudioAnalyzer:
                 features['pitch_mean'] = 0.0
                 features['pitch_std'] = 0.0
             
-            # Optimization: Use more efficient hop length
             hop_length = max(512, len(audio_segment) // 100)
             
             rms = librosa.feature.rms(y=audio_segment, hop_length=hop_length)[0]
@@ -2258,9 +2250,8 @@ class AudioAnalyzer:
             zcr = librosa.feature.zero_crossing_rate(audio_segment, hop_length=hop_length)[0]
             features['zcr_mean'] = np.mean(zcr)
             
-            # Optimization: Reduce MFCC computation and use fewer coefficients
             mfccs = librosa.feature.mfcc(y=audio_segment, sr=sr, n_mfcc=3, hop_length=hop_length)
-            for i in range(3):  # Reduced from 5 to 3
+            for i in range(3):
                 features[f'mfcc_{i}_mean'] = np.mean(mfccs[i])
             
             return features
@@ -2342,9 +2333,7 @@ class AudioAnalyzer:
         if cache_key in self._audio_cache:
             return self._audio_cache[cache_key]
         
-        # Load audio with optimizations
         try:
-            # Load with lower sample rate for faster processing if file is large
             file_size = os.path.getsize(audio_path)
             target_sr = None if file_size < 10 * 1024 * 1024 else 16000  # 10MB threshold
             
@@ -2435,7 +2424,6 @@ class AudioAnalyzer:
                                frame_duration: float) -> List[Tuple[float, float, bool]]:
         """Analyze audio for voice segments."""
         logger.info(f"Analyzing voice activity: {audio_path}")
-        # Optimization: Use cached audio data
         y, sr = self._get_cached_audio(audio_path)
         logger.info(f"Audio loaded: {len(y)/sr:.2f}s @ {sr}Hz")
         
@@ -2477,13 +2465,12 @@ class AudioAnalyzer:
             # Convert locale code to Whisper language code
             whisper_language = self._locale_to_whisper_language(target_language)
             
-            # Optimization: Use faster transcription options
             result = self.whisper_model.transcribe(
                 audio_path, 
                 task="transcribe", 
                 fp16=False,
-                condition_on_previous_text=False,  # Faster processing
-                temperature=0.0  # Deterministic, faster results
+                condition_on_previous_text=False,
+                temperature=0.0
             )
             detected_language = result.get('language', 'unknown')
             transcription = result.get('text', '').strip()
@@ -2935,7 +2922,6 @@ class VideoContentAnalyzer:
         cap = context['cap']
         fps = context['fps']
         
-        # Optimization: Pre-filter visual rules once instead of per frame
         visual_rules = [rule for rule in self.get_active_rules() 
                        if rule.detection_type not in [DetectionType.AUDIO_LANGUAGE, 
                                                      DetectionType.VOICE_AUDIBILITY]]
@@ -2953,8 +2939,7 @@ class VideoContentAnalyzer:
                               frame_params['frame_step']):
             if self._process_single_frame_optimized(cap, frame_idx, fps, visual_rules):
                 processed += 1
-                # Optimization: Less frequent logging
-                if processed % 50 == 0:  # Reduced from 100 to 50 for better feedback
+                if processed % 50 == 0:
                     logger.info(f"Processed {processed}/{total_frames} frames ({processed/total_frames*100:.1f}%)")
         
         self.total_frames_processed = processed
@@ -3007,7 +2992,6 @@ class VideoContentAnalyzer:
             if hasattr(self, 'audio_analyzer') and self.audio_analyzer:
                 self.audio_analyzer._clear_audio_cache()
             
-            # Original cleanup
             super().cleanup() if hasattr(super(), 'cleanup') else None
         except Exception as e:
             logger.warning(f"Cleanup warning: {e}")
@@ -3063,7 +3047,6 @@ class VideoContentAnalyzer:
                 
             timestamp = frame_idx / fps
             
-            # Optimization: Use pre-filtered rules instead of filtering each time
             for rule in visual_rules:
                 try:
                     result = self._apply_visual_rule(rule, frame, timestamp, frame_idx)
@@ -3148,7 +3131,6 @@ class VideoContentAnalyzer:
             if not audio_rules:
                 return
             
-            # Optimization: Pre-load audio data to cache for reuse
             try:
                 self.audio_analyzer._get_cached_audio(audio_path)
                 logger.info("Audio data cached for reuse")
@@ -3244,7 +3226,6 @@ class VideoContentAnalyzer:
         if not audio_rules:
             return
             
-        # Optimization: Group consecutive voice segments for batch processing
         voice_only_segments = [(ts, end_ts) for ts, end_ts, has_voice in voice_segments if has_voice]
         
         if len(voice_only_segments) > 5:
@@ -3360,12 +3341,10 @@ class VideoContentAnalyzer:
         from pydub import AudioSegment
         import tempfile
         
-        # Optimization: Use memory-efficient temporary files with session isolation
         segment_filename = FileManager.sanitize_filename(f"audio_segment_{timestamp:.2f}_{os.getpid()}.wav")
         segment_path = os.path.join(self.temp_dir, segment_filename)
         
         try:
-            # Optimization: Load audio data once and reuse from cache
             y, sr = self.audio_analyzer._get_cached_audio(audio_path)
             
             # Convert to segment directly from numpy array (faster than loading from file)
@@ -4380,8 +4359,6 @@ class AnalysisScreen:
         except Exception as e:
             logger.debug(f"Error scanning for orphaned sessions: {e}")
         
-        # Session-specific cleanup is handled elsewhere
-        
         ScreenManager._cleanup_previous_session()
         import gc
         gc.collect()
@@ -4656,8 +4633,6 @@ class QAScreen:
                                     logger.debug(f"QA Screen: Skipped cleanup of temp session {item}: {e}")
                 except Exception as e:
                     logger.debug(f"QA Screen: Error scanning for orphaned sessions: {e}")
-                
-                # Session-specific cleanup
                 
                 ScreenManager._cleanup_previous_session()
                 
@@ -5128,8 +5103,6 @@ class StreamlitInterface:
             session_id = session_id or SessionManager.generate_session_id()
             safe_filename = FileManager.sanitize_filename(video_file.name)
             
-            # Optimize chunk size for production environments
-            # Larger chunks for faster uploads in cloud environments
             file_size = getattr(video_file, 'size', 0)
             if file_size > 100 * 1024 * 1024:  # Files > 100MB
                 chunk_size = 4 * 1024 * 1024  # 4MB chunks
