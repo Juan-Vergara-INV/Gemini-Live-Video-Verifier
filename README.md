@@ -143,14 +143,14 @@ Open your browser and navigate to: `http://localhost:8501`
 - **Question ID**: Unique identifier for the analysis session
 - **Alias Email**: Email address for session tracking
 - **QA Email Address**: Quality assurance analyst email
-- **Video File**: Upload your video file (MP4, AVI, MOV, MKV)
+- **Video File**: Upload your video file (MP4)
 
 #### Configuration Options:
 
 - **Target Language**: Select the expected language for fluency analysis
 - **Frame Interval**: Time between analyzed frames (1-10 seconds)
   - Lower intervals = more accurate analysis but slower processing
-  - Higher intervals = faster processing but potentially missed content
+  - Higher intervals = faster processing, but potentially missed content
 
 ### 4. Video Analysis (Screen 2)
 
@@ -204,7 +204,7 @@ Review comprehensive results including:
 
 **Features**:
 
-- Multi-language support (15+ languages)
+- Multi-language support (25+ languages)
 - Whisper-based transcription
 - Fluency scoring algorithms
 - Confidence assessment
@@ -358,15 +358,15 @@ brew install ffmpeg
 **Analysis failures**:
 
 - Check video file format (must be MP4)
-- Verify file size (must be ≤500MB)
+- Verify file size (must be ≤1024MB)
 - Ensure good video quality for text detection
 - Check audio clarity for language analysis
 
 **Authorization failures**:
 
 - Verify Google Sheets configuration
-- Check user credentials in authorization sheet
-- Ensure QA email is in approved list
+- Check user credentials in the authorization sheet
+- Ensure QA email is in the approved list
 
 ### Getting Help
 
