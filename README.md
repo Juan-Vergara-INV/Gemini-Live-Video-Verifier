@@ -98,19 +98,31 @@ reduce_logging = true
 
 Supported languages for analysis:
 
-- English (en-US)
-- Spanish (es-MX, es-ES)
-- German (de-DE)
-- Italian (it-IT)
-- Portuguese (pt-BR, pt-PT)
-- Japanese (ja-JP)
-- Korean (ko-KR)
-- Chinese (zh-CN)
-- Arabic (ar-SA)
-- Hindi (hi-IN)
-- Indonesian (id-ID)
-- French (fr-FR)
-- Russian (ru-RU)
+- es-419
+- hi-IN
+- ja-JP
+- ko-KR
+- de-DE
+- en-IN
+- fr-FR
+- ar-EG
+- pt-BR
+- id-ID
+- ko-JA
+- zh-CN
+- ru-RU
+- ml-IN
+- sv-SE
+- te-IN
+- vi-VN
+- tr-TR
+- bn-IN
+- it-IT
+- zh-TW
+- pl-PL
+- nl-NL
+- th-TH
+- ko-ZH
 
 ## 📖 Usage
 
