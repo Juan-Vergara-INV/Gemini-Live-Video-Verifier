@@ -1,32 +1,10 @@
 [server]
 maxUploadSize = 1000
-
 headless = true
-enableCORS = true
-enableXsrfProtection = false
-
-runOnSave = false
 fileWatcherType = "none"
-
-address = "0.0.0.0"
-port = 8501
 
 [browser]
 gatherUsageStats = false
-serverAddress = "0.0.0.0"
-
-[client]
-showErrorDetails = true
-
-toolbarMode = "minimal"
 
 [runner]
-magicEnabled = true
-
-enforceSerializableSessionState = false
 enumCoercion = "off"
-
-[global]
-developmentMode = false
-suppressDeprecationWarnings = true
-
