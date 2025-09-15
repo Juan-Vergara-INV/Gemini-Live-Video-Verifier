@@ -29,14 +29,6 @@ import numpy as np
 import pytesseract
 import streamlit as st
 
-# Load environment variables from .env file if available
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    # dotenv not installed, skip loading .env file
-    pass
-
 import librosa
 import speech_recognition as sr
 from pydub import AudioSegment
@@ -1110,21 +1102,13 @@ class AnalysisScreen:
                 with st.expander(f"📝 2.5 Flash Text Detection{flash_qa_status}", expanded=False):
                     validation_status = flash_qa_info.get('validation_status', 'not_found') if flash_qa_info else 'not_found'
                     
-                    if validation_status in ['incorrect_model', 'potential_incorrect_model']:
-                        if validation_status == 'incorrect_model':
-                            st.error("**Incorrect Model Detected:** 2.5 Pro was found instead of 2.5 Flash")
-                        else:
-                            st.error("**Potential Incorrect Model:** Text suggesting 2.5 Pro was found instead of 2.5 Flash")
+                    if validation_status == 'incorrect_model':
+                        st.error("**Incorrect Model Detected:** 2.5 Pro was found instead of 2.5 Flash")
                         
                         pro_detection_result = None
                         for result in flash_results:
-                            model_validation = result.details.get('model_validation', {})
-                            detection_method = result.details.get('detection_method', '')
-                            raw_ocr_text = result.details.get('raw_ocr_text', '')
-                            
-                            if (model_validation.get('status') == 'incorrect_model' or 
-                                'pro_incorrect' in detection_method or
-                                (raw_ocr_text and ('pro' in raw_ocr_text.lower() or 'pno' in raw_ocr_text.lower()))):
+                            if (result.details and 
+                                result.details.get('model_validation', {}).get('status') == 'incorrect_model'):
                                 pro_detection_result = result
                                 break
                         
@@ -1390,7 +1374,6 @@ class GoogleDriveIntegration:
             scopes = ['https://www.googleapis.com/auth/drive']
             credentials = None
             
-            # Option 1: Use credentials from Streamlit secrets (recommended for production)
             try:
                 service_account_info = ConfigurationManager.get_google_service_account_info()
                 if service_account_info:
@@ -1398,20 +1381,6 @@ class GoogleDriveIntegration:
                     logger.info("Using Google service account credentials from Streamlit secrets")
             except Exception as e:
                 logger.warning(f"Could not load credentials from secrets: {e}")
-            
-            # Option 2: Fall back to environment variables
-            if not credentials:
-                credentials_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
-                if credentials_json:
-                    credentials_info = json.loads(credentials_json)
-                    credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
-                    logger.info("Using Google service account credentials from environment variable JSON")
-                else:
-                    # Option 3: Use credentials file path from environment variable
-                    credentials_path = os.getenv('GOOGLE_SERVICE_ACCOUNT_PATH')
-                    if credentials_path and os.path.exists(credentials_path):
-                        credentials = Credentials.from_service_account_file(credentials_path, scopes=scopes)
-                        logger.info("Using Google service account credentials from file path")
             
             if not credentials:
                 logger.error("No Google credentials found. Please configure credentials in Streamlit secrets or set environment variables")
@@ -1710,8 +1679,7 @@ class TextMatcher:
         '25 pro': '2.5 pro',
         'fiash': 'flash', 'flasb': 'flash', 'fash': 'flash',
         'flashy': 'flash', 'flast': 'flash', 'flach': 'flash',
-        'pno': 'pro', 'prn': 'pro', 'pro.': 'pro', 'pio': 'pro', 
-        'pr0': 'pro', 'prc': 'pro', 'prs': 'pro',
+        'pno': 'pro', 'prn': 'pro', 'pro.': 'pro',
         'evai mode': 'eval mode', 'eval rode': 'eval mode',
         'native audio output': 'native audio output',
         'roannng tiger': 'roaring tiger', 'roaring tiqer': 'roaring tiger', 'roaring tigee': 'roaring tiger',
@@ -1776,10 +1744,6 @@ class TextMatcher:
         detected_lower = detected.lower().strip()
         expected_lower = expected.lower().strip()
         
-        # Enhanced logging for Flash/Pro detection
-        if expected_lower in ['2.5 flash', '2.5 pro']:
-            logger.info(f"TextMatcher: Comparing '{detected}' with '{expected}'")
-        
         # Special case for "roaring tiger" - alias name
         if expected_lower == "roaring tiger":
             if cls._match_roaring_tiger_variants(detected_lower):
@@ -1787,14 +1751,10 @@ class TextMatcher:
         
         # Strategy 1: Exact phrase match (word boundaries respected)
         if cls._exact_phrase_match(detected_lower, expected_lower):
-            if expected_lower in ['2.5 flash', '2.5 pro']:
-                logger.info(f"TextMatcher: Exact phrase match found for '{expected}' in '{detected}'")
             return True, 'exact_phrase_match'
         # Strategy 2: OCR error correction with word boundaries
         corrected_detected = cls.apply_ocr_corrections(detected_lower)
         if cls._exact_phrase_match(corrected_detected, expected_lower):
-            if expected_lower in ['2.5 flash', '2.5 pro']:
-                logger.info(f"TextMatcher: OCR corrected match - '{detected}' -> '{corrected_detected}' matches '{expected}'")
             return True, 'ocr_corrected_phrase'
         # Strategy 3: Reverse check for very specific cases
         if (len(detected_lower) >= 6 and
@@ -1810,12 +1770,7 @@ class TextMatcher:
         detected_words = detected_lower.split()
         overall_similarity = cls.calculate_similarity(detected_lower, expected_lower)
         if overall_similarity >= cls.SIMILARITY_THRESHOLDS['character_strict']:
-            if expected_lower in ['2.5 flash', '2.5 pro']:
-                logger.info(f"TextMatcher: Fuzzy match found - '{detected}' matches '{expected}' with similarity {overall_similarity:.2f}")
             return True, f'character_similarity_{overall_similarity:.2f}'
-        
-        if expected_lower in ['2.5 flash', '2.5 pro']:
-            logger.info(f"TextMatcher: No match found - '{detected}' vs '{expected}' (similarity: {overall_similarity:.2f})")
         return False, f'no_match_similarity_{overall_similarity:.2f}'
 
     @classmethod
@@ -3346,7 +3301,7 @@ class VideoContentAnalyzer:
     
     def _detect_text(self, rule: DetectionRule, frame: np.ndarray, 
                     timestamp: float, frame_number: int) -> DetectionResult:
-        """OCR-based text detection pipeline with enhanced logging."""
+        """OCR-based text detection pipeline."""
         params = rule.parameters
         
         try:
@@ -3362,21 +3317,9 @@ class VideoContentAnalyzer:
             ocr_time = time.time() - ocr_start_time
             self.performance_metrics['ocr_processing_time'] += ocr_time
             
-            # Enhanced logging for Flash detection
-            expected_text = params.get('expected_text', '')
-            if expected_text == TargetTexts.FLASH_TEXT:
-                logger.info(f"Flash detection at {timestamp:.2f}s - Raw OCR: '{text}' (length: {len(text)})")
-                if boxes.get('text'):
-                    ocr_words = [word.strip() for word in boxes['text'] if word.strip()]
-                    logger.info(f"Flash detection OCR words: {ocr_words}")
-            
             detected, text_bounding_box, detection_method = self._analyze_ocr_results(
                 text, boxes, params, roi_offset
             )
-            
-            # Log detection results for debugging
-            if expected_text == TargetTexts.FLASH_TEXT:
-                logger.info(f"Flash detection result at {timestamp:.2f}s: detected={detected}, method='{detection_method}'")
             
             screenshot_path = None
             if params.get('save_screenshot', True) and (detected or 'pro_incorrect' in detection_method):
@@ -3385,12 +3328,10 @@ class VideoContentAnalyzer:
                         screenshot_path = self._create_flash_pro_screenshot(
                             frame, text_bounding_box, TargetTexts.PRO_TEXT, rule.name, timestamp, is_correct=False
                         )
-                        logger.info(f"Created Pro incorrect screenshot at {timestamp:.2f}s: {screenshot_path}")
                     elif 'flash_correct' in detection_method:
                         screenshot_path = self._create_flash_pro_screenshot(
                             frame, text_bounding_box, TargetTexts.FLASH_TEXT, rule.name, timestamp, is_correct=True
                         )
-                        logger.info(f"Created Flash correct screenshot at {timestamp:.2f}s: {screenshot_path}")
                     else:
                         screenshot_path = self._create_text_screenshot(
                             frame, text_bounding_box, params.get('expected_text', ''), rule.name, timestamp
@@ -3419,16 +3360,13 @@ class VideoContentAnalyzer:
                     'detection_method': detection_method,
                     'roi_offset': roi_offset,
                     'word_count': len([word for word in boxes['text'] if word.strip()]),
-                    'model_validation': self._get_model_validation_info(detection_method, params.get('expected_text')),
-                    'raw_ocr_text': text,  # Add raw OCR text for debugging
-                    'frame_timestamp': timestamp,
-                    'ocr_processing_time': ocr_time
+                    'model_validation': self._get_model_validation_info(detection_method, params.get('expected_text'))
                 }, 
                 screenshot_path=screenshot_path
             )
             
         except Exception as e:
-            logger.error(f"OCR failed for rule {rule.name} at {timestamp:.2f}s: {e}")
+            logger.error(f"OCR failed for rule {rule.name}: {e}")
             return DetectionResult(
                 rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
                 detected=False, details={'error': str(e)}
@@ -3471,7 +3409,7 @@ class VideoContentAnalyzer:
         return roi if roi.size > 0 else None, (x1, y1)
     
     def _process_ocr_pipeline(self, roi: np.ndarray, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """Process OCR pipeline: preprocessing + OCR with enhanced detection."""
+        """Process OCR pipeline: preprocessing + OCR."""
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
         preprocess_config = params.get('preprocess', {})
@@ -3480,28 +3418,8 @@ class VideoContentAnalyzer:
         if preprocess_config.get('threshold', Config.OCR_THRESHOLD_ENABLED):
             gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         
-        # Primary OCR attempt
         text = pytesseract.image_to_string(gray, config=Config.OCR_CONFIG).strip()
         boxes = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=Config.OCR_CONFIG)
-        
-        # Enhanced detection for Flash/Pro text if no clear results
-        expected_text = params.get('expected_text', '')
-        if expected_text == TargetTexts.FLASH_TEXT and not text:
-            # Try different OCR configurations for better Flash/Pro detection
-            alternative_configs = ['--psm 8', '--psm 7', '--psm 6 -c tessedit_char_whitelist=0123456789.FlashPro ']
-            
-            for alt_config in alternative_configs:
-                try:
-                    alt_text = pytesseract.image_to_string(gray, config=alt_config).strip()
-                    if alt_text and (('flash' in alt_text.lower()) or ('pro' in alt_text.lower())):
-                        text = alt_text
-                        boxes = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=alt_config)
-                        logger.info(f"Alternative OCR config '{alt_config}' detected: '{text}'")
-                        break
-                except Exception as e:
-                    logger.debug(f"Alternative OCR config failed: {e}")
-                    continue
-        
         return text, boxes
     
     def _analyze_ocr_results(self, text: str, boxes: Dict[str, Any], params: Dict[str, Any], 
@@ -3531,63 +3449,24 @@ class VideoContentAnalyzer:
     
     def _analyze_flash_pro_detection(self, text: str, boxes: Dict[str, Any], 
                                    roi_offset: Tuple[int, int]) -> Tuple[bool, Optional[List[int]], str]:
-        """Special analysis for Flash/Pro detection with enhanced debugging."""
-        # Log the raw OCR text for debugging
-        logger.info(f"OCR Raw text for Flash/Pro analysis: '{text}'")
-        
+        """Special analysis for Flash/Pro detection."""
         flash_detected, flash_method = TextMatcher.match_text(text, TargetTexts.FLASH_TEXT)
+        
         pro_detected, pro_method = TextMatcher.match_text(text, TargetTexts.PRO_TEXT)
         
-        # Enhanced detection: check individual words from OCR boxes for "Pro" text
-        if not pro_detected and boxes.get('text'):
-            individual_words = [word.strip().lower() for word in boxes['text'] if word.strip()]
-            logger.info(f"Individual OCR words: {individual_words}")
-            
-            # Look for patterns that might indicate "2.5 Pro"
-            pro_indicators = []
-            for i, word in enumerate(individual_words):
-                if 'pro' in word or 'pno' in word or 'prn' in word:
-                    pro_indicators.append((i, word))
-                elif word in ['2.5', '25', '2s', '2.s'] and i < len(individual_words) - 1:
-                    next_word = individual_words[i + 1]
-                    if 'pro' in next_word or 'pno' in next_word or 'prn' in next_word:
-                        pro_indicators.append((i, f"{word} {next_word}"))
-            
-            if pro_indicators:
-                logger.info(f"Found Pro indicators in OCR words: {pro_indicators}")
-                pro_detected = True
-                pro_method = 'enhanced_word_detection'
-        
-        # Additional check for partial matches in the text
-        text_lower = text.lower()
-        if not flash_detected and not pro_detected:
-            # Check for partial "2.5" + "Flash/Pro" patterns
-            if '2.5' in text_lower or '25' in text_lower or '2s' in text_lower:
-                if 'flash' in text_lower or 'fiash' in text_lower or 'flasb' in text_lower:
-                    flash_detected = True
-                    flash_method = 'partial_pattern_match'
-                    logger.info(f"Enhanced Flash detection via partial pattern in: '{text}'")
-                elif 'pro' in text_lower or 'pno' in text_lower or 'prn' in text_lower:
-                    pro_detected = True
-                    pro_method = 'partial_pattern_match'
-                    logger.info(f"Enhanced Pro detection via partial pattern in: '{text}'")
-        
         if flash_detected:
-            logger.info(f"Flash detected using method: {flash_method}")
             text_bounding_box = self._find_text_bounding_box(TargetTexts.FLASH_TEXT, boxes)
             if text_bounding_box and roi_offset != (0, 0):
                 text_bounding_box[0] += roi_offset[0]
                 text_bounding_box[1] += roi_offset[1]
             return True, text_bounding_box, f'flash_correct_{flash_method}'
         elif pro_detected:
-            logger.info(f"Pro detected using method: {pro_method}")
             text_bounding_box = self._find_text_bounding_box(TargetTexts.PRO_TEXT, boxes)
             if text_bounding_box and roi_offset != (0, 0):
                 text_bounding_box[0] += roi_offset[0]
                 text_bounding_box[1] += roi_offset[1]
             return False, text_bounding_box, f'pro_incorrect_{pro_method}'
         else:
-            logger.info(f"Neither Flash nor Pro detected in text: '{text}'")
             return False, None, 'neither_found'
     
     def _create_text_screenshot(self, frame: np.ndarray, text_bounding_box: Optional[List[int]], 
@@ -3962,11 +3841,6 @@ class QualityAssuranceChecker:
                 'validation_status': 'not_found'
             }
         
-        # Log all flash results for debugging
-        logger.info(f"Flash QA check - Total flash results: {len(flash_results)}")
-        for i, result in enumerate(flash_results):
-            logger.info(f"Flash result {i}: detected={result.detected}, details={result.details}")
-        
         positive_flash_results = [r for r in flash_results if r.detected]
         
         if positive_flash_results:
@@ -3979,32 +3853,13 @@ class QualityAssuranceChecker:
                 'validation_status': 'correct_model'
             }
         
-        # Enhanced Pro detection check with more detailed analysis
         pro_incorrect_results = []
-        potential_pro_detections = []
-        
         for result in flash_results:
             model_validation = result.details.get('model_validation', {})
-            detection_method = result.details.get('detection_method', '')
-            raw_ocr_text = result.details.get('raw_ocr_text', '')
-            
-            # Check for explicit Pro incorrect detection
             if model_validation.get('status') == 'incorrect_model':
                 pro_incorrect_results.append(result)
-                logger.info(f"Found explicit Pro incorrect detection: {result.details}")
-            
-            # Check for Pro indicators in detection method or OCR text
-            elif 'pro_incorrect' in detection_method:
-                pro_incorrect_results.append(result)
-                logger.info(f"Found Pro via detection method: {detection_method}")
-            
-            # Check raw OCR text for Pro indicators
-            elif raw_ocr_text and ('pro' in raw_ocr_text.lower() or 'pno' in raw_ocr_text.lower()):
-                potential_pro_detections.append(result)
-                logger.info(f"Found potential Pro in raw OCR: '{raw_ocr_text}'")
         
         if pro_incorrect_results:
-            logger.info(f"Pro incorrect results found: {len(pro_incorrect_results)}")
             return {
                 'passed': False,
                 'score': 0.0,
@@ -4015,20 +3870,7 @@ class QualityAssuranceChecker:
                 'pro_count': len(pro_incorrect_results),
                 'validation_status': 'incorrect_model'
             }
-        elif potential_pro_detections:
-            logger.info(f"Potential Pro detections found: {len(potential_pro_detections)}")
-            return {
-                'passed': False,
-                'score': 0.0,
-                'details': "❌ Potential incorrect model detected: Text suggesting '2.5 Pro' was found instead of '2.5 Flash'. Please ensure you are using the correct Gemini model and try again.",
-                'flash_found': False,
-                'flash_count': 0,
-                'pro_found': True,
-                'pro_count': len(potential_pro_detections),
-                'validation_status': 'potential_incorrect_model'
-            }
         else:
-            logger.info("No Flash or Pro detections found")
             return {
                 'passed': False,
                 'score': 0.0,
