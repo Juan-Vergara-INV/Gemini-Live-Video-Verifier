@@ -1097,6 +1097,14 @@ class AnalysisScreen:
         if flash_results:
             flash_positive = [r for r in flash_results if r.detected]
             
+            # Debug logging for troubleshooting
+            logger.info(f"Flash results analysis: {len(flash_results)} total results, {len(flash_positive)} positive detections")
+            for i, result in enumerate(flash_results):
+                if result.details:
+                    logger.info(f"Flash result {i}: detected={result.detected}, "
+                               f"model_validation={result.details.get('model_validation', {})}, "
+                               f"detection_method={result.details.get('detection_method', '')}")
+            
             flash_qa_info = AnalysisScreen._get_qa_info_for_result(flash_results[0]) if flash_results else None
             flash_qa_status = ""
             if flash_qa_info:
@@ -1119,9 +1127,33 @@ class AnalysisScreen:
                                 result.details.get('model_validation', {}).get('status') == 'incorrect_model'):
                                 pro_detection_result = result
                                 break
+                            # Fallback: check detection method for pro_incorrect
+                            elif (result.details and 
+                                  'detection_method' in result.details and 
+                                  'pro_incorrect' in result.details.get('detection_method', '')):
+                                pro_detection_result = result
+                                break
                         
                         if pro_detection_result:
                             AnalysisScreen._render_incorrect_model_result(pro_detection_result)
+                        else:
+                            # Fallback: if we can't find the specific result, show general info
+                            st.warning("A 2.5 Pro detection was identified but the detailed result could not be displayed.")
+                            logger.warning(f"Could not find pro_detection_result. Flash results count: {len(flash_results)}")
+                            for i, result in enumerate(flash_results):
+                                logger.warning(f"Flash result {i}: detected={result.detected}, "
+                                             f"details_available={result.details is not None}")
+                                if result.details:
+                                    logger.warning(f"  - model_validation: {result.details.get('model_validation')}")
+                                    logger.warning(f"  - detection_method: {result.details.get('detection_method')}")
+                            
+                            # Try to show any result that might have Pro detection info
+                            for result in flash_results:
+                                if (result.details and 
+                                    ('2.5 pro' in result.details.get('detected_text', '').lower() or
+                                     'pro' in result.details.get('detection_method', '').lower())):
+                                    AnalysisScreen._render_text_detection_result(result)
+                                    break
                     else:
                         st.error("**2.5 Flash** was not detected in any frame of the video")
                     
@@ -3371,6 +3403,9 @@ class VideoContentAnalyzer:
                 elif 'flash_correct' in detection_method:
                     actual_detected_text = f"{text} (2.5 Flash detected - correct model)"
             
+            # Get model validation info
+            model_validation_info = self._get_model_validation_info(detection_method, params.get('expected_text'))
+            
             return DetectionResult(
                 rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
                 detected=detected, 
@@ -3383,7 +3418,7 @@ class VideoContentAnalyzer:
                     'detection_method': detection_method,
                     'roi_offset': roi_offset,
                     'word_count': len([word for word in boxes['text'] if word.strip()]),
-                    'model_validation': self._get_model_validation_info(detection_method, params.get('expected_text'))
+                    'model_validation': model_validation_info
                 }, 
                 screenshot_path=screenshot_path
             )
@@ -3399,6 +3434,10 @@ class VideoContentAnalyzer:
         """Get model validation information for Flash/Pro detection."""
         if expected_text != TargetTexts.FLASH_TEXT:
             return {}
+        
+        # Ensure detection_method is a string
+        if not isinstance(detection_method, str):
+            detection_method = str(detection_method)
         
         if 'flash_correct' in detection_method:
             return {
@@ -3878,8 +3917,18 @@ class QualityAssuranceChecker:
         
         pro_incorrect_results = []
         for result in flash_results:
-            model_validation = result.details.get('model_validation', {})
+            model_validation = result.details.get('model_validation', {}) if result.details else {}
+            detection_method = result.details.get('detection_method', '') if result.details else ''
+            
+            # Log debug information for troubleshooting
+            logger.info(f"Flash result analysis - detected: {result.detected}, "
+                       f"model_validation: {model_validation}, detection_method: {detection_method}")
+            
+            # Primary check: model validation status
             if model_validation.get('status') == 'incorrect_model':
+                pro_incorrect_results.append(result)
+            # Fallback check: detection method contains pro_incorrect
+            elif 'pro_incorrect' in detection_method:
                 pro_incorrect_results.append(result)
         
         if pro_incorrect_results:
