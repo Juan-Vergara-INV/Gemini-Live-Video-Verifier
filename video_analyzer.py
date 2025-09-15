@@ -29,6 +29,14 @@ import numpy as np
 import pytesseract
 import streamlit as st
 
+# Load environment variables from .env file if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # dotenv not installed, skip loading .env file
+    pass
+
 import librosa
 import speech_recognition as sr
 from pydub import AudioSegment
@@ -1366,18 +1374,50 @@ class GoogleDriveIntegration:
     def _initialize_service(self):
         """Initialize Google Drive service using service account."""
         try:
+            import os
+            import json
             from googleapiclient.discovery import build
             from google.oauth2.service_account import Credentials
             
-            credentials_path = "/workspaces/nose/gemini-live-verifier-1a5125954749.json"
-            
             scopes = ['https://www.googleapis.com/auth/drive']
-            credentials = Credentials.from_service_account_file(credentials_path, scopes=scopes)
+            credentials = None
+            
+            # Option 1: Use credentials from Streamlit secrets (recommended for production)
+            try:
+                service_account_info = ConfigurationManager.get_google_service_account_info()
+                if service_account_info:
+                    credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+                    logger.info("Using Google service account credentials from Streamlit secrets")
+            except Exception as e:
+                logger.warning(f"Could not load credentials from secrets: {e}")
+            
+            # Option 2: Fall back to environment variables
+            if not credentials:
+                credentials_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+                if credentials_json:
+                    credentials_info = json.loads(credentials_json)
+                    credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
+                    logger.info("Using Google service account credentials from environment variable JSON")
+                else:
+                    # Option 3: Use credentials file path from environment variable
+                    credentials_path = os.getenv('GOOGLE_SERVICE_ACCOUNT_PATH')
+                    if credentials_path and os.path.exists(credentials_path):
+                        credentials = Credentials.from_service_account_file(credentials_path, scopes=scopes)
+                        logger.info("Using Google service account credentials from file path")
+            
+            if not credentials:
+                logger.error("No Google credentials found. Please configure credentials in Streamlit secrets or set environment variables")
+                self.service = None
+                return
             
             self.service = build('drive', 'v3', credentials=credentials)
+            logger.info("Google Drive service initialized successfully")
             
         except ImportError:
             logger.error("Google API client libraries not installed")
+            self.service = None
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON format in GOOGLE_SERVICE_ACCOUNT_JSON environment variable")
             self.service = None
         except Exception as e:
             logger.error(f"Failed to initialize Google Drive service: {e}")
@@ -1633,6 +1673,17 @@ class ConfigurationManager:
             except Exception as e:
                 logger.error(f"Secure configuration error: {e}")
                 raise RuntimeError(f"Cannot load secure configuration: {e}") from e
+    
+    @classmethod
+    def get_google_service_account_info(cls) -> Optional[Dict[str, Any]]:
+        """Get Google service account credentials from secrets."""
+        try:
+            if "google_service_account" in st.secrets:
+                return dict(st.secrets["google_service_account"])
+            return None
+        except Exception as e:
+            logger.error(f"Failed to load Google service account info: {e}")
+            return None
 
 
 class TextMatcher:
