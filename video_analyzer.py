@@ -5,6 +5,7 @@ A video analysis system that provides text recognition, language fluency analysi
 The system includes quality assurance validation and a multi-screen Streamlit interface.
 """
 
+import gc
 import json
 import logging
 import os
@@ -19,8 +20,6 @@ from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union, Set
-import concurrent.futures
-import psutil
 import signal
 import sys
 import requests
@@ -34,28 +33,21 @@ import librosa
 import speech_recognition as sr
 from pydub import AudioSegment
 import whisper
+from scipy.ndimage import median_filter
 
 
 class Config:
-    """
-    Application configuration constants.
-    
-    This class centralizes all configuration parameters to improve maintainability.
-    """
+    """Centralized application configuration constants."""
     
     # Frame processing parameters
-    DEFAULT_FRAME_INTERVAL: float = 5.0
-    MIN_FRAME_INTERVAL: float = 1.0
-    MAX_FRAME_INTERVAL: float = 10.0
+    DEFAULT_FRAME_INTERVAL: float = 10.0
     
     # OCR configuration
     OCR_CONFIG: str = '--psm 6'
     OCR_DENOISING_ENABLED: bool = True
     OCR_THRESHOLD_ENABLED: bool = True
     
-    # Directory structure
-    OUTPUT_DIR: str = "analysis_output"
-    TEMP_DIR: str = "temp"
+    # Video format support
     SUPPORTED_VIDEO_FORMATS: List[str] = ['.mp4']
     
     # UI annotation settings
@@ -65,477 +57,249 @@ class Config:
     
     # Resource limits
     MAX_FILE_SIZE: int = 1024 * 1024 * 1024 # 1GB
-    MAX_VIDEO_DURATION: int = 1200  # 20 minutes
-    MAX_CONCURRENT_ANALYSES: int = 10
-    SESSION_TIMEOUT: int = 3600  # 1 hour
-    
-    # Performance optimizations
-    STREAMLIT_CLOUD_MODE: bool = True
-    ENABLE_PERFORMANCE_MONITORING: bool = True
-    AGGRESSIVE_MEMORY_CLEANUP: bool = True
-
-    # Memory limits calculated dynamically based on system capacity
-    @staticmethod
-    def get_memory_limits() -> Dict[str, float]:
-        """Get memory limits appropriate for the current system with optimizations always enabled."""
-        try:
-            import psutil
-            total_memory_gb = psutil.virtual_memory().total / (1024**3)
-            available_memory_gb = psutil.virtual_memory().available / (1024**3)
-            
-            if total_memory_gb <= 2:  # Very limited environment
-                return {
-                    "min_available_gb": 0.1,
-                    "max_usage_percent": 85,
-                    "per_session_gb": min(0.8, available_memory_gb * 0.8)  # Conservative
-                }
-            elif available_memory_gb >= 4.0:  # If we have 4GB+ available
-                per_session_gb = min(2.0, available_memory_gb * 0.6)  # Use up to 60% of available
-            elif available_memory_gb >= 3.0:  # If we have 3-4GB available
-                per_session_gb = min(1.5, available_memory_gb * 0.65)  # Use up to 65% of available
-            elif available_memory_gb >= 2.0:  # If we have 2-3GB available
-                per_session_gb = min(1.2, available_memory_gb * 0.7)  # Use up to 70% of available
-            else:  # Less than 2GB available
-                per_session_gb = max(0.8, available_memory_gb * 0.75)  # Use up to 75% of available
-            
-            if total_memory_gb <= 8:  # Small environment
-                return {
-                    "min_available_gb": 0.15,
-                    "max_usage_percent": 90,
-                    "per_session_gb": per_session_gb
-                }
-            elif total_memory_gb <= 16:  # Medium environment
-                return {
-                    "min_available_gb": 0.3,
-                    "max_usage_percent": 88,
-                    "per_session_gb": per_session_gb
-                }
-            else:  # Large environment
-                return {
-                    "min_available_gb": 0.5,
-                    "max_usage_percent": 85,
-                    "per_session_gb": per_session_gb
-                }
-        except:
-            # Fallback
-            return {
-                "min_available_gb": 0.1,
-                "max_usage_percent": 85,
-                "per_session_gb": 0.8
-            }
-    
-    # Security validation
-    ALLOWED_FILENAME_PATTERN: re.Pattern = re.compile(r'^[a-zA-Z0-9._\-\s:]+$')
-    MAX_FILENAME_LENGTH: int = 255
+    MAX_VIDEO_DURATION: int = 600  # 10 minutes
+    MIN_VIDEO_DURATION: int = 30   # 30 seconds minimum
     
     # Color definitions for UI annotations and bounding boxes
-    COLORS: Dict[str, Tuple[int, int, int]] = {
+    ANNOTATION_COLORS: Dict[str, Tuple[int, int, int]] = {
         'GREEN': (0, 255, 0),
-        'BLUE': (255, 0, 0),
         'RED': (0, 0, 255),
         'YELLOW': (0, 255, 255),
         'WHITE': (255, 255, 255),
-        'BLACK': (0, 0, 0)
     }
     
-    # Supported languages for audio analysis
-    SUPPORTED_LANGUAGES: Dict[str, str] = {
-        'es-419': 'es-419',
-        'hi-IN': 'hi-IN',
-        'ja-JP': 'ja-JP',
-        'ko-KR': 'ko-KR',
-        'de-DE': 'de-DE',
-        'en-IN': 'en-IN',
-        'fr-FR': 'fr-FR',
-        'ar-EG': 'ar-EG',
-        'pt-BR': 'pt-BR',
-        'id-ID': 'id-ID',
-        'ko-JA': 'ko-JA',
-        'zh-CN': 'zh-CN',
-        'ru-RU': 'ru-RU',
-        'ml-IN': 'ml-IN',
-        'sv-SE': 'sv-SE',
-        'te-IN': 'te-IN',
-        'vi-VN': 'vi-VN',
-        'tr-TR': 'tr-TR',
-        'bn-IN': 'bn-IN',
-        'it-IT': 'it-IT',
-        'zh-TW': 'zh-TW',
-        'pl-PL': 'pl-PL',
-        'nl-NL': 'nl-NL',
-        'th-TH': 'th-TH',
-        'ko-ZH': 'ko-ZH',
+    # Language configuration for display and Whisper mapping
+    LANGUAGE_CONFIG: Dict[str, Tuple[str, str]] = {
+        'es-419': ('es-419', 'es'), 'hi-IN': ('hi-IN', 'hi'), 'ja-JP': ('ja-JP', 'ja'), 'ko-KR': ('ko-KR', 'ko'),
+        'de-DE': ('de-DE', 'de'), 'en-IN': ('en-IN', 'en'), 'fr-FR': ('fr-FR', 'fr'), 'ar-EG': ('ar-EG', 'ar'),
+        'pt-BR': ('pt-BR', 'pt'), 'id-ID': ('id-ID', 'id'), 'ko-JA': ('ko-JA', 'ko'), 'zh-CN': ('zh-CN', 'zh'),
+        'ru-RU': ('ru-RU', 'ru'), 'ml-IN': ('ml-IN', 'ml'), 'sv-SE': ('sv-SE', 'sv'), 'te-IN': ('te-IN', 'te'),
+        'vi-VN': ('vi-VN', 'vi'), 'tr-TR': ('tr-TR', 'tr'), 'bn-IN': ('bn-IN', 'bn'), 'it-IT': ('it-IT', 'it'),
+        'zh-TW': ('zh-TW', 'zh'), 'pl-PL': ('pl-PL', 'pl'), 'nl-NL': ('nl-NL', 'nl'), 'th-TH': ('th-TH', 'th'),
+        'ko-ZH': ('ko-ZH', 'ko'),
     }
-    
-    @staticmethod
-    def get_language_options() -> Dict[str, str]:
-        """Get language options for UI selectors."""
-        return Config.SUPPORTED_LANGUAGES.copy()
 
-    @staticmethod
-    def get_language_display_name(language_code: str) -> str:
+    @classmethod
+    def get_supported_languages(cls) -> Dict[str, str]:
+        """Get dict of supported language codes to display names."""
+        return {locale: display_name for locale, (display_name, _) in cls.LANGUAGE_CONFIG.items()}
+
+    @classmethod
+    def get_language_display_name(cls, language_code: str) -> str:
         """Get display name for a language code."""
-        return Config.SUPPORTED_LANGUAGES.get(language_code, language_code.upper())
+        if language_code in cls.LANGUAGE_CONFIG:
+            return cls.LANGUAGE_CONFIG[language_code][0]
+        return language_code if language_code else "No language inferred, please review Question ID"
     
-    @staticmethod
-    def locale_to_whisper_language(locale_code: str) -> str:
-        """Convert locale code (e.g., 'en-US') to Whisper language code (e.g., 'en'). Only supports configured languages."""
-        locale_to_whisper = {
-            'es-419': 'es',
-            'hi-IN': 'hi',
-            'ja-JP': 'ja',
-            'ko-KR': 'ko',
-            'de-DE': 'de',
-            'en-IN': 'en',
-            'fr-FR': 'fr',
-            'ar-EG': 'ar',
-            'pt-BR': 'pt',
-            'id-ID': 'id',
-            'ko-JA': 'ko',
-            'zh-CN': 'zh',
-            'ru-RU': 'ru',
-            'ml-IN': 'ml',
-            'sv-SE': 'sv',
-            'te-IN': 'te',
-            'vi-VN': 'vi',
-            'tr-TR': 'tr',
-            'bn-IN': 'bn',
-            'it-IT': 'it',
-            'zh-TW': 'zh',
-            'pl-PL': 'pl',
-            'nl-NL': 'nl',
-            'th-TH': 'th',
-            'ko-ZH': 'ko',
-        }
-        # Return mapped value if present, else fallback to language part
-        return locale_to_whisper.get(locale_code, locale_code.split('-')[0] if '-' in locale_code else locale_code)
+    @classmethod
+    def locale_to_whisper_language(cls, locale_code: str) -> str:
+        """Convert locale code to Whisper language code."""
+        if locale_code in cls.LANGUAGE_CONFIG:
+            return cls.LANGUAGE_CONFIG[locale_code][1]
+        return locale_code
+
+    @classmethod
+    def whisper_language_to_locale(cls, whisper_language: str, target_locale: str = None) -> str:
+        """Convert Whisper language code back to locale format."""
+        if target_locale and cls.locale_to_whisper_language(target_locale) == whisper_language:
+            return target_locale
+        return whisper_language if whisper_language else "unknown"
+    
+    @classmethod
+    def is_portrait_mobile_resolution(cls, width: int, height: int) -> bool:
+        """Check if video resolution is portrait mobile phone format."""
+        if width >= height:
+            return False
+        
+        aspect_ratio = height / width
+        
+        if 1.6 <= aspect_ratio <= 2.5:
+            if 360 <= width <= 1600:
+                return True
+        
+        return False
+    
+    @classmethod
+    def validate_video_properties(cls, video_path: str) -> Dict[str, Any]:
+        """Validate and extract video properties including duration, resolution,and audio properties."""
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                return {'error': 'Cannot open video file'}
+            
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            
+            cap.release()
+            
+            audio_properties = {}
+            try:
+                from pydub import AudioSegment
+                audio = AudioSegment.from_file(video_path)
+                audio_properties = {
+                    'sample_rate': audio.frame_rate,
+                    'channels': audio.channels,
+                    'bit_depth': audio.sample_width * 8,
+                    'bit_rate': int(audio.frame_rate * audio.channels * audio.sample_width * 8)
+                }
+            except Exception as e:
+                logger.warning(f"Could not extract audio properties: {e}")
+                audio_properties = {
+                    'sample_rate': 'Unknown',
+                    'channels': 'Unknown', 
+                    'bit_depth': 'Unknown',
+                    'bit_rate': 'Unknown'
+                }
+            
+            validation_results = {
+                'duration_valid': duration >= cls.MIN_VIDEO_DURATION,
+                'resolution_valid': cls.is_portrait_mobile_resolution(width, height),
+                'duration': duration,
+                'width': width,
+                'height': height,
+                'fps': fps,
+                'total_frames': total_frames,
+                'audio_properties': audio_properties,
+                'min_duration_required': cls.MIN_VIDEO_DURATION
+            }
+            
+            return validation_results
+            
+        except Exception as e:
+            logger.error(f"Video validation failed: {e}")
+            return {'error': str(e)}
 
 
 class TargetTexts:
-    """
-    Target text definitions for detection.
-    """
+    """Target text definitions for detection."""
     
-    FLASH_TEXTS: List[str] = ["2.5 Flash"]
+    FLASH_TEXT: str = "2.5 Flash"
+    PRO_TEXT: str = "2.5 Pro"
+    ALIAS_NAME_TEXT: str = "Roaring tiger"
     EVAL_MODE_TEXT: str = "Eval Mode: Native Audio Output"
 
 
-class Logger:
-    """
-    Centralized logging management with configuration support.
-    """
-    
-    _logger_instance: Optional[logging.Logger] = None
-    
-    @staticmethod
-    def setup_logging(log_level: str = "INFO", log_format: Optional[str] = None) -> logging.Logger:
-        """
-        Initialize application logging with configurable level and format.
-        
-        Args:
-            log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-            log_format: Custom log format string
-            
-        Returns:
-            Configured logger instance
-        """
-        if Logger._logger_instance is not None:
-            return Logger._logger_instance
-            
-        if log_format is None:
-            log_format = '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
-        
-        logging.basicConfig(
-            level=getattr(logging, log_level.upper()),
-            format=log_format,
-            handlers=[logging.StreamHandler()]
-        )
-        
-        Logger._logger_instance = logging.getLogger(__name__)
-        
-        return Logger._logger_instance
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
-
-logger = Logger.setup_logging()
+logger = logging.getLogger(__name__)
 
 
 class DetectionType(Enum):
-    """
-    Content detection types enumeration.
-    
-    Uses auto() for automatic value assignment to prevent manual value management.
-    """
+    """Content detection types enumeration."""
     TEXT = auto()
-    AUDIO_LANGUAGE = auto()
+    LANGUAGE_FLUENCY = auto()
     VOICE_AUDIBILITY = auto()
 
 
-@dataclass(frozen=True)
+@dataclass
 class DetectionRule:
-    """
-    Detection rule configuration.
-    """
+    """Detection rule configuration."""
     name: str
     detection_type: DetectionType
     parameters: Dict[str, Any]
-    enabled: bool = True
-    created_at: datetime = field(default_factory=datetime.now)
-    
-    def __post_init__(self) -> None:
-        """Validate rule configuration after initialization."""
-        self._validate_rule()
-    
-    def _validate_rule(self) -> None:
-        """
-        Rule validation.
-        
-        Raises:
-            ValueError: If rule configuration is invalid
-        """
-        if not self.name or not self.name.strip():
-            raise ValueError("Rule name cannot be empty")
-        
-        if len(self.name) > 100:
-            raise ValueError("Rule name too long (max 100 characters)")
-        
-        validation_methods = {
-            DetectionType.TEXT: self._validate_text_rule,
-            DetectionType.AUDIO_LANGUAGE: self._validate_audio_language_rule,
-            DetectionType.VOICE_AUDIBILITY: self._validate_voice_audibility_rule
-        }
-        
-        validator = validation_methods.get(self.detection_type)
-        if validator:
-            validator()
-    
-    def _validate_text_rule(self) -> None:
-        """Validate text detection rule parameters."""
-        required_keys = ['expected_text', 'unexpected_text']
-        if not any(key in self.parameters for key in required_keys):
-            raise ValueError("Text rule requires at least one of: expected_text or unexpected_text")
-    
-    def _validate_audio_language_rule(self) -> None:
-        """Validate audio language detection rule parameters."""
-        if 'target_language' not in self.parameters:
-            raise ValueError("Audio language rule requires target_language parameter")
-        
-        target_lang = self.parameters['target_language']
-        if target_lang not in Config.SUPPORTED_LANGUAGES:
-            raise ValueError(f"Unsupported language: {target_lang}")
-    
-    def _validate_voice_audibility_rule(self) -> None:
-        """Validate voice audibility rule parameters."""
-        min_confidence = self.parameters.get('min_confidence', 0.3)
-        min_duration = self.parameters.get('min_duration', 3.0)
-        
-        if not 0.0 <= min_confidence <= 1.0:
-            raise ValueError("min_confidence must be between 0.0 and 1.0")
-        
-        if min_duration < 0.0:
-            raise ValueError("min_duration must be non-negative")
 
 
 @dataclass
 class DetectionResult:
-    """
-    Detection operation result with metadata.
-    
-    Provides detailed information about detection operations including
-    performance metrics and debugging information.
-    """
+    """Provides detailed information about detection operations including performance metrics and debugging information."""
     rule_name: str
     timestamp: float
     frame_number: int
     detected: bool
-    confidence: float
     details: Dict[str, Any]
     screenshot_path: Optional[Union[str, Path]] = None
     processing_time: float = 0.0
     error_message: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
     
-    def __post_init__(self) -> None:
-        """Validate result data after initialization."""
-        self._validate_result()
-    
-    def _validate_result(self) -> None:
-        """Validate detection result data."""
-        if not isinstance(self.confidence, (int, float)) or not 0.0 <= self.confidence <= 1.0:
-            raise ValueError("Confidence must be a number between 0.0 and 1.0")
-        
-        if self.timestamp < 0:
-            raise ValueError("Timestamp cannot be negative")
-        
-        if self.frame_number < 0:
-            raise ValueError("Frame number cannot be negative")
-    
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert detection result to dictionary representation.
-        
-        Returns:
-            Dictionary representation suitable for JSON serialization
-        """
+        """Convert detection result to dictionary representation."""
+
         return {
             'rule_name': self.rule_name,
             'timestamp': self.timestamp,
             'frame_number': self.frame_number,
             'detected': self.detected,
-            'confidence': self.confidence,
             'details': self.details,
             'screenshot_path': str(self.screenshot_path) if self.screenshot_path else None,
             'processing_time': self.processing_time,
             'error_message': self.error_message,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
-    
-    def is_valid(self) -> bool:
-        """Check if the detection result is valid."""
-        try:
-            self._validate_result()
-            return self.error_message is None
-        except ValueError:
-            return False
 
 
-class SecurityError(Exception):
-    """Custom exception for security-related errors."""
-    pass
-
-
-class GoogleSheetsVerifier:
-    """
-    Verifies question IDs, alias emails, and languages against authorized list in SoT.
-    
-    This class implements secure verification of video analysis requests by checking
-    question IDs, alias emails, and language IDs against a SoT.
-    """
-    
-    CACHE_DURATION = 300  # 5 minutes cache duration
+class TaskVerifier:
+    """Verifies question_id and alias_email inputs."""
     
     def __init__(self):
-        self._cache = {}
-        self._last_cache_time = 0
-        
-        # Load configuration from secrets
         config = ConfigurationManager.get_secure_config()
-        self.SHEET_URL = config.get("verifier_sheet_url", "")
-        self.SHEET_ID = config.get("verifier_sheet_id", "")
-        self.SHEET_NAME = config.get("verifier_sheet_name", "SoT Video Verifier")
+        self.SHEET_URL = config["verifier_sheet_url"]
+        self.SHEET_ID = config["verifier_sheet_id"]
+        self.QUESTION_IDS_SHEET = "Question IDs"
+        self.ALIAS_EMAILS_SHEET = "Alias Emails"
     
-    def verify_authorization(self, question_id: str, alias_email: str, language_id: str) -> Tuple[bool, str]:
-        """
-        Verify if question ID, alias email, and language are authorized for video analysis.
-        
-        Args:
-            question_id: The question identifier to verify
-            alias_email: The alias email to verify
-            language_id: The language ID to verify (e.g., 'en-US', 'id-ID', 'es-MX')
-            
-        Returns:
-            Tuple of (is_authorized, reason) where reason explains the result
-        """
+    def verify_inputs(self, question_id: str, alias_email: str) -> Tuple[bool, str]:
+        """Verify if question_id and alias_email are both authorized."""
         try:
-            # Input validation
             if not question_id or not question_id.strip():
                 return False, "Question ID cannot be empty"
             
             if not alias_email or not alias_email.strip():
                 return False, "Alias email cannot be empty"
             
-            # Language ID validation
-            if not language_id or not language_id.strip():
-                return False, "Language ID is required and cannot be empty"
-            clean_language_id = InputValidator.sanitize_user_input(language_id.strip())
-            # Validate language ID format
-            if not re.match(r'^[a-z]{2,3}-[A-Z0-9]{2,4}$', clean_language_id):
-                return False, f"Invalid language ID format: {language_id}. Expected format: 'en-US', 'id-ID', 'es-419', etc."
-            
-            # Sanitize inputs
-            clean_question_id = InputValidator.sanitize_user_input(question_id.strip())
-            clean_alias_email = InputValidator.sanitize_user_input(alias_email.strip()).lower()
-            
-            # Get authorized entries from SoT
-            authorized_entries = self._get_cached_data(
-                'authorized_entries',
-                lambda: self._fetch_from_sheets("getAuthorizedEntries", self.SHEET_NAME)
-            )
-            if not authorized_entries:
-                return False, "Unable to retrieve authorization data from SoT"
-            
-            # Check if combination is authorized
-            is_authorized = self._check_authorization(
-                clean_question_id, clean_alias_email, clean_language_id, authorized_entries
-            )
-            
-            if is_authorized:
-                auth_msg = f"question_id={clean_question_id}, email={clean_alias_email}, language={clean_language_id}"
-                return True, "Authorization verified successfully"
-            else:
-                auth_msg = f"Question ID '{clean_question_id}' with email '{clean_alias_email}' and language '{clean_language_id}' is not authorized for video verification"
-                logger.warning(f"Authorization failed: {auth_msg}")
-                return False, auth_msg
-        
+            return self._check_both_inputs(question_id.strip(), alias_email.strip().lower())
+
         except Exception as e:
             logger.error(f"Authorization verification error: {e}")
             return False, f"Authorization check failed: {str(e)}"
     
-    def _get_cached_data(self, cache_key: str, fetch_function) -> any:
-        """
-        Method to get cached data with fallback to fetch function.
-        
-        Args:
-            cache_key: The key to use for caching the data
-            fetch_function: Function to call to fetch fresh data
-            
-        Returns:
-            Cached or freshly fetched data
-        """
-        current_time = time.time()
-        
-        # Check cache validity
-        if (current_time - self._last_cache_time) < self.CACHE_DURATION and cache_key in self._cache:
-            return self._cache.get(cache_key, [])
-        
+    def _check_both_inputs(self, question_id: str, alias_email: str) -> Tuple[bool, str]:
+        """Check if both question_id and alias_email are authorized."""
         try:
-            # Fetch fresh data
-            data = fetch_function()
+            question_ids = self._fetch_sheet_data(self.QUESTION_IDS_SHEET)
+            alias_emails = self._fetch_sheet_data(self.ALIAS_EMAILS_SHEET)
             
-            # Update cache
-            self._cache[cache_key] = data
-            self._last_cache_time = current_time
+            question_found = False
+            for entry in question_ids:
+                if str(entry).strip() == question_id:
+                    question_found = True
+                    break
             
-            return data
+            if not question_found:
+                return False, f"Question ID '{question_id}' not found in authorized list"
+            
+            email_found = False
+            for entry in alias_emails:
+                if str(entry).strip().lower() == alias_email.lower():
+                    email_found = True
+                    break
+            
+            if not email_found:
+                return False, f"Alias email '{alias_email}' not found in authorized list"
+            
+            return True, f"Both Question ID '{question_id}' and email '{alias_email}' are authorized"
             
         except Exception as e:
-            logger.error(f"Failed to fetch data for {cache_key}: {e}")
-            # Return cached data if available, even if stale
-            if cache_key in self._cache:
-                logger.warning(f"Using stale cached data for {cache_key} due to fetch error")
-                return self._cache.get(cache_key, [])
-            return []
-    
-    def _fetch_from_sheets(self, action: str, sheet_name: str, data_processor=None):
-        """
-        Method to fetch data from Google Sheets via Google Apps Script.
-        
-        Args:
-            action: The action to perform (e.g., "getAuthorizedEntries", "getQAEmails")
-            sheet_name: The name of the sheet to query
-            data_processor: Optional function to process the raw data
-            
-        Returns:
-            Processed data from the sheet
-        """
+            logger.error(f"Input check error: {e}")
+            return False, f"Failed to verify inputs: {str(e)}"
+
+    def _fetch_sheet_data(self, sheet_name: str) -> List[str]:
+        """Fetch data from a specific sheet."""
         try:
-            # Use the existing Google Apps Script infrastructure
             config = ConfigurationManager.get_secure_config()
             gas_url = config["apps_script_url"]
             
             payload = {
-                "action": action,
+                "action": "getAuthorizedEntries",
                 "sheetName": sheet_name,
-                "data": {}  # Empty data object since we're just fetching
+                "data": {}
             }
             
             response = requests.post(
@@ -547,499 +311,1320 @@ class GoogleSheetsVerifier:
             
             response.raise_for_status()
             result = response.json()
-            
-            if result.get("success") or result.get("status") == "success":
+
+            if result.get("success"):
                 raw_data = result.get("data", [])
-                if data_processor:
-                    return data_processor(raw_data)
-                return raw_data
+                values = []
+                
+                for item in raw_data:
+                    if isinstance(item, dict):
+                        if sheet_name == "Question IDs":
+                            question_id = item.get('question_id', item.get('id', ''))
+                            if question_id and str(question_id).strip():
+                                values.append(str(question_id).strip())
+                        elif sheet_name == "Alias Emails":
+                            alias_email = item.get('alias_email', item.get('email', ''))
+                            if alias_email and str(alias_email).strip():
+                                values.append(str(alias_email).strip())
+                        else:
+                            for value in item.values():
+                                if value and str(value).strip():
+                                    values.append(str(value).strip())
+                                    break
+                    elif item and str(item).strip():
+                        values.append(str(item).strip())
+                
+                return values
             else:
                 error_msg = result.get('message', result.get('error', 'Unknown error'))
-                logger.error(f"Google Sheets API error for {action}: {error_msg}")
+                logger.error(f"Google Sheets API error for {sheet_name}: {error_msg}")
                 return []
                 
         except requests.RequestException as e:
-            logger.error(f"Network error fetching from Google Sheets ({action}): {e}")
+            logger.error(f"Network error fetching {sheet_name} sheet: {e}")
             return []
         except Exception as e:
-            logger.error(f"Unexpected error fetching from Google Sheets ({action}): {e}")
+            logger.error(f"Unexpected error fetching {sheet_name} sheet: {e}")
             return []
-    
-    def _check_membership(self, item, authorized_list, match_function=None) -> bool:
-        """
-        Method to check if an item is in an authorized list.
-        
-        Args:
-            item: The item to check for authorization
-            authorized_list: List of authorized items
-            match_function: Optional custom function to determine matches
-            
-        Returns:
-            True if authorized, False otherwise
-        """
-        if match_function:
-            return match_function(item, authorized_list)
-        
-        # Default behavior for simple list membership
-        return item in authorized_list
-    
-    def _check_authorization(self, question_id: str, alias_email: str, language_id: str,
-                           authorized_entries: List[Dict[str, str]] = None) -> bool:
-        """
-        Check if question ID, alias email, and language combination is authorized.
-        
-        Args:
-            question_id: Clean question ID
-            alias_email: Clean alias email
-            language_id: Clean language ID
-            authorized_entries: List of authorized entries
-            
-        Returns:
-            True if authorized, False otherwise
-        """
-        def match_triple(params, entries):
-            q_id, email, lang_id = params
-            for entry in entries:
-                entry_question_id = str(entry.get('question_id', '')).strip()
-                entry_alias_email = str(entry.get('alias_email', '')).strip().lower()
-                entry_language_id = str(entry.get('language_id', '')).strip()
-
-                # All three must match for authorization
-                question_match = entry_question_id == q_id
-                email_match = entry_alias_email == email
-                language_match = entry_language_id.lower() == lang_id.lower()
-                if question_match and email_match and language_match:
-                    return True
-            return False
-        
-        return self._check_membership(
-            (question_id, alias_email, language_id),
-            authorized_entries,
-            match_triple
-        )
-    
-    def verify_qa_email(self, qa_email: str) -> Tuple[bool, str]:
-        """
-        Verify if QA email is authorized in the QA sheet.
-        
-        Args:
-            qa_email: The QA email address to verify
-            
-        Returns:
-            Tuple of (is_authorized, reason) where reason explains the result
-        """
-        try:
-            # Input validation
-            if not qa_email or not qa_email.strip():
-                return False, "QA email cannot be empty"
-            
-            # Sanitize input
-            clean_qa_email = InputValidator.sanitize_user_input(qa_email.strip()).lower()
-            
-            # Get authorized QA emails from SoT
-            def process_qa_data(raw_data):
-                qa_emails = []
-                for entry in raw_data:
-                    if isinstance(entry, dict) and 'qa_email' in entry:
-                        email = str(entry['qa_email']).strip().lower()
-                        if email:
-                            qa_emails.append(email)
-                    elif isinstance(entry, str):
-                        email = entry.strip().lower()
-                        if email:
-                            qa_emails.append(email)
-                return qa_emails
-            
-            authorized_qa_emails = self._get_cached_data(
-                'authorized_qa_emails',
-                lambda: self._fetch_from_sheets("getQAEmails", "QA", process_qa_data)
-            )
-            if not authorized_qa_emails:
-                return False, "Unable to retrieve QA authorization data from SoT"
-
-            # Check if QA email is authorized
-            is_authorized = self._check_membership(clean_qa_email, authorized_qa_emails)
-            
-            if is_authorized:
-                return True, "QA email verified successfully"
-            else:
-                logger.warning(f"QA authorization failed: {clean_qa_email} is not authorized")
-                return False, f"QA email '{clean_qa_email}' is not authorized for video verification"
-        
-        except Exception as e:
-            logger.error(f"QA authorization verification error: {e}")
-            return False, f"QA authorization check failed: {str(e)}"
-
-
-class InputValidator:
-    """
-    Input validation utilities with compiled patterns.
-    
-    Handles input sanitization and validation with pre-compiled regex patterns.
-    """
-    
-    _DANGEROUS_PATTERNS = [
-        re.compile(r'<[^>]*>', re.IGNORECASE),  # HTML tags
-        re.compile(r'javascript:', re.IGNORECASE),  # JavaScript protocol
-        re.compile(r'on\w+\s*=', re.IGNORECASE),  # Event handlers
-        re.compile(r'expression\s*\(', re.IGNORECASE),  # CSS expressions
-        re.compile(r'(drop|delete|insert|update|select|union|exec|execute)\s+', re.IGNORECASE),  # SQL keywords
-        re.compile(r'["\';\\]'),  # Quote characters
-        re.compile(r'\.\./', re.IGNORECASE),  # Path traversal
-        re.compile(r'\$\('),  # Command substitution
-        re.compile(r'`[^`]*`'),  # Backticks
-    ]
-    
-    _SESSION_SANITIZE_PATTERN = re.compile(r'[^\w-]')
-    
-    @staticmethod
-    def sanitize_user_input(user_input: str, max_length: int = 1000) -> str:
-        """
-        Sanitize user input to prevent injection attacks using pre-compiled patterns.
-        
-        Args:
-            user_input: Raw user input to sanitize
-            max_length: Maximum allowed length
-            
-        Returns:
-            Sanitized input string
-        """
-        if not isinstance(user_input, str):
-            return ""
-        
-        # Truncate to maximum length
-        sanitized = user_input[:max_length]
-        
-        # Remove dangerous patterns
-        for pattern in InputValidator._DANGEROUS_PATTERNS:
-            sanitized = pattern.sub('', sanitized)
-        
-        # Remove control characters except common whitespace
-        sanitized = ''.join(
-            char for char in sanitized 
-            if ord(char) >= 32 or char in '\t\n\r'
-        )
-        
-        return sanitized.strip()
-    
-    @staticmethod
-    def sanitize_session_id(session_id: str, max_length: int = 64) -> str:
-        """
-        Sanitize session ID for filesystem use with pre-compiled pattern.
-        
-        Args:
-            session_id: Session ID to sanitize
-            max_length: Maximum length to truncate to
-            
-        Returns:
-            Sanitized session ID safe for filesystem use
-        """
-        if not isinstance(session_id, str):
-            return ""
-        
-        return InputValidator._SESSION_SANITIZE_PATTERN.sub('_', session_id)[:max_length]
-    
-    @staticmethod
-    def validate_input_type_and_content(input_value: str, field_name: str) -> bool:
-        """
-        Common input validation pattern.
-        
-        Args:
-            input_value: Value to validate
-            field_name: Name of field for logging
-            
-        Returns:
-            True if input is valid, False otherwise
-        """
-        if not input_value or not isinstance(input_value, str):
-            logger.warning(f"Invalid {field_name} type or empty value")
-            return False
-        return True
-
-
-class PathValidator:
-    """
-    File path validation utilities.
-    
-    Separates path validation concerns from general security validation.
-    """
-    
-    _allowed_prefixes_cache: Optional[List[str]] = None
-    _cache_lock = threading.Lock()
-    
-    @classmethod
-    def _get_allowed_prefixes(cls) -> List[str]:
-        """Get cached allowed path prefixes."""
-        if cls._allowed_prefixes_cache is None:
-            with cls._cache_lock:
-                if cls._allowed_prefixes_cache is None:
-                    cls._allowed_prefixes_cache = [
-                        '/tmp/',
-                        '/var/tmp/',
-                        tempfile.gettempdir(),
-                        str(Path(Config.OUTPUT_DIR).resolve()),
-                        str(Path(Config.TEMP_DIR).resolve())
-                    ]
-        return cls._allowed_prefixes_cache
-    
-    @staticmethod
-    def validate_file_path(file_path: str) -> bool:
-        """
-        Validate file path to prevent path traversal and other attacks.
-        
-        Args:
-            file_path: Path to validate
-            
-        Returns:
-            True if path is safe, False otherwise
-        """
-        if not InputValidator.validate_input_type_and_content(file_path, "file path"):
-            return False
-        
-        try:
-            resolved_path = Path(file_path).resolve()
-            
-            # Check for path traversal attempts
-            if '..' in file_path:
-                logger.warning(f"Path traversal attempt detected: {file_path}")
-                return False
-            
-            # Validate absolute paths are in allowed locations
-            if file_path.startswith('/'):
-                allowed_prefixes = PathValidator._get_allowed_prefixes()
-                if not any(file_path.startswith(prefix) for prefix in allowed_prefixes):
-                    logger.warning(f"Absolute path not in allowed locations: {file_path}")
-                    return False
-            
-            # Validate filename
-            filename = resolved_path.name
-            if (len(filename) > Config.MAX_FILENAME_LENGTH or 
-                not Config.ALLOWED_FILENAME_PATTERN.match(filename)):
-                logger.warning(f"Invalid filename: {filename}")
-                return False
-                
-            return True
-            
-        except (OSError, ValueError) as e:
-            logger.error(f"Path validation error: {e}")
-            return False
-    
-    @staticmethod
-    def validate_file_size(file_path: str) -> bool:
-        """
-        Validate file size is within configured limits.
-        
-        Args:
-            file_path: Path to file to check
-            
-        Returns:
-            True if file size is acceptable, False otherwise
-        """
-        try:
-            if not os.path.exists(file_path):
-                logger.warning(f"File does not exist for size validation: {file_path}")
-                return True
-            
-            file_size = os.path.getsize(file_path)
-            if file_size > Config.MAX_FILE_SIZE:
-                logger.warning(
-                    f"File too large: {file_size} bytes (max: {Config.MAX_FILE_SIZE})"
-                )
-                return False
-                
-            return True
-            
-        except OSError as e:
-            logger.error(f"File size validation error: {e}")
-            return False
-
-
-class URLValidator:
-    """
-    URL validation utilities for trusted domain verification.
-    """
-    
-    # Allowed URL domains for external requests
-    _TRUSTED_DOMAINS: List[str] = [
-        'script.google.com',
-        'docs.google.com',
-        'drive.google.com',
-        'googleapis.com'
-    ]
-    
-    @staticmethod
-    def validate_url(url: str) -> bool:
-        """
-        Validate URL to ensure it's from trusted domains.
-        
-        Args:
-            url: URL to validate
-            
-        Returns:
-            True if URL is from trusted domain, False otherwise
-        """
-        if not InputValidator.validate_input_type_and_content(url, "URL"):
-            return False
-            
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            
-            # Check if domain is in trusted list
-            if parsed.hostname not in URLValidator._TRUSTED_DOMAINS:
-                logger.warning(f"Untrusted domain in URL: {parsed.hostname}")
-                return False
-                
-            # Ensure HTTPS for security
-            if parsed.scheme != 'https':
-                logger.warning(f"Non-HTTPS URL rejected: {parsed.scheme}")
-                return False
-                
-            return True
-            
-        except Exception as e:
-            logger.error(f"URL validation error: {e}")
-            return False
 
 
 class SessionManager:
-    """
-    Session management utilities with proper resource tracking.
+    """Session and resource management system."""
     
-    Handles session ID generation and secure temporary directory management.
-    """
+    _instance = None
+    _lock = threading.RLock()
+    _active_sessions: Dict[str, Dict[str, Any]] = {}
     
-    # Track created directories for cleanup
-    _created_directories: Set[str] = set()
-    _directory_lock = threading.Lock()
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
     
-    @staticmethod
-    def generate_session_id() -> str:
-        """
-        Generate cryptographically secure session ID.
-        
-        Returns:
-            Unique session identifier
-        """
+    def __init__(self):
+        if hasattr(self, '_initialized'):
+            return
+        self._initialized = True
+        self._session_base_dir = Path("sessions")
+        self._session_base_dir.mkdir(exist_ok=True)
+    
+    def generate_session_id(self) -> str:
+        """Generate a unique session ID."""
         return str(uuid.uuid4())
     
-    @staticmethod
-    def create_secure_temp_dir(session_id: str) -> str:
-        """
-        Create secure temporary directory for user session.
-        
-        Args:
-            session_id: Unique session identifier
+    def create_session(self, session_id: str) -> str:
+        """Create a new session directory and return its path."""
+        with self._lock:
+            session_dir = self._session_base_dir / session_id
+            session_dir.mkdir(exist_ok=True)
             
-        Returns:
-            Path to created directory
+            self._active_sessions[session_id] = {
+                'directory': str(session_dir),
+                'created_at': datetime.now().timestamp(),
+                'files': []
+            }
             
-        Raises:
-            SecurityError: If directory creation fails
-        """
-        if not InputValidator.validate_input_type_and_content(session_id, "session ID"):
-            raise SecurityError("Invalid session ID provided")
+            logger.info(f"Created session directory: {session_dir}")
+            return str(session_dir)
+    
+    def get_session_directory(self, session_id: str) -> Optional[str]:
+        """Get the directory path for a session."""
+        with self._lock:
+            if session_id in self._active_sessions:
+                return self._active_sessions[session_id]['directory']
+            
+            session_dir = self._session_base_dir / session_id
+            if session_dir.exists():
+                return str(session_dir)
+            
+            return None
+    
+    def add_file_to_session(self, session_id: str, file_path: str):
+        """Track a file as part of a session."""
+        with self._lock:
+            if session_id in self._active_sessions:
+                self._active_sessions[session_id]['files'].append(file_path)
+    
+    def save_frame(self, session_id: str, frame: np.ndarray, filename: str) -> Optional[str]:
+        """Save a frame to the session directory."""
+        try:
+            session_dir = self.get_session_directory(session_id)
+            if not session_dir:
+                logger.error(f"Session directory not found for {session_id}")
+                return None
+            
+            filepath = os.path.join(session_dir, filename)
+            
+            if frame is None or frame.size == 0:
+                logger.error(f"Invalid frame data for {filepath}")
+                return None
+            
+            success = cv2.imwrite(filepath, frame)
+            if success and os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                self.add_file_to_session(session_id, filepath)
+                return filepath
+            else:
+                logger.error(f"Failed to save frame: {filepath}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Frame save error: {e}")
+            return None
+    
+    def create_temp_file(self, session_id: str, prefix: str, suffix: str = ".tmp") -> str:
+        """Create a temporary file within the session directory."""
+        session_dir = self.get_session_directory(session_id)
+        if not session_dir:
+            raise ValueError(f"Session {session_id} not found")
         
-        # Sanitize session ID for filesystem use
-        safe_session_id = InputValidator.sanitize_session_id(session_id)
+        safe_prefix = re.sub(r'[^\w-]', '_', prefix)[:50]
+        timestamp = int(datetime.now().timestamp())
+        random_part = str(uuid.uuid4())[:8]
         
-        base_temp = Path(tempfile.gettempdir())
-        session_dir = base_temp / f"video_analyzer_{safe_session_id}"
+        filename = f"{safe_prefix}_{timestamp}_{random_part}{suffix}"
+        filepath = os.path.join(session_dir, filename)
+        
+        self.add_file_to_session(session_id, filepath)
+        return filepath
+    
+    def cleanup_session(self, session_id: str) -> None:
+        """Clean up a session and all its files."""
+        try:
+            with self._lock:
+                session_dir = self.get_session_directory(session_id)
+                if not session_dir or not os.path.exists(session_dir):
+                    return
+                
+                try:
+                    shutil.rmtree(session_dir)
+                    logger.info(f"Removed session directory: {session_dir}")
+                except Exception as e:
+                    logger.error(f"Failed to remove session directory {session_dir}: {e}")
+                
+                if session_id in self._active_sessions:
+                    del self._active_sessions[session_id]
+                
+        except Exception as e:
+            logger.error(f"Session cleanup error for {session_id}: {e}")
+    
+    def cleanup_old_sessions(self, max_age_hours: int = 24) -> None:
+        """Clean up sessions older than specified age."""
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
         
         try:
-            session_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-            
-            # Track created directory for cleanup
-            with SessionManager._directory_lock:
-                SessionManager._created_directories.add(str(session_dir))
-            
-            return str(session_dir)
-            
-        except OSError as e:
-            logger.error(f"Failed to create secure temp dir: {e}")
-            raise SecurityError(f"Cannot create secure temporary directory: {e}") from e
+            for session_dir in self._session_base_dir.iterdir():
+                if not session_dir.is_dir():
+                    continue
+                
+                try:
+                    dir_mtime = session_dir.stat().st_mtime
+                    if current_time - dir_mtime > max_age_seconds:
+                        session_id = session_dir.name
+                        
+                        try:
+                            import streamlit as st
+                            if (hasattr(st, 'session_state') and 
+                                hasattr(st.session_state, 'session_id') and
+                                st.session_state.session_id == session_id):
+                                continue
+                        except:
+                            pass
+                        
+                        self.cleanup_session(session_id)
+                        
+                except Exception as e:
+                    logger.error(f"Error checking session {session_dir.name}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Old sessions cleanup error: {e}")
+    
+    def get_active_sessions(self) -> List[str]:
+        """Get list of active session IDs."""
+        with self._lock:
+            return list(self._active_sessions.keys())
+
+
+_session_manager = SessionManager()
+
+
+def get_session_manager() -> SessionManager:
+    """Get the global session manager instance."""
+    return _session_manager
+
+
+class ScreenManager:
+    """Manages the screen interface state."""
     
     @staticmethod
-    def cleanup_session_directories() -> None:
-        """Clean up all tracked session directories."""
-        with SessionManager._directory_lock:
-            directories_to_clean = SessionManager._created_directories.copy()
-            SessionManager._created_directories.clear()
+    def initialize_session_state():
+        """Initialize session state variables for screen management."""
+        if 'current_screen' not in st.session_state:
+            st.session_state.current_screen = 'input'
         
-        for directory in directories_to_clean:
+        if 'session_id' not in st.session_state:
+            session_manager = get_session_manager()
+            st.session_state.session_id = session_manager.generate_session_id()
+        
+        if 'question_id' not in st.session_state:
+            st.session_state.question_id = ""
+        if 'alias_email' not in st.session_state:
+            st.session_state.alias_email = ""
+        if 'is_authorized' not in st.session_state:
+            st.session_state.is_authorized = False
+        if 'video_file' not in st.session_state:
+            st.session_state.video_file = None
+        if 'selected_language' not in st.session_state:
+            st.session_state.selected_language = ""
+        if 'frame_interval' not in st.session_state:
+            st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
+        
+        if 'analysis_results' not in st.session_state:
+            st.session_state.analysis_results = None
+        if 'analyzer_instance' not in st.session_state:
+            st.session_state.analyzer_instance = None
+        if 'qa_checker' not in st.session_state:
+            st.session_state.qa_checker = None
+
+        if 'analysis_in_progress' not in st.session_state:
+            st.session_state.analysis_in_progress = False
+        if 'analysis_started' not in st.session_state:
+            st.session_state.analysis_started = False
+        if 'validation_error_shown' not in st.session_state:
+            st.session_state.validation_error_shown = False
+    
+    @staticmethod
+    def navigate_to_screen(screen: str):
+        """Navigate to a specific screen."""
+        if st.session_state.get('current_screen') == 'input' and screen != 'input':
+            for key in list(st.session_state.keys()):
+                if key.startswith('input_') or key in ['FormSubmitter:input-', 'FormSubmitter:analysis-']:
+                    try:
+                        del st.session_state[key]
+                    except:
+                        pass
+        
+        st.session_state.current_screen = screen
+        st.rerun()
+    
+    @staticmethod
+    def reset_session_for_new_analysis():
+        """Completely reset session state for a new analysis."""
+        target_screen = 'input'
+        
+        current_session_id = st.session_state.get('session_id')
+        if current_session_id:
+            session_manager = get_session_manager()
+            session_manager.cleanup_session(current_session_id)
+            logger.info(f"Cleaned up session {current_session_id}")
+        
+        keys_to_clear = list(st.session_state.keys())
+        
+        for key in keys_to_clear:
             try:
-                if Path(directory).exists():
-                    shutil.rmtree(directory)
+                del st.session_state[key]
+            except:
+                logger.warning(f"Failed to clear session state key: {key}")
+        
+        session_manager = get_session_manager()
+        st.session_state.current_screen = target_screen
+        st.session_state.session_id = session_manager.generate_session_id()
+        st.session_state.question_id = ""
+        st.session_state.alias_email = ""
+        st.session_state.video_file = None
+        st.session_state.selected_language = ""
+        st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
+        st.session_state.analysis_results = None
+        st.session_state.analyzer_instance = None
+        st.session_state.qa_checker = None
+        st.session_state.analysis_in_progress = False
+        st.session_state.analysis_started = False
+        st.session_state.validation_error_shown = False
+        
+        try:
+            if hasattr(st, 'cache_data') and hasattr(st.cache_data, 'clear'):
+                st.cache_data.clear()
+        except:
+            pass
+        
+        try:
+            if hasattr(st, 'cache_resource') and hasattr(st.cache_resource, 'clear'):
+                st.cache_resource.clear()
+        except:
+            pass
+        
+        logger.info(f"Reset session for new analysis with new session ID: {st.session_state.session_id}")
+        st.rerun()
+    
+    @staticmethod
+    def get_current_screen() -> str:
+        """Get the current screen."""
+        return st.session_state.get('current_screen', 'input')
+    
+    @staticmethod
+    def _cleanup_previous_session():
+        """Clean up screenshots and files from the current session."""
+        try:
+            current_session_id = st.session_state.get('session_id')
+            if current_session_id:
+                session_manager = get_session_manager()
+                session_manager.cleanup_session(current_session_id)
+                logger.debug(f"Cleanup session {current_session_id}")
+            else:
+                logger.debug("No current session ID to clean up")
+                        
+        except Exception as e:
+            logger.error(f"Session cleanup error: {e}")
+
+
+class InputScreen:
+    """First screen: Input form for analysis parameters."""
+    _verifier = None
+
+    @classmethod
+    def _get_verifier(cls):
+        """Get or create the verifier instance."""
+        if cls._verifier is None:
+            cls._verifier = TaskVerifier()
+        return cls._verifier
+    
+    @staticmethod
+    def _infer_language_from_question_id(question_id: str) -> str:
+        """Infer target language from question ID."""
+        clean_id = question_id.strip()
+        
+        primary_match = re.search(r'human_eval_([a-z]{2,3}-[A-Z]{2,4})(?:_[A-Za-z]*)?(?:\+|$)', clean_id)
+        if primary_match:
+            lang_code = primary_match.group(1)
+            if lang_code in Config.LANGUAGE_CONFIG:
+                return lang_code
+        
+        for lang_code in Config.LANGUAGE_CONFIG:
+            if re.search(re.escape(lang_code), clean_id, re.IGNORECASE):
+                return lang_code
+
+    @staticmethod
+    def render():
+        """Render the input screen UI."""
+        main_container = st.container()
+        
+        if ScreenManager.get_current_screen() != 'input':
+            main_container.empty()
+            return
+            
+        with main_container:
+            InputScreen._render_title_and_divider()
+            InputScreen._render_form_fields()
+            st.divider()
+            InputScreen._render_validation_and_navigation()
+
+    @staticmethod
+    def _render_title_and_divider():
+        """Render title and divider for input screen."""
+        with st.container():
+            st.title("1️⃣ Input Parameters")
+            st.divider()
+
+    @staticmethod
+    def _render_form_fields():
+        """Render form input fields."""
+        if ScreenManager.get_current_screen() != 'input':
+            return
+            
+        col1, col2 = st.columns(2)
+        with col1:
+            question_id = st.text_input(
+                "Question ID *",
+                value=st.session_state.question_id,
+                placeholder="Enter question identifier",
+                help="Unique identifier for this analysis session (must be authorized in the Question IDs sheet, target language will be automatically inferred)",
+                disabled=st.session_state.get('analysis_in_progress', False)
+            )
+            st.session_state.question_id = question_id
+        with col2:
+            alias_email = st.text_input(
+                "Alias Email Address *",
+                value=st.session_state.alias_email,
+                placeholder="alias-email@gmail.com",
+                help="Email address for this analysis session (must be authorized in the Alias Emails sheet)",
+                disabled=st.session_state.get('analysis_in_progress', False)
+            )
+            st.session_state.alias_email = alias_email
+        st.divider()
+        st.subheader("📁 Video File")
+        video_file = st.file_uploader(
+            "Upload Video File *",
+            type=Config.SUPPORTED_VIDEO_FORMATS,
+            help=f"Supported formats: {', '.join(Config.SUPPORTED_VIDEO_FORMATS)} (Max: {Config.MAX_FILE_SIZE // 1024 // 1024}MB)",
+            disabled=st.session_state.get('analysis_in_progress', False)
+        )
+        st.session_state.video_file = video_file
+
+        question_id = st.session_state.get('question_id', '')
+        inferred_language = InputScreen._infer_language_from_question_id(question_id)
+        st.session_state.selected_language = inferred_language
+
+        st.info(f"⏳ **Minimum Video Duration Required**: {Config.MIN_VIDEO_DURATION} seconds")
+
+        st.info("📱 **Video Resolution**: Video must have standard mobile phone resolution")
+
+        if question_id:
+            language_display = Config.get_language_display_name(inferred_language)
+            if language_display is None:
+                language_display = inferred_language
+            st.info(f"🗣️ **Target Language**: {language_display}")
+        else:
+            st.info(f"🗣️ **Target Language**: Will be inferred from Question ID")
+
+        if video_file:
+            InputScreen._render_video_validation_and_properties(video_file)
+
+    @staticmethod
+    def _render_validation_and_navigation():
+        """Render validation messages and navigation buttons."""
+        if ScreenManager.get_current_screen() != 'input':
+            return
+        errors = InputScreen._validate_inputs()
+        display_errors = [error for error in errors if error != "validation_error"]
+        if errors:
+            for error in display_errors:
+                st.error(f"❌ {error}")
+            st.warning("⚠️ Please complete all required fields and ensure authorization before proceeding.")
+        
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            is_disabled = bool(errors) or st.session_state.get('analysis_in_progress', False)
+            button_text = "Validating..." if st.session_state.get('analysis_in_progress', False) else "Start Analysis"
+            
+            if st.button(button_text, type="primary", use_container_width=True, disabled=is_disabled, key="input_start_analysis_btn"):
+                st.session_state.analysis_in_progress = True
+                st.rerun()
+                
+        if st.session_state.get('analysis_in_progress', False) and not st.session_state.get('analysis_started', False):
+            st.session_state.analysis_started = True
+            InputScreen._handle_start_analysis()
+
+    @staticmethod
+    def _handle_start_analysis():
+        """Handle the Start Analysis button: authorization, state cleanup and navigation."""
+        question_id = st.session_state.question_id.strip()
+        alias_email = st.session_state.alias_email.strip()
+        
+        inferred_language = InputScreen._infer_language_from_question_id(question_id)
+        st.session_state.selected_language = inferred_language
+        
+        try:
+            if question_id and alias_email:
+                verifier = InputScreen._get_verifier()
+                is_authorized, auth_message = verifier.verify_inputs(question_id, alias_email)
+                
+                if not is_authorized:
+                    st.session_state.analysis_in_progress = False
+                    st.session_state.analysis_started = False
+                    st.session_state.validation_error_shown = True
+                    st.error(f"❌ **Authorization Failed**: {auth_message}")
+                    import time
+                    time.sleep(3)
+                    st.rerun()
+                    return
+                
+                InputScreen._cleanup_previous_analysis_state()
+                gc.collect()
+                try:
+                    cv2.destroyAllWindows()
+                except:
+                    pass
+                
+                st.session_state.analysis_in_progress = False
+                st.session_state.analysis_started = False
+                ScreenManager.navigate_to_screen('analysis')
+            
+        except Exception as e:
+            st.session_state.analysis_in_progress = False
+            st.session_state.analysis_started = False
+            st.session_state.validation_error_shown = True
+            logger.error(f"Authorization check error: {e}")
+            st.error(f"❌ **Authorization Check Failed**: Unable to verify inputs - {str(e)}")
+            st.rerun()
+            return
+
+    @staticmethod
+    def _cleanup_previous_analysis_state():
+        """Clean up previous analysis state from session."""
+        if hasattr(st.session_state, 'cached_temp_path'):
+            try:
+                if os.path.exists(st.session_state.cached_temp_path):
+                    os.unlink(st.session_state.cached_temp_path)
             except Exception as e:
-                logger.warning(f"Failed to cleanup session directory {directory}: {e}")
+                logger.warning(f"Failed to clean up cached temp file: {e}")
+            finally:
+                del st.session_state.cached_temp_path
+        
+        if hasattr(st.session_state, 'cached_video_file_name'):
+            del st.session_state.cached_video_file_name
+            
+        st.session_state.analysis_results = None
+        st.session_state.analyzer_instance = None
+        st.session_state.qa_checker = None
+        st.session_state.analysis_in_progress = False
+        st.session_state.analysis_started = False
+        st.session_state.validation_error_shown = False
+        if hasattr(st.session_state, 'analysis_session_id'):
+            del st.session_state.analysis_session_id
+
+    @staticmethod
+    def _validate_inputs() -> List[str]:
+        """Validate all input parameters and return errors for logic but not display."""
+        errors = []
+        if not st.session_state.question_id.strip():
+            errors.append("validation_error")
+        if not st.session_state.alias_email.strip():
+            errors.append("validation_error")
+        elif not InputScreen._is_valid_email(st.session_state.alias_email):
+            errors.append("Please enter a valid email address")
+        if not st.session_state.video_file:
+            errors.append("validation_error")
+        else:
+            video_validation = st.session_state.get('video_validation', {})
+            if video_validation:
+                duration_valid = video_validation.get('duration_valid', False)
+                resolution_valid = video_validation.get('resolution_valid', False)
+                
+                if not duration_valid:
+                    logger.debug(f"Video duration invalid: {video_validation.get('duration', 0)}s. Video must be at least {video_validation.get('min_duration_required', Config.MIN_VIDEO_DURATION)}s.")
+                    errors.append("validation_error")
+                if not resolution_valid:
+                    logger.debug(f"Video resolution invalid: {video_validation.get('width', 0)}x{video_validation.get('height', 0)}. Video must be in portrait mobile format.")
+                    errors.append("validation_error")
+
+        return errors
+
+    @staticmethod
+    def _is_valid_email(email: str) -> bool:
+        """Basic email validation."""
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(pattern, email) is not None
+
+    @staticmethod
+    def _render_video_validation_and_properties(video_file):
+        """Render video validation results and properties display."""
+        try:
+            if (hasattr(st.session_state, 'cached_video_file_name') and 
+                st.session_state.cached_video_file_name == video_file.name and
+                hasattr(st.session_state, 'cached_temp_path') and
+                hasattr(st.session_state, 'video_validation') and
+                os.path.exists(st.session_state.cached_temp_path)):
+                
+                validation_results = st.session_state.video_validation
+            else:
+                session_id = st.session_state.get('session_id', 'temp')
+                temp_path, _ = StreamlitInterface.create_temp_video(video_file, session_id)
+                
+                if not temp_path:
+                    return
+                    
+                validation_results = Config.validate_video_properties(temp_path)
+                
+                if 'error' in validation_results:
+                    try:
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+                    except:
+                        pass
+                    st.error(f"❌ Video validation failed: {validation_results['error']}")
+                    return
+                
+                st.session_state.cached_temp_path = temp_path
+                st.session_state.cached_video_file_name = video_file.name
+                st.session_state.video_validation = validation_results
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                duration = validation_results.get('duration', 0)
+                duration_valid = validation_results.get('duration_valid', False)
+                min_duration = validation_results.get('min_duration_required', Config.MIN_VIDEO_DURATION)
+                
+                if duration_valid:
+                    st.success(f"✅ **Duration**: {duration:.1f}s (≥ {min_duration}s required)")
+                else:
+                    st.error(f"❌ **Duration**: {duration:.1f}s (minimum {min_duration}s required)")
+                    
+            with col2:
+                width = validation_results.get('width', 0)
+                height = validation_results.get('height', 0)
+                resolution_valid = validation_results.get('resolution_valid', False)
+                
+                if resolution_valid:
+                    st.success(f"✅ **Resolution**: {width}x{height} (Portrait mobile format)")
+                else:
+                    if width >= height:
+                        st.error(f"❌ **Resolution**: {width}x{height} (Must be portrait orientation)")
+                    else:
+                        st.error(f"❌ **Resolution**: {width}x{height} (Not standard mobile portrait format)")
+                
+        except Exception as e:
+            st.error(f"❌ Could not validate video: {str(e)}")
+            logger.error(f"Video validation error: {e}")
+
+
+class AnalysisScreen:
+    """Second screen: Analysis progress and results."""
+    @staticmethod
+    def render():
+        """Render the analysis screen."""
+        st.title("2️⃣ Video Analysis")
+        st.divider()
+        
+        if st.session_state.analysis_results is not None:
+            AnalysisScreen._render_completed_analysis()
+        else:
+            AnalysisScreen._start_analysis()
+
+    @staticmethod
+    def _start_analysis():
+        """Start the video analysis process."""
+        st.subheader("🔄 Processing Video...")
+        overall_progress = st.progress(0, text="Initializing analysis...")
+        try:
+            session_id = st.session_state.session_id
+            if (hasattr(st.session_state, 'cached_temp_path') and
+                hasattr(st.session_state, 'cached_video_file_name') and
+                st.session_state.cached_video_file_name == st.session_state.video_file.name and
+                os.path.exists(st.session_state.cached_temp_path)):
+                
+                video_path = st.session_state.cached_temp_path
+                temp_files = [video_path]
+                overall_progress.progress(10, text="Using cached video, initializing analyzer...")
+            else:
+                video_path, temp_files = StreamlitInterface.create_temp_video(
+                    st.session_state.video_file, session_id
+                )
+                overall_progress.progress(10, text="Video processed, initializing analyzer...")
+
+            if not video_path:
+                st.error("❌ Failed to prepare video file for analysis")
+                return
+            with VideoContentAnalyzer(session_id=session_id) as analyzer:
+                AnalysisScreen._setup_and_run_analysis(analyzer, video_path, overall_progress)
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Analysis failed: {str(e)}")
+            logger.error(f"Analysis error: {e}")
+            AnalysisScreen._render_analysis_error_buttons()
+
+    @staticmethod
+    def _setup_and_run_analysis(analyzer, video_path, overall_progress):
+        default_rules = create_detection_rules(target_language=st.session_state.selected_language)
+        analyzer.rules = default_rules
+        rule_types = {}
+        for rule in analyzer.rules:
+            rule_type = rule.detection_type.value
+            rule_types[rule_type] = rule_types.get(rule_type, 0) + 1
+        overall_progress.progress(20, text=f"Added analysis rules...")
+        
+        def progress_callback(percentage, message):
+            try:
+                overall_progress.progress(percentage, text=message)
+            except Exception as e:
+                logger.warning(f"Progress update failed: {e}")
+        
+        results = analyzer.analyze_video(
+            video_path,
+            frame_interval=st.session_state.frame_interval,
+            progress_callback=progress_callback
+        )
+        overall_progress.progress(90, text="Analysis complete, generating report...")
+        analyzer.export_results("results.json")
+        
+        analyzer.cleanup_temp_files()
+        
+        video_duration = analyzer._get_video_duration() if hasattr(analyzer, '_get_video_duration') else 0.0
+        if video_duration == 0.0:
+            try:
+                cap = cv2.VideoCapture(video_path)
+                if cap.isOpened():
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    video_duration = total_frames / fps if fps > 0 else 0.0
+                    cap.release()
+            except Exception as e:
+                logger.warning(f"Failed to calculate video duration: {e}")
+                video_duration = 0.0
+        st.session_state.video_duration = video_duration
+        st.session_state.analysis_results = results
+        st.session_state.analysis_session_id = analyzer.session_id
+        st.session_state.analyzer_instance = analyzer
+        st.session_state.qa_checker = QualityAssuranceChecker(results)
+        overall_progress.progress(100, text="Analysis complete!")
+
+    @staticmethod
+    def _render_analysis_error_buttons():
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Retry Analysis"):
+                st.rerun()
+        with col2:
+            if st.button("⬅️ Back to Input"):
+                ScreenManager.navigate_to_screen('input')
+
+    @staticmethod
+    def _render_completed_analysis():
+        """Render completed analysis results."""
+        st.subheader("📊 Analysis Reports")
+        results = st.session_state.analysis_results
+        
+        if st.session_state.qa_checker:
+            overall = st.session_state.qa_checker.get_qa_summary()
+            
+            if overall['passed']:
+                st.success(f"✅ **Quality Assurance: PASSED** - All requirements met!")
+            else:
+                st.error(f"❌ **Quality Assurance: FAILED** - {overall['checks_passed']}/{overall['total_checks']} checks passed")
+            
+            st.divider()
+        
+        if results:
+            AnalysisScreen._render_individual_detections(results)
+        
+        AnalysisScreen._render_navigation_buttons()
+
+    @staticmethod
+    def _render_individual_detections(results):
+        text_results = [r for r in results if 'Text Detection' in r.rule_name]
+        language_results = [r for r in results if 'Language Detection' in r.rule_name]
+        voice_results = [r for r in results if 'Voice Audibility' in r.rule_name]
+        
+        if text_results:
+            AnalysisScreen._render_text_detections(text_results)
+            
+        if language_results:
+            language_qa_info = AnalysisScreen._get_qa_info_for_result(language_results[0]) if language_results else None
+            language_qa_status = ""
+            if language_qa_info:
+                language_qa_status = " - ✅ PASS" if language_qa_info['passed'] else " - ❌ FAIL"
+            
+            with st.expander(f"🗣️ Language Fluency Analysis{language_qa_status}", expanded=False):
+                for result in language_results[:15]:
+                    AnalysisScreen._render_audio_detection_result(result)
+                    
+        if voice_results:
+            voice_qa_info = AnalysisScreen._get_qa_info_for_result(voice_results[0]) if voice_results else None
+            voice_qa_status = ""
+            if voice_qa_info:
+                voice_qa_status = " - ✅ PASS" if voice_qa_info['passed'] else " - ❌ FAIL"
+            
+            with st.expander(f"👥 Voice Audibility Analysis{voice_qa_status}", expanded=False):
+                for result in voice_results[:15]:
+                    AnalysisScreen._render_audio_detection_result(result)
+
+    @staticmethod
+    def _render_text_detections(text_results):
+        """Render text detections."""
+        flash_results = [r for r in text_results if '2.5 Flash' in r.rule_name]
+        alias_results = [r for r in text_results if 'Alias Name' in r.rule_name]
+        eval_results = [r for r in text_results if 'Eval Mode' in r.rule_name]
+        
+        if flash_results:
+            flash_positive = [r for r in flash_results if r.detected]
+            
+            flash_qa_info = AnalysisScreen._get_qa_info_for_result(flash_results[0]) if flash_results else None
+            flash_qa_status = ""
+            if flash_qa_info:
+                flash_qa_status = " - ✅ PASS" if flash_qa_info['passed'] else " - ❌ FAIL"
+            
+            if flash_positive:
+                with st.expander(f"📝 2.5 Flash Text Detection{flash_qa_status}", expanded=False):
+                    AnalysisScreen._render_text_detection_result(flash_positive[0])
+                    
+            else:
+                with st.expander(f"📝 2.5 Flash Text Detection{flash_qa_status}", expanded=False):
+                    validation_status = flash_qa_info.get('validation_status', 'not_found') if flash_qa_info else 'not_found'
+                    
+                    if validation_status == 'incorrect_model':
+                        st.error("**Incorrect Model Detected:** 2.5 Pro was found instead of 2.5 Flash")
+                        
+                        pro_detection_result = None
+                        for result in flash_results:
+                            if (result.details and 
+                                result.details.get('model_validation', {}).get('status') == 'incorrect_model'):
+                                pro_detection_result = result
+                                break
+                        
+                        if pro_detection_result:
+                            AnalysisScreen._render_incorrect_model_result(pro_detection_result)
+                    else:
+                        st.error("**2.5 Flash** was not detected in any frame of the video")
+                    
+                    if flash_qa_info:
+                        st.markdown(f"**QA Feedback:** {flash_qa_info['details']}")
+        
+        if alias_results:
+            alias_positive = [r for r in alias_results if r.detected]
+            
+            alias_qa_info = AnalysisScreen._get_qa_info_for_result(alias_results[0]) if alias_results else None
+            alias_qa_status = ""
+            if alias_qa_info:
+                alias_qa_status = " - ✅ PASS" if alias_qa_info['passed'] else " - ❌ FAIL"
+            
+            if alias_positive:
+                with st.expander(f"📝 Alias Name Text Detection{alias_qa_status}", expanded=False):
+                    AnalysisScreen._render_text_detection_result(alias_positive[0])
+                    
+            else:
+                with st.expander(f"📝 Alias Name Text Detection{alias_qa_status}", expanded=False):
+                    st.error("**Roaring tiger** was not detected in any frame of the video")
+                    
+                    if alias_qa_info:
+                        st.markdown(f"**QA Feedback:** {alias_qa_info['details']}")
+        
+        if eval_results:
+            eval_positive = [r for r in eval_results if r.detected]
+            
+            eval_qa_info = AnalysisScreen._get_qa_info_for_result(eval_results[0]) if eval_results else None
+            eval_qa_status = ""
+            if eval_qa_info:
+                eval_qa_status = " - ✅ PASS" if eval_qa_info['passed'] else " - ❌ FAIL"
+            
+            if eval_positive:
+                with st.expander(f"📝 Eval Mode Text Detection{eval_qa_status}", expanded=False):
+                    AnalysisScreen._render_text_detection_result(eval_positive[0])
+            
+            else:
+                with st.expander(f"📝 Eval Mode Text Detection{eval_qa_status}", expanded=False):
+                    st.error("**Eval Mode: Native Audio Output** was not detected in any frame of the video")
+                    if eval_qa_info:
+                        st.markdown(f"**QA Feedback:** {eval_qa_info['details']}")
+
+    @staticmethod
+    def _render_navigation_buttons():
+        submit_enabled = False
+        submit_message = ""
+        
+        if st.session_state.qa_checker:
+            overall = st.session_state.qa_checker.get_qa_summary()
+            submit_enabled = overall['passed']
+            if not submit_enabled:
+                failed_checks = overall['total_checks'] - overall['checks_passed']
+                submit_message = f"Your video cannot be submitted because it failed {failed_checks} quality check(s). Please review the analysis results and make necessary adjustments."
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 New Analysis", use_container_width=True):
+                AnalysisScreen._cleanup_and_reset_for_new_analysis()
+        with col2:
+            if st.button("Submit Video", type="primary", use_container_width=True, disabled=not submit_enabled):
+                if submit_enabled:
+                    ScreenManager.navigate_to_screen('qa')
+                    
+        if not submit_enabled and submit_message:
+            st.warning(f"⚠️ {submit_message}")
+
+    @staticmethod
+    def _cleanup_and_reset_for_new_analysis():
+        current_session_id = st.session_state.get('analysis_session_id', st.session_state.get('session_id'))
+        if current_session_id:
+            session_manager = get_session_manager()
+            session_manager.cleanup_session(current_session_id)
+        
+        try:
+            session_manager = get_session_manager()
+            session_manager.cleanup_old_sessions(max_age_hours=1)
+        except Exception as e:
+            logger.debug(f"Error cleaning old sessions: {e}")
+        
+        ScreenManager._cleanup_previous_session()
+        gc.collect()
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
+        ScreenManager.reset_session_for_new_analysis()
+
+    @staticmethod
+    def _get_qa_info_for_result(result):
+        """Get QA information for a specific result."""
+        if not st.session_state.qa_checker:
+            return None
+        
+        qa_results = st.session_state.qa_checker.get_detailed_results()
+        
+        if 'Language Detection' in result.rule_name:
+            return qa_results.get('language_fluency')
+        elif 'Voice Audibility' in result.rule_name:
+            return qa_results.get('voice_audibility')
+        elif 'Text Detection' in result.rule_name and '2.5 Flash' in result.rule_name:
+            return qa_results.get('flash_presence')
+        elif 'Text Detection' in result.rule_name and 'Alias Name' in result.rule_name:
+            return qa_results.get('alias_name_presence')
+        elif 'Text Detection' in result.rule_name and 'Eval Mode' in result.rule_name:
+            return qa_results.get('eval_mode_presence')
+        
+        return None
+
+    @staticmethod
+    def _render_text_detection_result(result):
+        """Render text detections."""
+        qa_info = AnalysisScreen._get_qa_info_for_result(result)
+        header_text = f"### {result.rule_name}"
+        with st.container():
+            st.markdown(header_text)
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.write(f"**🎯 Detection Details:**")
+                st.write(f"• **Timestamp:** {result.timestamp:.2f}s")
+                st.write(f"• **Frame:** {result.frame_number}")
+                if hasattr(result, 'details') and result.details:
+                    if isinstance(result.details, dict):
+                        if 'detected_text' in result.details:
+                            st.write(f"**📝 Detected Text:**")
+                            st.code(result.details['detected_text'], language=None)
+            with col2:
+                AnalysisScreen._render_screenshot_section(result)
+
+            if qa_info:
+                st.markdown(f"**QA Feedback:** {qa_info['details']}")
+
+    @staticmethod
+    def _render_incorrect_model_result(result):
+        """Render details for incorrect model detection (2.5 Pro found instead of 2.5 Flash)."""
+        with st.container():
+            st.markdown("### Incorrect Model Detected")
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.write(f"**🎯 Detection Details:**")
+                st.write(f"• **Timestamp:** {result.timestamp:.2f}s")
+                st.write(f"• **Frame:** {result.frame_number}")
+                if hasattr(result, 'details') and result.details:
+                    if isinstance(result.details, dict):
+                        if 'detected_text' in result.details:
+                            st.write(f"**📝 Detected Text:**")
+                            st.code(result.details['detected_text'], language=None)
+                        model_info = result.details.get('model_validation', {})
+            with col2:
+                AnalysisScreen._render_screenshot_section(result)
+
+    @staticmethod
+    def _render_screenshot_section(result):
+        """Render screenshot section."""
+        screenshot_path = result.screenshot_path
+        if not screenshot_path:
+            st.warning("⚠️ No screenshot generated for positive detection" if result.detected else "No screenshot (no detection)")
+            return
+
+        if not os.path.isabs(screenshot_path):
+            session_id = getattr(st.session_state, 'analysis_session_id', None)
+            if session_id:
+                session_manager = get_session_manager()
+                session_dir = session_manager.get_session_directory(session_id)
+                if session_dir:
+                    screenshot_path = os.path.join(session_dir, os.path.basename(screenshot_path))
+
+        if not os.path.exists(screenshot_path):
+            if result.detected:
+                st.error("🚨 Screenshot missing for positive detection!")
+                st.caption(f"Expected path: {screenshot_path}")
+            else:
+                st.caption("Screenshot not available")
+            return
+
+        try:
+            file_size = os.path.getsize(screenshot_path)
+            is_readable = os.access(screenshot_path, os.R_OK)
+            if not is_readable or file_size == 0:
+                msg = f"Screenshot exists but not readable (size: {file_size})" if result.detected else "Screenshot not readable"
+                if result.detected:
+                    st.error(msg)
+                else:
+                    with st.expander("🖼️ Frame Screenshot", expanded=False):
+                        st.error(msg)
+                return
+
+            is_pro_detection = (
+                hasattr(result, 'details') and result.details and
+                isinstance(result.details, dict) and
+                result.details.get('model_validation', {}).get('status') == 'incorrect_model'
+            )
+            
+            if result.detected or is_pro_detection:
+                st.markdown("**Detection Screenshot:**")
+                st.image(screenshot_path, width=400)
+            else:
+                with st.expander("🖼️ Frame Screenshot", expanded=False):
+                    st.image(screenshot_path, caption=f"Frame {result.frame_number} at {result.timestamp:.2f}s", width=300)
+        except Exception as e:
+            st.error(f"Error displaying screenshot: {e}")
+
+    @staticmethod
+    def _render_audio_detection_result(result):
+        qa_info = AnalysisScreen._get_qa_info_for_result(result)
+        
+        header_text = f"### {result.rule_name}"
+        
+        with st.container():
+            st.markdown(header_text)
+            
+            if hasattr(result, 'details') and result.details:
+                if isinstance(result.details, dict):
+                    if 'Language Detection' in result.rule_name:
+                        if 'analysis_failed_reason' in result.details:
+                            st.markdown(f"**Analysis Status:** {result.details['analysis_failed_reason']}")
+                            st.markdown("**Explanation:** The fluency could not be analyzed because there were no audible voices in the video.")
+                        else:
+                            if 'detected_language' in result.details:
+                                whisper_detected = result.details['detected_language']
+                                target_locale = result.details.get('target_language')
+                                locale_format = Config.whisper_language_to_locale(whisper_detected, target_locale)
+                                display_name = Config.get_language_display_name(locale_format)
+                                if display_name is None:
+                                    display_name = whisper_detected if whisper_detected else "Unknown"
+                                st.markdown(f"**Detected Language:** {display_name}")
+                            if 'transcription' in result.details and result.details['transcription']:
+                                transcription = result.details['transcription']
+                                st.markdown("**Full Audio Transcription:**")
+                                st.text_area("Full Audio Transcription", transcription, height=200, disabled=True, key=f"transcript_{result.timestamp}", label_visibility="hidden")
+                    elif 'Voice Audibility' in result.rule_name:
+                        if 'voice_detected' in result.details:
+                            st.markdown(f"**Voice Activity:** {'Yes' if result.details['voice_detected'] else 'No'}")
+                        if 'num_audible_voices' in result.details:
+                            st.markdown(f"**Number of audible voices:** {result.details['num_audible_voices']}")
+                        if 'both_voices_audible' in result.details:
+                            st.markdown(f"**Both voices audible:** {result.details['both_voices_audible']}")
+            
+            if qa_info:
+                st.markdown(f"**QA Feedback:** {qa_info['details']}")
+
+
+class GoogleDriveIntegration:
+    """Google Drive integration for creating submission folders."""
+    
+    def __init__(self):
+        self.service = None
+        self._initialize_service()
+    
+    def _initialize_service(self):
+        """Initialize Google Drive service using service account."""
+        try:
+            from googleapiclient.discovery import build
+            from google.oauth2.service_account import Credentials
+            
+            credentials_path = "/workspaces/nose/gemini-live-verifier-1a5125954749.json"
+            
+            scopes = ['https://www.googleapis.com/auth/drive']
+            credentials = Credentials.from_service_account_file(credentials_path, scopes=scopes)
+            
+            self.service = build('drive', 'v3', credentials=credentials)
+            
+        except ImportError:
+            logger.error("Google API client libraries not installed")
+            self.service = None
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Drive service: {e}")
+            self.service = None
+    
+    def create_submission_folder(self, question_id: str, alias_email: str) -> Optional[str]:
+        """Create a Google Drive folder for video submission."""
+        if not self.service:
+            logger.error("Google Drive service not available")
+            return None
+        
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            folder_name = f"Video_Submission_{question_id}_{alias_email.split('@')[0]}_{timestamp}"
+            
+            folder_metadata = {
+                'name': folder_name,
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': []
+            }
+            
+            folder = self.service.files().create(body=folder_metadata, fields='id,name,webViewLink').execute()
+            
+            permission_metadata = {
+                'role': 'writer',
+                'type': 'anyone'
+            }
+            
+            self.service.permissions().create(
+                fileId=folder.get('id'),
+                body=permission_metadata
+            ).execute()
+            
+            folder_link = folder.get('webViewLink')
+            logger.info(f"Created Google Drive folder: {folder_name}")
+            
+            return folder_link
+            
+        except Exception as e:
+            logger.error(f"Failed to create Google Drive folder: {e}")
+            return None
+
+
+class VideoSubmissionScreen:
+    """Third screen: Video submission with Google Drive integration."""
+    @staticmethod
+    def render():
+        """Render the video submission screen."""
+        st.title("📤 Video Submission")
+        st.divider()
+        
+        VideoSubmissionScreen._initialize_submission_state()
+        VideoSubmissionScreen._render_submission_content()
+
+    @staticmethod
+    def _initialize_submission_state():
+        """Initialize session state for submission screen."""
+        if 'drive_folder_link' not in st.session_state:
+            st.session_state.drive_folder_link = ""
+        if 'folder_generated' not in st.session_state:
+            st.session_state.folder_generated = False
+        if 'task_submitted' not in st.session_state:
+            st.session_state.task_submitted = False
+        if 'submission_locked' not in st.session_state:
+            st.session_state.submission_locked = False
+
+    @staticmethod
+    def _render_submission_content():
+        """Render the main submission content."""
+        video_file = st.session_state.get('video_file')
+        file_name = video_file.name if video_file else "your video file"
+        
+        st.info(f"""
+        **Please follow these steps to submit your video:**
+        
+        1. Click the "Generate" button below to create a dedicated Google Drive folder for your submission
+        2. Once generated, use the provided Google Drive link to upload your video file: **{file_name}**
+        3. After uploading your video to the Google Drive folder, click the "Submission Completed" button to complete the process
+        
+        ⚠️ **Important:** Make sure to upload the exact same video file that was analyzed in the previous steps.
+        """)
+        
+        st.subheader("🔗 Google Drive Folder Generation")
+        
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            drive_link = st.text_input(
+                "Google Drive Folder Link",
+                value=st.session_state.drive_folder_link,
+                disabled=True,
+                placeholder="Click 'Generate' to create a Google Drive folder link",
+                label_visibility="collapsed"
+            )
+        
+        with col2:
+            if not st.session_state.folder_generated:
+                if st.button("🔄 Generate", use_container_width=True, type="primary"):
+                    VideoSubmissionScreen._generate_drive_folder()
+            else:
+                st.button("✅ Generated", use_container_width=True, type="secondary", disabled=True)
+        
+        if st.session_state.folder_generated:
+            st.markdown(f'🔗 [Open Google Drive Folder]({st.session_state.drive_folder_link})')
+        
+        if st.session_state.folder_generated:
+            st.divider()
+            
+            if not st.session_state.submission_locked:
+                if st.button("✅ Submission Completed", use_container_width=True, type="primary"):
+                    VideoSubmissionScreen._handle_task_submission()
+            else:
+                VideoSubmissionScreen._render_submission_success()
+
+    @staticmethod
+    def _generate_drive_folder():
+        """Generate Google Drive folder for submission."""
+        try:
+            with st.spinner("Creating Google Drive folder..."):
+                question_id = st.session_state.get('question_id')
+                alias_email = st.session_state.get('alias_email')
+                
+                drive_integration = GoogleDriveIntegration()
+                
+                if not drive_integration.service:
+                    st.error("❌ Google Drive service is not available. Please try again later.")
+                    return
+                
+                folder_link = drive_integration.create_submission_folder(question_id, alias_email)
+                
+                if folder_link:
+                    st.session_state.drive_folder_link = folder_link
+                    st.session_state.folder_generated = True
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to create Google Drive folder. Please try again.")
+                    
+        except Exception as e:
+            logger.error(f"Error generating Google Drive folder: {e}")
+            st.error(f"❌ An error occurred while creating the folder: {str(e)}")
+
+    @staticmethod
+    def _handle_task_submission():
+        """Handle the task submission process."""
+        try:
+            st.session_state.task_submitted = True
+            st.session_state.submission_locked = True
+            
+            question_id = st.session_state.get('question_id')
+            alias_email = st.session_state.get('alias_email')
+            timestamp = datetime.now().isoformat()
+            
+            st.rerun()
+            
+        except Exception as e:
+            logger.error(f"Error handling task submission: {e}")
+            st.error(f"❌ An error occurred during submission: {str(e)}")
+
+    @staticmethod
+    def _render_submission_success():
+        """Render success message and options after submission."""
+        st.markdown("""
+        <div style="background-color: #fff8dc; padding: 15px; border-radius: 8px; margin: 20px 0; border: 1px solid #f0e68c;">
+            <p style="color: #b8860b; margin: 0; font-size: 16px;">
+                🔒 This session is now locked. Start a new session for another video analysis.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.divider()
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("⬅️ Back to Results", use_container_width=True):
+                ScreenManager.navigate_to_screen('analysis')
+        
+        with col2:
+            if st.button("🔄 Start New Analysis", use_container_width=True, type="primary"):
+                VideoSubmissionScreen._start_new_analysis_session()
+
+    @staticmethod
+    def _start_new_analysis_session():
+        """Start a completely new analysis session."""
+        current_session_id = st.session_state.get('analysis_session_id', st.session_state.get('session_id'))
+        if current_session_id:
+            session_manager = get_session_manager()
+            session_manager.cleanup_session(current_session_id)
+        
+        try:
+            session_manager = get_session_manager()
+            session_manager.cleanup_old_sessions(max_age_hours=1)
+        except Exception as e:
+            logger.debug(f"Error cleaning old sessions: {e}")
+        
+        ScreenManager._cleanup_previous_session()
+        
+        gc.collect()
+        
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
+        
+        ScreenManager.reset_session_for_new_analysis()
 
 
 class ConfigurationManager:
-    """
-    Centralized configuration management.
-    """
+    """Centralized configuration management."""
     
     _config_cache: Optional[Dict[str, str]] = None
     _cache_lock = threading.Lock()
     _cache_timestamp: float = 0
-    _cache_ttl: float = 300  # 5 minutes TTL
+    _cache_ttl: float = 300
     
     @classmethod
     def get_secure_config(cls, force_refresh: bool = False) -> Dict[str, str]:
-        """
-        Get secure configuration from Streamlit secrets.
-        
-        Args:
-            force_refresh: Force refresh of cached configuration
-            
-        Returns:
-            Dictionary with validated configuration values
-            
-        Raises:
-            SecurityError: If configuration is invalid or missing
-        """
+        """Get secure configuration from Streamlit secrets."""
         current_time = time.time()
         
-        # Check cache validity
         if (not force_refresh and cls._config_cache is not None and 
             (current_time - cls._cache_timestamp) < cls._cache_ttl):
             return cls._config_cache.copy()
         
         with cls._cache_lock:
-            # Double-check pattern
             if (not force_refresh and cls._config_cache is not None and 
                 (current_time - cls._cache_timestamp) < cls._cache_ttl):
                 return cls._config_cache.copy()
             
             try:
-                import streamlit as st
-                
-                # Validate required secrets exist
                 if "google" not in st.secrets:
-                    raise SecurityError("Google configuration missing from secrets")
+                    raise ValueError("Google configuration missing from secrets")
                     
                 google_config = st.secrets["google"]
-                required_keys = ["apps_script_url", "sheets_url"]
+                required_keys = ["apps_script_url", "verifier_sheet_url", "verifier_sheet_id"]
                 
                 for key in required_keys:
                     if key not in google_config:
-                        raise SecurityError(f"Required configuration missing: {key}")
-                        
-                    # Validate URLs
-                    url_value = google_config[key]
-                    if not URLValidator.validate_url(url_value):
-                        raise SecurityError(f"Invalid or untrusted URL in {key}: {url_value}")
+                        raise ValueError(f"Required configuration missing: {key}")
                 
                 config = {
                     "apps_script_url": google_config["apps_script_url"],
-                    "sheets_url": google_config["sheets_url"],
-                    "sheet_id": google_config.get("sheet_id", ""),
-                    "default_sheet_name": st.secrets.get("settings", {}).get("default_sheet_name", "Submissions"),
-                    "max_retries": st.secrets.get("settings", {}).get("max_retries", 2),
-                    "timeout_base": st.secrets.get("settings", {}).get("timeout_base", 45)
+                    "verifier_sheet_url": google_config["verifier_sheet_url"],
+                    "verifier_sheet_id": google_config["verifier_sheet_id"],
+                    "verifier_sheet_name": google_config["verifier_sheet_name"]
                 }
                 
-                # Update cache
                 cls._config_cache = config
                 cls._cache_timestamp = current_time
                 
@@ -1047,561 +1632,11 @@ class ConfigurationManager:
                 
             except Exception as e:
                 logger.error(f"Secure configuration error: {e}")
-                raise SecurityError(f"Cannot load secure configuration: {e}") from e
-
-
-class ResourceManager:
-    """
-    Manages system resources and limits for concurrent operations.
-    """
-    _CLEANUP_BATCH_SIZE = 50
-    _UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]+$')
-    _SESSION_PATTERN = re.compile(r'.*session.*', re.IGNORECASE)
-    
-    # Class-level coordination for concurrent operations
-    _global_lock = threading.RLock()
-    _active_sessions_global: Set[str] = set()
-    _export_pending_sessions: Set[str] = set()
-
-    def __init__(self) -> None:
-        self._active_analyses: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.RLock()
-        self._shutdown_event = threading.Event()
-        self._cleanup_thread: Optional[threading.Thread] = None
-        self._cleanup_stats = {'files_cleaned': 0, 'directories_cleaned': 0, 'errors': 0}
-        self._start_cleanup_monitor()
-
-    def __enter__(self) -> 'ResourceManager':
-        return self
-
-    def __exit__(self, exc_type: Optional[type], exc_val: Optional[Exception], exc_tb: Optional[object]) -> None:
-        self.shutdown()
-
-    @classmethod
-    def register_active_session(cls, session_id: str) -> None:
-        """Register a session as active globally to prevent premature cleanup."""
-        with cls._global_lock:
-            cls._active_sessions_global.add(session_id)
-
-    @classmethod
-    def unregister_active_session(cls, session_id: str) -> None:
-        """Unregister a session as active globally."""
-        with cls._global_lock:
-            cls._active_sessions_global.discard(session_id)
-
-    @classmethod
-    def mark_session_for_export(cls, session_id: str) -> None:
-        """Mark a session as pending export to prevent cleanup."""
-        with cls._global_lock:
-            cls._export_pending_sessions.add(session_id)
-
-    @classmethod
-    def unmark_session_for_export(cls, session_id: str) -> None:
-        """Remove export pending status for a session."""
-        with cls._global_lock:
-            cls._export_pending_sessions.discard(session_id)
-
-    def _start_cleanup_monitor(self) -> None:
-        try:
-            self._cleanup_thread = threading.Thread(
-                target=self._cleanup_monitor,
-                daemon=True,
-                name="ResourceCleanupMonitor"
-            )
-            self._cleanup_thread.start()
-        except Exception as e:
-            logger.error(f"Failed to start cleanup monitor: {e}")
-
-    def _cleanup_monitor(self) -> None:
-        cleanup_interval = 300  # 5 minutes
-        while not self._shutdown_event.wait(cleanup_interval):
-            try:
-                self._cleanup_expired_sessions()
-                self._check_memory()
-                self._check_cpu()
-                self._log_resource_stats(self.get_active_count())
-            except Exception as e:
-                logger.error(f"Cleanup monitor error: {e}")
-
-    def _cleanup_expired_sessions(self) -> None:
-        current_time = datetime.now().timestamp()
-        expired_sessions = []
-        with self._lock:
-            for session_id, session_data in self._active_analyses.items():
-                session_age = current_time - session_data['start_time']
-                if session_age > Config.SESSION_TIMEOUT:
-                    expired_sessions.append((session_id, session_age))
-        for session_id, age in expired_sessions:
-            try:
-                self.end_analysis(session_id, force_cleanup=True)
-            except Exception as e:
-                logger.error(f"Failed to cleanup expired session {session_id}: {e}")
-
-    def can_start_analysis(self, video_duration: float = None) -> Tuple[bool, str]:
-        """Check if a new analysis can be started considering video characteristics."""
-        with self._lock:
-            active_count = len(self._active_analyses)
-            if active_count >= Config.MAX_CONCURRENT_ANALYSES:
-                return False, (f"Maximum concurrent analyses "
-                             f"({Config.MAX_CONCURRENT_ANALYSES}) reached")
-            
-            try:
-                memory_info = psutil.virtual_memory()
-                memory_limits = Config.get_memory_limits()
-                min_available_gb = memory_limits["min_available_gb"]
-                max_usage_percent = memory_limits["max_usage_percent"]
-                per_session_gb = memory_limits["per_session_gb"]
-                
-                if video_duration is not None:
-                    # Longer videos require more memory for processing
-                    duration_factor = min(2.0, max(1.0, video_duration / 120.0))
-                    adjusted_per_session_gb = per_session_gb * duration_factor
-                else:
-                    adjusted_per_session_gb = per_session_gb
-                
-                available_gb = memory_info.available / (1024**3)
-                total_gb = memory_info.total / (1024**3)
-                
-                if available_gb < min_available_gb:
-                    return False, f"Low memory: {available_gb:.1f}GB available, need {min_available_gb:.1f}GB minimum (system: {total_gb:.1f}GB)"
-                
-                if memory_info.percent > max_usage_percent:
-                    return False, f"Memory usage too high: {memory_info.percent:.1f}% (max {max_usage_percent}% for {total_gb:.1f}GB system)"
-                
-                # Check if we have enough memory for this specific session
-                required_for_session = adjusted_per_session_gb * (1024**3)
-                
-                min_required_for_session = required_for_session * 0.7
-                if memory_info.available < min_required_for_session:
-                    return False, f"Insufficient memory for session: need {adjusted_per_session_gb:.1f}GB, have {available_gb:.1f}GB"
-                
-                # Ensure we're not overloading the system with concurrent operations
-                if active_count > 0:
-                    estimated_memory_per_active = total_gb * 0.1
-                    estimated_total_usage = estimated_memory_per_active * active_count + adjusted_per_session_gb
-                    if estimated_total_usage > (total_gb * 0.8):
-                        return False, f"System memory would be overloaded with {active_count + 1} concurrent sessions"
-                
-            except Exception as e:
-                logger.warning(f"Memory check failed: {e}")
-                if active_count < 3:
-                    return True, "Resource check passed (fallback)"
-                return False, f"Memory check failed and {active_count} sessions already active"
-            
-            return True, "Resource check passed"
-
-    def start_analysis(self, session_id: str, analyzer_instance, video_duration: float = None) -> bool:
-        """Start a new analysis session"""
-        can_start, reason = self.can_start_analysis(video_duration)
-        if not can_start:
-            logger.warning(f"Cannot start analysis {session_id}: {reason}")
-            return False
-        
-        with self._lock:
-            self._active_analyses[session_id] = {
-                'start_time': datetime.now().timestamp(),
-                'analyzer': analyzer_instance,
-                'pid': os.getpid(),
-                'preserve_files': True,
-                'video_duration': video_duration
-            }
-        
-        # Register session globally to prevent premature cleanup
-        ResourceManager.register_active_session(session_id)
-
-        logger.info(f"Started analysis session: {session_id}")
-        return True
-    
-    def end_analysis(self, session_id: str, force_cleanup: bool = False):
-        """Unregister analysis session, optionally preserve files for UI."""
-        with self._lock:
-            if session_id in self._active_analyses:
-                session_data = self._active_analyses[session_id]
-                
-                if force_cleanup:
-                    try:
-                        if hasattr(session_data['analyzer'], 'cleanup_screenshots'):
-                            has_results = ('analysis_results' in session_data and 
-                                         session_data.get('analysis_results'))
-                            session_data['analyzer'].cleanup_screenshots(preserve_for_export=has_results)
-                    except Exception as e:
-                        logger.error(f"Screenshot cleanup error for {session_id}: {e}")
-                else:
-                    logger.debug(f"Preserving session files for UI: {session_id}")
-                
-                del self._active_analyses[session_id]
-                logger.info(f"Ended analysis session: {session_id}")
-        
-        # Only unregister from global sessions if force cleanup is requested
-        if force_cleanup:
-            ResourceManager.unregister_active_session(session_id)
-    
-    def force_cleanup_session(self, session_id: str):
-        """Force cleanup of a specific session."""
-        self.end_analysis(session_id, force_cleanup=True)
-    
-    def get_active_count(self) -> int:
-        """Get number of active analyses."""
-        with self._lock:
-            return len(self._active_analyses)
-    
-    def get_session_data(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get session data for a specific session ID."""
-        with self._lock:
-            return self._active_analyses.get(session_id)
-    
-    def cleanup_session_directories(self, session_id: str):
-        """Clean up all directories and files for a specific session."""
-        cleanup_stats = {'files': 0, 'directories': 0, 'errors': 0}
-        
-        try:
-            # Clean session-specific directories
-            self._cleanup_session_directory(Config.OUTPUT_DIR, session_id, cleanup_stats)
-            self._cleanup_session_directory(Config.TEMP_DIR, session_id, cleanup_stats)
-            
-            # Clean system temp files
-            self._cleanup_system_temp_files(session_id, cleanup_stats)
-            
-            # Update global stats
-            with self._lock:
-                self._cleanup_stats['files_cleaned'] += cleanup_stats['files']
-                self._cleanup_stats['directories_cleaned'] += cleanup_stats['directories']
-                self._cleanup_stats['errors'] += cleanup_stats['errors']
-            
-            # Unregister session from global tracking since it's fully cleaned up
-            ResourceManager.unregister_active_session(session_id)
-            ResourceManager.unmark_session_for_export(session_id)
-            
-        except Exception as e:
-            logger.error(f"Session directories cleanup error for {session_id}: {e}")
-    
-    def _cleanup_session_directory(self, base_dir: str, session_id: str, 
-                                  cleanup_stats: Dict[str, int]) -> None:
-        """Clean up session directory in specified base directory."""
-        try:
-            base_path = Path(base_dir)
-            if not base_path.exists():
-                return
-                
-            session_dir = base_path / session_id
-            if session_dir.exists():
-                try:
-                    # Get size info before deletion for memory tracking
-                    dir_size = sum(f.stat().st_size for f in session_dir.rglob('*') if f.is_file())
-                    if dir_size > 100 * 1024 * 1024:  # 100MB
-                        logger.debug(f"Cleaning large directory ({dir_size / (1024*1024):.1f}MB): {session_dir}")
-                    
-                    shutil.rmtree(str(session_dir))
-                    cleanup_stats['directories'] += 1
-                except Exception as e:
-                    cleanup_stats['errors'] += 1
-                    logger.error(f"Failed to remove directory {session_dir}: {e}")
-        except Exception as e:
-            cleanup_stats['errors'] += 1
-            logger.error(f"Error accessing base directory {base_dir}: {e}")
-    
-    def _cleanup_system_temp_files(self, session_id: str, cleanup_stats: Dict[str, int]) -> None:
-        """Clean up system temp files."""
-        try:
-            system_temp = Path(tempfile.gettempdir())
-            session_pattern = f"*{session_id}*"
-            
-            # Process files in batches to avoid memory spikes with large temp directories
-            temp_files = list(system_temp.glob(session_pattern))
-            
-            for i in range(0, len(temp_files), self._CLEANUP_BATCH_SIZE):
-                batch = temp_files[i:i + self._CLEANUP_BATCH_SIZE]
-                
-                for temp_file in batch:
-                    try:
-                        if temp_file.is_file():
-                            temp_file.unlink()
-                            cleanup_stats['files'] += 1
-                        elif temp_file.is_dir():
-                            shutil.rmtree(str(temp_file))
-                            cleanup_stats['directories'] += 1
-                    except Exception as e:
-                        cleanup_stats['errors'] += 1
-                        logger.warning(f"Failed to remove temp item {temp_file}: {e}")
-                
-                # Small delay between batches to prevent overwhelming the system
-                if i + self._CLEANUP_BATCH_SIZE < len(temp_files):
-                    time.sleep(0.01)
-                    
-        except Exception as e:
-            cleanup_stats['errors'] += 1
-            logger.error(f"System temp cleanup error: {e}")
-    
-    def shutdown(self):
-        """Shutdown resource manager and cleanup all sessions.""" 
-        # Check for preserved sessions
-        preserved_sessions = self._get_preserved_sessions()
-        
-        self._shutdown_event.set()
-        
-        if self._cleanup_thread and self._cleanup_thread.is_alive():
-            self._cleanup_thread.join(timeout=5)
-        
-        # Process session cleanup in batches to avoid memory spikes
-        with self._lock:
-            session_ids = list(self._active_analyses.keys())
-        
-        self._cleanup_active_sessions(session_ids, preserved_sessions)
-        
-        # Cleanup directories based on preservation status
-        if preserved_sessions:
-            self._cleanup_session_directories_selective(preserved_sessions)
-        else:
-            self._cleanup_session_directories_all()
-        
-        # Log final cleanup statistics
-        self._log_cleanup_statistics()
-    
-    # Integrated utility methods
-    def _check_memory(self, threshold_percent=85):
-        """Monitor system memory usage."""
-        try:
-            memory_info = psutil.virtual_memory()
-            if memory_info.percent > threshold_percent:
-                logger.warning(f"High memory usage: {memory_info.percent:.1f}%")
-            return memory_info
-        except Exception as e:
-            logger.error(f"Memory monitoring error: {e}")
-            return None
-
-    def _check_cpu(self, threshold_percent=90):
-        """Monitor system CPU usage."""
-        try:
-            cpu_percent = psutil.cpu_percent(interval=1)
-            if cpu_percent > threshold_percent:
-                logger.warning(f"High CPU usage: {cpu_percent:.1f}%")
-            return cpu_percent
-        except Exception as e:
-            logger.error(f"CPU monitoring error: {e}")
-            return None
-
-    def _log_resource_stats(self, active_count):
-        """Log current resource statistics."""
-        try:
-            if active_count > 0:
-                memory_info = psutil.virtual_memory()
-        except Exception as e:
-            logger.debug(f"Failed to log resource statistics: {e}")
-
-    def _get_preserved_sessions(self) -> set:
-        """Get set of sessions that should be preserved during shutdown."""
-        preserved_sessions = set()
-        
-        # Include globally registered active sessions
-        with ResourceManager._global_lock:
-            preserved_sessions.update(ResourceManager._active_sessions_global)
-            preserved_sessions.update(ResourceManager._export_pending_sessions)
-        
-        # First, check active sessions in memory that haven't been exported yet
-        with self._lock:
-            for session_id, session_data in self._active_analyses.items():
-                if session_data and 'analyzer' in session_data:
-                    analyzer = session_data['analyzer']
-                    # Preserve sessions that have results but haven't been exported
-                    if hasattr(analyzer, 'detection_results') and analyzer.detection_results:
-                        preserved_sessions.add(session_id)
-        
-        # Also check for sessions with existing output directories
-        try:
-            analysis_output_path = Path(Config.OUTPUT_DIR)
-            if analysis_output_path.exists():
-                for item in analysis_output_path.iterdir():
-                    if item.is_dir() and self._is_session_directory(item.name):
-                        # Check if directory has screenshot files
-                        screenshot_files = list(item.glob("*.png"))
-                        if screenshot_files:
-                            preserved_sessions.add(item.name)
-        except Exception as e:
-            logger.debug(f"Could not check output directories: {e}")
-        
-        try:
-            import streamlit as st
-            if (hasattr(st, 'session_state') and 
-                hasattr(st.session_state, 'analysis_results') and 
-                st.session_state.analysis_results and
-                hasattr(st.session_state, 'analysis_session_id') and
-                st.session_state.analysis_session_id):
-                preserved_sessions.add(st.session_state.analysis_session_id)
-        except Exception as e:
-            logger.debug(f"Could not check UI session state: {e}")
-            
-        return preserved_sessions
-    
-    def _cleanup_active_sessions(self, session_ids: List[str], preserved_sessions: set) -> None:
-        """Cleanup active sessions with preservation logic."""
-        cleanup_count = 0
-        preserved_count = 0
-        
-        for session_id in session_ids:
-            if session_id not in preserved_sessions:
-                self.end_analysis(session_id)
-                cleanup_count += 1
-            else:
-                preserved_count += 1
-        
-        if cleanup_count > 0 or preserved_count > 0:
-            logger.info(f"Session cleanup: {cleanup_count} ended, {preserved_count} preserved")
-    
-    def _cleanup_session_directories_all(self):
-        """Clean up all session directories."""
-        cleanup_stats = {'directories': 0, 'files': 0, 'errors': 0}
-        
-        try:
-            analysis_output_path = Path(Config.OUTPUT_DIR)
-            if analysis_output_path.exists():
-                # Process directories in batches
-                session_dirs = [item for item in analysis_output_path.iterdir() 
-                               if item.is_dir() and self._is_session_directory(item.name)]
-                
-                self._batch_cleanup_directories(session_dirs, cleanup_stats)
-                
-                # Clean up results file
-                self._cleanup_results_file(analysis_output_path, cleanup_stats)
-                
-            self._log_directory_cleanup_stats(cleanup_stats, "all")
-                        
-        except Exception as e:
-            logger.warning(f"Session directories cleanup error: {e}")
-    
-    def _cleanup_session_directories_selective(self, preserved_sessions: set):
-        """Clean up session directories except for preserved ones."""
-        cleanup_stats = {'directories': 0, 'files': 0, 'errors': 0, 'preserved': 0}
-        
-        try:
-            analysis_output_path = Path(Config.OUTPUT_DIR)
-            if analysis_output_path.exists():
-                for item in analysis_output_path.iterdir():
-                    if item.is_dir() and self._is_session_directory(item.name):
-                        if item.name not in preserved_sessions:
-                            if self._safe_remove_directory(item):
-                                cleanup_stats['directories'] += 1
-                            else:
-                                cleanup_stats['errors'] += 1
-                        else:
-                            cleanup_stats['preserved'] += 1
-                            
-            self._log_directory_cleanup_stats(cleanup_stats, "selective")
-                            
-        except Exception as e:
-            logger.warning(f"Selective session directories cleanup error: {e}")
-    
-    def _is_session_directory(self, dir_name: str) -> bool:
-        """Check if directory name matches session patterns using pre-compiled regexes."""
-        return (self._UUID_PATTERN.match(dir_name) or 
-                self._SESSION_PATTERN.match(dir_name))
-    
-    def _batch_cleanup_directories(self, directories: List[Path], 
-                                  cleanup_stats: Dict[str, int]) -> None:
-        """Clean up directories."""
-        for i in range(0, len(directories), self._CLEANUP_BATCH_SIZE):
-            batch = directories[i:i + self._CLEANUP_BATCH_SIZE]
-            
-            for directory in batch:
-                if self._safe_remove_directory(directory):
-                    cleanup_stats['directories'] += 1
-                else:
-                    cleanup_stats['errors'] += 1
-            
-            # Small delay between batches
-            if i + self._CLEANUP_BATCH_SIZE < len(directories):
-                time.sleep(0.01)
-    
-    def _safe_remove_directory(self, directory_path: Path) -> bool:
-        """Safely remove a directory."""
-        try:
-            # Check size before removal for large directory warning
-            try:
-                dir_size = sum(f.stat().st_size for f in directory_path.rglob('*') if f.is_file())
-                if dir_size > 100 * 1024 * 1024:  # 100MB
-                    logger.debug(f"Removing large directory ({dir_size / (1024*1024):.1f}MB): {directory_path}")
-            except Exception:
-                pass
-            
-            shutil.rmtree(str(directory_path))
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to cleanup directory {directory_path}: {e}")
-            return False
-    
-    def _cleanup_results_file(self, analysis_output_path: Path, 
-                             cleanup_stats: Dict[str, int]) -> None:
-        """Clean up analysis results file."""
-        analysis_results_file = analysis_output_path / "results.json"
-        if analysis_results_file.exists():
-            try:
-                analysis_results_file.unlink()
-                cleanup_stats['files'] += 1
-            except Exception as e:
-                cleanup_stats['errors'] += 1
-                logger.warning(f"Failed to cleanup analysis_output/results.json: {e}")
-    
-    def _log_directory_cleanup_stats(self, cleanup_stats: Dict[str, int], 
-                                    cleanup_type: str) -> None:
-        """Log directory cleanup statistics."""
-        if any(cleanup_stats.get(key, 0) > 0 for key in ['directories', 'files', 'errors', 'preserved']):
-            stats_msg = f"{cleanup_type.capitalize()} cleanup: {cleanup_stats.get('directories', 0)} directories"
-            if cleanup_stats.get('files', 0) > 0:
-                stats_msg += f", {cleanup_stats['files']} files"
-            if cleanup_stats.get('preserved', 0) > 0:
-                stats_msg += f", {cleanup_stats['preserved']} preserved"
-            if cleanup_stats.get('errors', 0) > 0:
-                stats_msg += f", {cleanup_stats['errors']} errors"
-            logger.info(stats_msg)
-    
-    def _log_cleanup_statistics(self) -> None:
-        """Log final cleanup statistics."""
-        with self._lock:
-            if any(self._cleanup_stats.get(key, 0) > 0 for key in self._cleanup_stats):
-                logger.info(f"Total cleanup statistics - Files: {self._cleanup_stats['files_cleaned']}, "
-                           f"Directories: {self._cleanup_stats['directories_cleaned']}, "
-                           f"Errors: {self._cleanup_stats['errors']}")
-    
-    def get_cleanup_statistics(self) -> Dict[str, int]:
-        """Get current cleanup statistics for monitoring."""
-        with self._lock:
-            return self._cleanup_stats.copy()
-    
-    def get_memory_usage_stats(self) -> Dict[str, Any]:
-        """Get current memory usage statistics for monitoring."""
-        try:
-            import psutil
-            memory_info = psutil.virtual_memory()
-            
-            with self._lock:
-                active_sessions = len(self._active_analyses)
-            
-            return {
-                'total_memory_gb': memory_info.total / (1024**3),
-                'available_memory_gb': memory_info.available / (1024**3),
-                'used_memory_percent': memory_info.percent,
-                'active_sessions': active_sessions,
-                'max_concurrent_sessions': Config.MAX_CONCURRENT_ANALYSES,
-                'cleanup_stats': self._cleanup_stats.copy(),
-                'memory_per_session_limit_gb': Config.get_memory_limits().get('per_session_gb', 'unknown')
-            }
-        except Exception as e:
-            logger.error(f"Error getting memory stats: {e}")
-            return {'error': str(e)}
-
-
-_resource_manager = ResourceManager()
-
-
-def get_resource_manager() -> ResourceManager:
-    """Get global resource manager instance."""
-    return _resource_manager
+                raise RuntimeError(f"Cannot load secure configuration: {e}") from e
 
 
 class TextMatcher:
-    """
-    Text matching with OCR error correction and fuzzy matching.
-    """
-    # Confidence thresholds for different matching strategies
+    """Text matching with OCR error correction and fuzzy matching."""
     SIMILARITY_THRESHOLDS = {
         'word_match': 0.75,
         'partial_match': 0.75,
@@ -1609,22 +1644,27 @@ class TextMatcher:
         'character_strict': 0.8
     }
     
-    # OCR error corrections
     OCR_CORRECTIONS: Dict[str, str] = {
         '2s flash': '2.5 flash', '2.s flash': '2.5 flash', '2,5 flash': '2.5 flash',
         '25 flash': '2.5 flash',
+        '2s pro': '2.5 pro', '2.s pro': '2.5 pro', '2,5 pro': '2.5 pro',
+        '25 pro': '2.5 pro',
         'fiash': 'flash', 'flasb': 'flash', 'fash': 'flash',
         'flashy': 'flash', 'flast': 'flash', 'flach': 'flash',
+        'pno': 'pro', 'prn': 'pro', 'pro.': 'pro',
         'evai mode': 'eval mode', 'eval rode': 'eval mode',
         'native audio output': 'native audio output',
+        'roannng tiger': 'roaring tiger', 'roaring tiqer': 'roaring tiger', 'roaring tigee': 'roaring tiger',
+        'roaring tger': 'roaring tiger', 'roaring ticer': 'roaring tiger', 'roanng tiger': 'roaring tiger',
+        'roarmg tiger': 'roaring tiger', 'roarrng tiger': 'roaring tiger', 'roarirg tiger': 'roaring tiger',
+        'roaring.tiger': 'roaring tiger', 'roaring . tiger': 'roaring tiger', 'roaring. tiger': 'roaring tiger',
+        'roaring .tiger': 'roaring tiger', 'roaring..tiger': 'roaring tiger',
         'rn': 'm', 'vv': 'w', '1': 'l'
     }
 
     @staticmethod
     def calculate_similarity(text1: str, text2: str) -> float:
-        """
-        Calculate text similarity using normalized Levenshtein distance.
-        """
+        """Calculate text similarity using normalized Levenshtein distance."""
         if not text1 or not text2:
             return 0.0
         text1, text2 = text1.lower().strip(), text2.lower().strip()
@@ -1660,9 +1700,7 @@ class TextMatcher:
 
     @classmethod
     def apply_ocr_corrections(cls, text: str) -> str:
-        """
-        Apply common OCR error corrections to improve recognition accuracy.
-        """
+        """Apply common OCR error corrections to improve recognition accuracy."""
         if not text:
             return text
         corrected = text.lower()
@@ -1672,14 +1710,17 @@ class TextMatcher:
 
     @classmethod
     def match_text(cls, detected: str, expected: str, enable_fuzzy: bool = True) -> Tuple[bool, str]:
-        """
-        Precise text matching that requires more exact matches to avoid false positives.
-        Returns (match_found, match_method).
-        """
+        """Precise text matching that requires more exact matches to avoid false positives."""
         if not detected or not expected:
             return False, 'empty_input'
         detected_lower = detected.lower().strip()
         expected_lower = expected.lower().strip()
+        
+        # Special case for "roaring tiger" - alias name
+        if expected_lower == "roaring tiger":
+            if cls._match_roaring_tiger_variants(detected_lower):
+                return True, 'roaring_tiger_variant_match'
+        
         # Strategy 1: Exact phrase match (word boundaries respected)
         if cls._exact_phrase_match(detected_lower, expected_lower):
             return True, 'exact_phrase_match'
@@ -1699,20 +1740,19 @@ class TextMatcher:
             return False, 'no_fuzzy_match'
         expected_words = expected_lower.split()
         detected_words = detected_lower.split()
-        if cls._all_words_match(expected_words, detected_words):
-            return True, 'all_words_match'
-        if len(expected_words) > 1:
-            match_result = cls._precise_partial_word_match(expected_words, detected_words)
-            if match_result[0]:
-                return True, match_result[1]
         overall_similarity = cls.calculate_similarity(detected_lower, expected_lower)
         if overall_similarity >= cls.SIMILARITY_THRESHOLDS['character_strict']:
             return True, f'character_similarity_{overall_similarity:.2f}'
         return False, f'no_match_similarity_{overall_similarity:.2f}'
 
     @classmethod
+    def _match_roaring_tiger_variants(cls, detected_text: str) -> bool:
+        """Matching for roaring tiger with various separators."""
+        pattern = r'\broaring\s*[.\s_-]*\s*tiger\b'
+        return bool(re.search(pattern, detected_text))
+
+    @classmethod
     def _exact_phrase_match(cls, detected: str, expected: str) -> bool:
-        import re
         expected_words = expected.split()
         if len(expected_words) == 1:
             pattern = r'\b' + re.escape(expected) + r'\b'
@@ -1722,351 +1762,10 @@ class TextMatcher:
             pattern = r'\b' + r'\s+'.join(escaped_words) + r'\b'
             return bool(re.search(pattern, detected))
 
-    @classmethod
-    def _all_words_match(cls, expected_words: List[str], detected_words: List[str]) -> bool:
-        if not expected_words or not detected_words:
-            return False
-        if len(expected_words) <= 3 and len(detected_words) <= 5:
-            expected_indices = []
-            for exp_word in expected_words:
-                found_index = -1
-                for i, det_word in enumerate(detected_words):
-                    similarity = cls.calculate_similarity(exp_word, det_word)
-                    if (similarity >= 0.85 or
-                        (len(exp_word) >= 3 and exp_word in det_word and len(det_word) <= len(exp_word) + 2)):
-                        found_index = i
-                        break
-                if found_index == -1:
-                    return False
-                expected_indices.append(found_index)
-            if len(expected_indices) >= 2:
-                for i in range(len(expected_indices) - 1):
-                    if expected_indices[i] >= expected_indices[i + 1]:
-                        return False
-            return True
-        matched_count = 0
-        for exp_word in expected_words:
-            found_match = False
-            for det_word in detected_words:
-                similarity = cls.calculate_similarity(exp_word, det_word)
-                if similarity >= 0.85:
-                    found_match = True
-                    break
-                elif len(exp_word) >= 3 and exp_word in det_word and len(det_word) <= len(exp_word) + 2:
-                    found_match = True
-                    break
-            if found_match:
-                matched_count += 1
-        return matched_count == len(expected_words)
-
-    @classmethod
-    def _precise_partial_word_match(cls, expected_words: List[str], detected_words: List[str]) -> Tuple[bool, str]:
-        if len(expected_words) < 2:
-            return False, 'single_word'
-        if len(expected_words) <= 3 and len(detected_words) <= 5:
-            expected_positions = []
-            for exp_word in expected_words:
-                found_position = -1
-                for i, det_word in enumerate(detected_words):
-                    similarity = cls.calculate_similarity(exp_word, det_word)
-                    if (similarity >= 0.8 or
-                        (len(exp_word) >= 3 and exp_word == det_word) or
-                        (len(exp_word) >= 2 and abs(len(exp_word) - len(det_word)) <= 1 and similarity >= 0.7)):
-                        found_position = i
-                        break
-                if found_position == -1:
-                    return False, 'word_not_found'
-                expected_positions.append(found_position)
-            for i in range(len(expected_positions) - 1):
-                if expected_positions[i] >= expected_positions[i + 1]:
-                    return False, 'wrong_word_order'
-        matched_words = 0
-        total_similarity = 0.0
-        for exp_word in expected_words:
-            best_similarity = 0.0
-            best_match_found = False
-            for det_word in detected_words:
-                similarity = cls.calculate_similarity(exp_word, det_word)
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                if (similarity >= 0.8 or
-                    (len(exp_word) >= 3 and exp_word == det_word) or
-                    (len(exp_word) >= 2 and abs(len(exp_word) - len(det_word)) <= 1 and similarity >= 0.7)):
-                    best_match_found = True
-                    break
-            if best_match_found:
-                matched_words += 1
-                total_similarity += best_similarity
-        match_ratio = matched_words / len(expected_words)
-        avg_similarity = total_similarity / len(expected_words) if len(expected_words) > 0 else 0.0
-        if match_ratio >= 0.8 and avg_similarity >= 0.75:
-            return True, f'precise_partial_match_{match_ratio:.2f}_{avg_similarity:.2f}'
-        return False, f'insufficient_partial_match_{match_ratio:.2f}_{avg_similarity:.2f}'
-
-
-class FileManager:
-    """
-    Thread-safe file management utilities with security controls.
-    
-    This class provides secure file operations with:
-    - Path validation and sanitization
-    - Session-based isolation
-    - Thread-safe file operations
-    - Automatic cleanup management
-    - Security validation at all levels
-    
-    All file operations are logged and validated to prevent security vulnerabilities.
-    """
-    
-    # Class-level file locks for thread safety
-    _file_locks: Dict[str, threading.Lock] = {}
-    _lock_manager = threading.Lock()
-    
-    @classmethod
-    def _get_file_lock(cls, file_path: str) -> threading.Lock:
-        """
-        Get or create file-specific lock for thread safety.
-        
-        Args:
-            file_path: Path to the file needing synchronization
-            
-        Returns:
-            Thread lock for the specific file
-        """
-        with cls._lock_manager:
-            if file_path not in cls._file_locks:
-                cls._file_locks[file_path] = threading.Lock()
-            return cls._file_locks[file_path]
-    
-    @staticmethod
-    def validate_and_ensure_directory(path: str, session_id: Optional[str] = None) -> Path:
-        """
-        Create directory with security validation.
-        
-        Args:
-            path: Directory path to create
-            session_id: Optional session ID for isolation
-            
-        Returns:
-            Resolved Path object for the created directory
-            
-        Raises:
-            ValueError: If path is invalid or unsafe
-            RuntimeError: If directory creation fails
-        """
-        if not path:
-            raise ValueError("Path cannot be empty")
-        
-        if not PathValidator.validate_file_path(path):
-            raise ValueError(f"Invalid or unsafe path: {path}")
-        
-        try:
-            # Add session isolation if provided
-            if session_id:
-                safe_session = InputValidator.sanitize_session_id(session_id)
-                path = os.path.join(path, safe_session)
-            
-            directory = Path(path).resolve()
-            
-            # Validate directory is within allowed base paths
-            allowed_bases = [
-                Path(Config.OUTPUT_DIR).resolve(),
-                Path(Config.TEMP_DIR).resolve(),
-                Path(tempfile.gettempdir()).resolve()
-            ]
-            
-            is_allowed = any(
-                directory.is_relative_to(base) or directory == base 
-                for base in allowed_bases
-            )
-            
-            if not is_allowed:
-                raise ValueError(f"Directory creation outside allowed paths: {directory}")
-            
-            # Create directory
-            directory.mkdir(parents=True, exist_ok=True, mode=0o755)
-            
-            return directory
-            
-        except (OSError, ValueError) as e:
-            logger.error(f"Directory creation failed for {path}: {e}")
-            raise RuntimeError(f"Cannot create directory: {e}") from e
-    
-    @staticmethod
-    def ensure_directory(path: str) -> Path:
-        """
-        Backward compatibility wrapper for directory creation.
-        
-        Args:
-            path: Directory path to create
-            
-        Returns:
-            Created directory path
-        """
-        return FileManager.validate_and_ensure_directory(path)
-    
-    @classmethod
-    def cleanup_files(cls, file_paths: List[str], session_id: Optional[str] = None) -> Dict[str, int]:
-        """
-        Thread-safe cleanup of temporary files with reporting.
-        
-        Args:
-            file_paths: List of file paths to clean up
-            session_id: Optional session ID for additional validation
-            
-        Returns:
-            Dictionary with cleanup statistics
-        """
-        if not file_paths:
-            return {'removed': 0, 'errors': 0, 'skipped': 0}
-        
-        stats = {'removed': 0, 'errors': 0, 'skipped': 0}
-        
-        for path in file_paths:
-            try:
-                file_lock = cls._get_file_lock(path)
-                with file_lock:
-                    result = cls._safe_remove_file(path, session_id)
-                    stats[result] += 1
-                    
-            except Exception as e:
-                logger.error(f"Cleanup error for {path}: {e}")
-                stats['errors'] += 1
-        
-        return stats
-    
-    @classmethod
-    def _safe_remove_file(cls, path: str, session_id: Optional[str] = None) -> str:
-        """
-        Safely remove a single file.
-        
-        Args:
-            path: File path to remove
-            session_id: Optional session ID for validation
-            
-        Returns:
-            Result status: 'removed', 'errors', or 'skipped'
-        """
-        try:
-            if not os.path.exists(path):
-                return 'skipped'
-            
-            # Security validation
-            if not PathValidator.validate_file_path(path):
-                logger.warning(f"Unsafe file path during cleanup: {path}")
-                return 'errors'
-            
-            # Session validation if provided
-            if session_id:
-                safe_session = InputValidator.sanitize_session_id(session_id)
-                if safe_session not in path:
-                    logger.warning(
-                        f"Attempting to remove file outside session {session_id}: {path}"
-                    )
-                    return 'errors'
-            
-            # Perform the removal
-            os.unlink(path)
-            return 'removed'
-            
-        except OSError as e:
-            if e.errno == 2:  # File not found
-                return 'skipped'
-            logger.warning(f"OS error during cleanup of {path}: {e}")
-            return 'errors'
-            
-        except Exception as e:
-            logger.error(f"Unexpected cleanup error for {path}: {e}")
-            return 'errors'
-    
-    @classmethod
-    def save_frame(cls, frame: np.ndarray, filepath: str, session_id: str = None) -> bool:
-        """Thread-safe frame saving with security validation."""
-        try:
-            if not PathValidator.validate_file_path(filepath):
-                logger.error(f"Invalid file path for frame save: {filepath}")
-                return False
-            
-            cls.validate_and_ensure_directory(os.path.dirname(filepath))
-            
-            file_lock = cls._get_file_lock(filepath)
-            with file_lock:
-                if frame is None or frame.size == 0:
-                    logger.error(f"Invalid frame data for {filepath}")
-                    return False
-                
-                success = cv2.imwrite(filepath, frame)
-                if success:
-                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                        return True
-                    else:
-                        logger.error(f"Frame save verification failed: {filepath}")
-                        return False
-                else:
-                    logger.error(f"cv2.imwrite failed for {filepath}")
-                    return False
-                    
-        except Exception as e:
-            logger.error(f"Save frame failed {filepath}: {e}")
-            return False
-    
-    @staticmethod
-    def create_temp_filename(prefix: str, suffix: str = ".wav", session_id: str = None) -> str:
-        """Create secure temporary filename with session isolation."""
-        safe_prefix = InputValidator.sanitize_user_input(prefix, 50)
-        safe_prefix = InputValidator.sanitize_session_id(safe_prefix, 50)
-        
-        if session_id:
-            safe_session = InputValidator.sanitize_session_id(session_id)
-            safe_prefix = f"{safe_session}_{safe_prefix}"
-        
-        timestamp = datetime.now().timestamp()
-        random_part = str(uuid.uuid4())[:8]
-        
-        return f"{safe_prefix}_{timestamp}_{random_part}{suffix}"
-    
-    @staticmethod
-    def sanitize_filename(filename: str) -> str:
-        """Sanitize filename for filesystem compatibility with security."""
-        if not filename:
-            return "unknown_file"
-        
-        sanitized = re.sub(r'[/\\:*?"<>|]', '_', filename)
-        
-        sanitized = re.sub(r'\.\.+', '.', sanitized)
-        
-        sanitized = re.sub(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)', 'file_', sanitized, flags=re.IGNORECASE)
-        
-        sanitized = ''.join(char for char in sanitized if ord(char) >= 32 and ord(char) < 127)
-        
-        sanitized = sanitized.strip('. ')
-        
-        if len(sanitized) > Config.MAX_FILENAME_LENGTH:
-            name, ext = os.path.splitext(sanitized)
-            max_name_len = Config.MAX_FILENAME_LENGTH - len(ext) - 10
-            sanitized = name[:max_name_len] + "_truncated" + ext
-        
-        if not sanitized or sanitized.startswith('.') or sanitized in ['', '.', '..']:
-            sanitized = "sanitized_file"
-        
-        return sanitized
-    
-    @classmethod
-    def create_session_temp_dir(cls, session_id: str) -> str:
-        """Create isolated temporary directory for session."""
-        try:
-            base_temp = Path(Config.TEMP_DIR)
-            session_temp = cls.validate_and_ensure_directory(str(base_temp), session_id)
-            return str(session_temp)
-        except Exception as e:
-            logger.error(f"Failed to create session temp dir: {e}")
-            return SessionManager.create_secure_temp_dir(session_id)
-
 
 class AudioAnalyzer:
     """Audio processing for voice and language detection with voice separation capabilities."""
     
-    # Class-level shared Whisper model to prevent concurrent loading issues
     _shared_whisper_model = None
     _whisper_model_lock = threading.RLock()
     _model_loading_condition = threading.Condition(_whisper_model_lock)
@@ -2074,51 +1773,34 @@ class AudioAnalyzer:
     
     def __init__(self):
         self.whisper_model = None
-        self.speech_recognizer = sr.Recognizer()
-        self.supported_languages = Config.SUPPORTED_LANGUAGES.copy()
+        self.supported_languages = Config.get_supported_languages()
         self.voice_features_cache = {}
-        # Cache loaded audio data
-        self._audio_cache = {}
-        
-        self._audio_cache_max_size = 1  # Minimal cache for optimal performance
-        logger.info("Using minimal audio cache for optimal performance")
     
-    def load_whisper_model(self, model_size: str = "tiny") -> bool:
+    def load_whisper_model(self, model_size: str = "base") -> bool:
         """Load Whisper transcription model with thread-safe shared loading."""
         try:
-            model_size = "tiny"  # Always use fastest model for optimal performance
-            logger.info("Using 'tiny' Whisper model for optimal performance")
+            model_size = "base"
             
-            # Use shared model to prevent concurrent loading issues
             with AudioAnalyzer._model_loading_condition:
-                # If shared model is already loaded, use it
                 if AudioAnalyzer._shared_whisper_model is not None:
                     self.whisper_model = AudioAnalyzer._shared_whisper_model
-                    logger.info(f"Using existing shared Whisper model '{model_size}'")
                     return True
                 
-                # If another thread is loading, wait for it to complete
                 while AudioAnalyzer._model_loading:
-                    logger.info("Whisper model loading in progress, waiting...")
                     AudioAnalyzer._model_loading_condition.wait()
                     
-                    # Check if model was loaded by other thread
                     if AudioAnalyzer._shared_whisper_model is not None:
                         self.whisper_model = AudioAnalyzer._shared_whisper_model
-                        logger.info("Using Whisper model loaded by another thread")
                         return True
                 
-                # Load the model (only one thread will do this)
                 AudioAnalyzer._model_loading = True
                 try:
-                    logger.info(f"Loading Whisper model '{model_size}'...")
                     AudioAnalyzer._shared_whisper_model = whisper.load_model(model_size)
                     self.whisper_model = AudioAnalyzer._shared_whisper_model
                     logger.info(f"Whisper model '{model_size}' loaded successfully")
                     return True
                 finally:
                     AudioAnalyzer._model_loading = False
-                    # Notify all waiting threads that loading is complete
                     AudioAnalyzer._model_loading_condition.notify_all()
                     
         except Exception as e:
@@ -2138,332 +1820,13 @@ class AudioAnalyzer:
             logger.error(f"Audio extraction failed: {e}")
             return False
     
-    def detect_voice_audibility(self, audio_path: str, 
-                               frame_duration: float = 2.0) -> Dict[str, Any]:
-        """
-        Detect if both user and model voices are audible in the audio.
-        Uses simple acoustic features to determine if multiple distinct voices are present.
-        """
-        try:
-            logger.info(f"Analyzing voice audibility: {audio_path}")
-            
-            y, sr = self._get_cached_audio(audio_path)
-            duration = len(y) / sr
-            
-            voice_segments = self.detect_voice_activity(audio_path, frame_duration)
-            voice_only_segments = [(start, end) for start, end, has_voice in voice_segments if has_voice]
-            
-            if len(voice_only_segments) < 2:
-                logger.info("Insufficient voice segments for audibility analysis")
-                return {
-                    'both_voices_audible': False,
-                    'voice_segments_count': len(voice_only_segments),
-                    'total_voice_duration': sum(end - start for start, end in voice_only_segments),
-                    'confidence': 0.0,
-                    'analysis_details': 'Insufficient voice segments detected'
-                }
-            
-            segment_features = []
-            total_voice_duration = 0
-            
-            for start_time, end_time in voice_only_segments:
-                duration_seg = end_time - start_time
-                if duration_seg < 0.5:
-                    continue
-                    
-                start_sample = int(start_time * sr)
-                end_sample = int(end_time * sr)
-                segment = y[start_sample:end_sample]
-                
-                if len(segment) > 0:
-                    features = self._extract_simple_voice_features(segment, sr)
-                    if features:
-                        segment_features.append(features)
-                        total_voice_duration += duration_seg
-            
-            if len(segment_features) < 2:
-                return {
-                    'both_voices_audible': False,
-                    'voice_segments_count': len(voice_only_segments),
-                    'total_voice_duration': total_voice_duration,
-                    'confidence': 0.0,
-                    'analysis_details': 'Insufficient valid voice segments for analysis'
-                }
-            
-            diversity_analysis = self._analyze_voice_diversity(segment_features)
-            
-            both_audible = self._determine_voice_audibility(diversity_analysis, total_voice_duration)
-            
-            result = {
-                'both_voices_audible': both_audible['audible'],
-                'confidence': both_audible['confidence'],
-                'voice_segments_count': len(voice_only_segments),
-                'total_voice_duration': total_voice_duration,
-                'voice_diversity_score': diversity_analysis['diversity_score'],
-                'analysis_details': both_audible['details'],
-                'feature_analysis': diversity_analysis
-            }
-            
-            logger.info(f"Voice audibility analysis complete: {both_audible['audible']} (confidence: {both_audible['confidence']:.1%})")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Voice audibility detection failed: {e}")
-            return {
-                'error': str(e),
-                'both_voices_audible': False,
-                'confidence': 0.0
-            }
-    
-    def _extract_simple_voice_features(self, audio_segment: np.ndarray, sr: int) -> Dict[str, float]:
-        """Extract simplified voice features focused on distinguishing different speakers."""
-        try:
-            features = {}
-            
-            if len(audio_segment) < sr * 0.1:  # Less than 100ms
-                return self._extract_basic_features_only(audio_segment, sr)
-            
-            try:
-                frame_length = min(2048, len(audio_segment) // 4)
-                f0 = librosa.yin(audio_segment, fmin=50, fmax=400, sr=sr, frame_length=frame_length)
-                f0_valid = f0[~np.isnan(f0)]
-                if len(f0_valid) > 0:
-                    features['pitch_mean'] = np.mean(f0_valid)
-                    features['pitch_std'] = np.std(f0_valid)
-                else:
-                    features['pitch_mean'] = 0.0
-                    features['pitch_std'] = 0.0
-            except:
-                # Fallback: Use basic pitch estimation
-                features['pitch_mean'] = 0.0
-                features['pitch_std'] = 0.0
-            
-            hop_length = max(512, len(audio_segment) // 100)
-            
-            rms = librosa.feature.rms(y=audio_segment, hop_length=hop_length)[0]
-            features['energy_mean'] = np.mean(rms)
-            features['energy_std'] = np.std(rms)
-            
-            spectral_centroids = librosa.feature.spectral_centroid(y=audio_segment, sr=sr, hop_length=hop_length)[0]
-            features['spectral_centroid_mean'] = np.mean(spectral_centroids)
-            
-            zcr = librosa.feature.zero_crossing_rate(audio_segment, hop_length=hop_length)[0]
-            features['zcr_mean'] = np.mean(zcr)
-            
-            mfccs = librosa.feature.mfcc(y=audio_segment, sr=sr, n_mfcc=3, hop_length=hop_length)
-            for i in range(3):
-                features[f'mfcc_{i}_mean'] = np.mean(mfccs[i])
-            
-            return features
-            
-        except Exception as e:
-            logger.warning(f"Simple feature extraction failed: {e}")
-            return {}
-
-    def _extract_basic_features_only(self, audio_segment: np.ndarray, sr: int) -> Dict[str, float]:
-        """Extract only basic features for very short audio segments."""
-        try:
-            features = {}
-            
-            # Basic energy features only for short segments
-            rms = np.sqrt(np.mean(audio_segment**2))
-            features['energy_mean'] = rms
-            features['energy_std'] = 0.0
-            
-            # Zero crossing rate
-            zcr = np.mean(librosa.feature.zero_crossing_rate(audio_segment)[0])
-            features['zcr_mean'] = zcr
-            
-            # Fill in defaults for missing features
-            features['pitch_mean'] = 0.0
-            features['pitch_std'] = 0.0
-            features['spectral_centroid_mean'] = 0.0
-            for i in range(3):
-                features[f'mfcc_{i}_mean'] = 0.0
-            
-            return features
-        except:
-            return {}
-    
-    def _analyze_voice_diversity(self, segment_features: List[Dict[str, float]]) -> Dict[str, Any]:
-        """Analyze diversity in voice features to determine if multiple speakers are present."""
-        try:
-            if len(segment_features) < 2:
-                return {'diversity_score': 0.0, 'details': 'Insufficient segments'}
-            
-            feature_names = list(segment_features[0].keys())
-            feature_variations = {}
-            
-            for feature_name in feature_names:
-                values = [seg.get(feature_name, 0.0) for seg in segment_features]
-                values = [v for v in values if not (np.isnan(v) or np.isinf(v))]
-                
-                if len(values) > 1:
-                    mean_val = np.mean(values)
-                    std_val = np.std(values)
-                    cv = std_val / (abs(mean_val) + 1e-6)
-                    feature_variations[feature_name] = cv
-                else:
-                    feature_variations[feature_name] = 0.0
-            
-            key_features = ['pitch_mean', 'spectral_centroid_mean', 'mfcc_0_mean', 'mfcc_1_mean']
-            key_variations = [feature_variations.get(f, 0.0) for f in key_features if f in feature_variations]
-            
-            if key_variations:
-                diversity_score = np.mean(key_variations)
-            else:
-                diversity_score = 0.0
-            
-            return {
-                'diversity_score': diversity_score,
-                'feature_variations': feature_variations,
-                'key_feature_variations': dict(zip(key_features, key_variations)) if key_variations else {},
-                'num_segments_analyzed': len(segment_features)
-            }
-            
-        except Exception as e:
-            logger.warning(f"Voice diversity analysis failed: {e}")
-            return {'diversity_score': 0.0, 'details': f'Analysis error: {str(e)}'}
-
-    def _get_cached_audio(self, audio_path: str) -> Tuple[np.ndarray, int]:
-        """Get cached audio data or load and cache it."""
-        # Create session-aware cache key to prevent conflicts between concurrent sessions
-        cache_key = f"{os.path.abspath(audio_path)}_{os.path.getsize(audio_path)}_{os.path.getmtime(audio_path)}"
-        
-        if cache_key in self._audio_cache:
-            return self._audio_cache[cache_key]
-        
-        try:
-            file_size = os.path.getsize(audio_path)
-            target_sr = None if file_size < 10 * 1024 * 1024 else 16000  # 10MB threshold
-            
-            y, sr = librosa.load(audio_path, sr=target_sr)
-            
-            # Cache management: remove oldest if cache is full
-            if len(self._audio_cache) >= self._audio_cache_max_size:
-                oldest_key = next(iter(self._audio_cache))
-                del self._audio_cache[oldest_key]
-            
-            self._audio_cache[cache_key] = (y, sr)
-            return y, sr
-        except Exception as e:
-            logger.error(f"Failed to load audio {audio_path}: {e}")
-            raise
-
-    def _clear_audio_cache(self):
-        """Clear audio cache to free memory."""
-        self._audio_cache.clear()
-
-    def _determine_voice_audibility(self, diversity_analysis: Dict[str, Any], 
-                                   total_voice_duration: float) -> Dict[str, Any]:
-        """Determine if both user and model voices are audible based on diversity analysis."""
-        try:
-            diversity_score = diversity_analysis.get('diversity_score', 0.0)
-            
-            min_diversity_threshold = 0.12
-            good_diversity_threshold = 0.20
-            min_duration_threshold = 3.0
-            
-            sufficient_duration = total_voice_duration >= min_duration_threshold
-            
-            has_diversity = diversity_score >= min_diversity_threshold
-            good_diversity = diversity_score >= good_diversity_threshold
-            
-            if sufficient_duration and good_diversity:
-                audible = True
-                confidence = min(0.95, 0.75 + (diversity_score - good_diversity_threshold) * 2)
-                details = f"Both voices audible - good diversity ({diversity_score:.3f}) and sufficient duration ({total_voice_duration:.1f}s)"
-            elif sufficient_duration and has_diversity:
-                audible = True
-                confidence = min(0.85, 0.60 + (diversity_score - min_diversity_threshold) * 2.5)
-                details = f"Both voices likely audible - moderate diversity ({diversity_score:.3f}) and sufficient duration ({total_voice_duration:.1f}s)"
-            elif has_diversity and total_voice_duration >= min_duration_threshold * 0.6:
-                audible = True
-                confidence = min(0.75, 0.45 + (diversity_score - min_diversity_threshold) * 2)
-                details = f"Both voices possibly audible - has diversity ({diversity_score:.3f}) but limited duration ({total_voice_duration:.1f}s)"
-            else:
-                audible = False
-                if not sufficient_duration:
-                    confidence = 0.15
-                    details = f"Insufficient voice duration ({total_voice_duration:.1f}s < {min_duration_threshold}s)"
-                else:
-                    confidence = 0.15
-                    details = f"Low voice diversity ({diversity_score:.3f} < {min_diversity_threshold})"
-            
-            return {
-                'audible': audible,
-                'confidence': max(0.0, min(1.0, confidence)),
-                'details': details,
-                'diversity_score': diversity_score,
-                'total_duration': total_voice_duration,
-                'thresholds': {
-                    'min_diversity': min_diversity_threshold,
-                    'good_diversity': good_diversity_threshold,
-                    'min_duration': min_duration_threshold
-                }
-            }
-            
-        except Exception as e:
-            logger.warning(f"Voice audibility determination failed: {e}")
-            return {
-                'audible': False,
-                'confidence': 0.0,
-                'details': f'Analysis error: {str(e)}'
-            }
-    
-    def detect_voice_activity(self, audio_path: str, 
-                            frame_duration: float = 1.0) -> List[Tuple[float, float, bool]]:
-        """Detect voice activity using energy analysis."""
-        try:
-            return self._analyze_voice_segments(audio_path, frame_duration)
-        except Exception as e:
-            logger.error(f"Voice activity detection failed: {e}")
-            return []
-    
-    def _analyze_voice_segments(self, audio_path: str, 
-                               frame_duration: float) -> List[Tuple[float, float, bool]]:
-        """Analyze audio for voice segments."""
-        logger.info(f"Analyzing voice activity: {audio_path}")
-        y, sr = self._get_cached_audio(audio_path)
-        logger.info(f"Audio loaded: {len(y)/sr:.2f}s @ {sr}Hz")
-        
-        frame_length = int(frame_duration * sr)
-        hop_length = frame_length // 4
-        
-        rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-        
-        base_threshold = np.percentile(rms, 15)
-        max_rms = np.max(rms)
-        relative_threshold = max_rms * 0.1
-        threshold = max(base_threshold, relative_threshold)
-        logger.info(f"Voice threshold: {threshold:.6f}")
-        
-        voice_segments = []
-        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
-        
-        for time, energy in zip(times, rms):
-            end_time = min(time + frame_duration, len(y)/sr)
-            has_voice = energy > threshold
-            voice_segments.append((time, end_time, has_voice))
-        
-        voice_count = sum(1 for _, _, has_voice in voice_segments if has_voice)
-        logger.info(f"Voice activity: {voice_count}/{len(voice_segments)} segments")
-        
-        return voice_segments
-    
-    def _locale_to_whisper_language(self, locale_code: str) -> str:
-        """Convert locale code (e.g., 'en-US') to Whisper language code (e.g., 'en')."""
-        return Config.locale_to_whisper_language(locale_code)
-    
-    def analyze_language_fluency(self, audio_path: str, 
-                               target_language: str = 'en-US') -> Optional[Dict[str, Any]]:
-        """Analyze language and fluency using Whisper."""
+    def analyze_full_audio_fluency(self, audio_path: str, target_language: str) -> Optional[Dict[str, Any]]:
+        """Analyze language fluency for entire audio file."""
         if self.whisper_model is None:
             return {'detected_language': 'unknown', 'is_fluent': False, 'confidence': 0.0}
         
         try:
-            # Convert locale code to Whisper language code
-            whisper_language = self._locale_to_whisper_language(target_language)
+            whisper_language = Config.locale_to_whisper_language(target_language)
             
             result = self.whisper_model.transcribe(
                 audio_path, 
@@ -2472,26 +1835,30 @@ class AudioAnalyzer:
                 condition_on_previous_text=False,
                 temperature=0.0
             )
+            
             detected_language = result.get('language', 'unknown')
             transcription = result.get('text', '').strip()
             
             words = transcription.split()
-            if len(words) < 3:
+            total_words = len(words)
+            
+            no_space_languages = {'ja', 'zh', 'ko', 'th'}
+            if detected_language in no_space_languages and total_words == 1:
+                char_per_word = 2.5 if detected_language in {'ja', 'ko'} else 2.0
+                total_words = max(1, int(len(transcription.strip()) / char_per_word))
+            
+            if total_words == 0:
                 return None
             
             is_target_language = detected_language == whisper_language
-            avg_word_length = sum(len(word) for word in words) / len(words)
+            avg_word_length = sum(len(word) for word in words) / len(words) if words else 0
             
-            fluency_indicators = {
-                'word_count': len(words),
-                'avg_word_length': avg_word_length,
-                'language_match': is_target_language,
-                'has_transcription': len(transcription) > 0
-            }
-            
-            fluency_score = 1.0 if (is_target_language and avg_word_length > 4 
-                                  and len(transcription) > 0) else 0.0
-            is_fluent = fluency_score > 0.6 and is_target_language
+            if is_target_language and total_words >= 3 and len(transcription) >= 10:
+                fluency_score = 1.0
+                is_fluent = True
+            else:
+                fluency_score = 0.0
+                is_fluent = False
             
             return {
                 'detected_language': detected_language,
@@ -2501,36 +1868,490 @@ class AudioAnalyzer:
                 'fluency_score': fluency_score,
                 'confidence': result.get('avg_logprob', fluency_score),
                 'transcription': transcription,
-                'fluency_indicators': fluency_indicators
+                'total_words': total_words,
+                'avg_word_length': avg_word_length,
+                'full_audio_analysis': True
             }
             
         except Exception as e:
-            logger.error(f"Language analysis failed: {e}")
+            logger.error(f"Full audio language analysis failed: {e}")
             return {
                 'detected_language': 'unknown',
                 'is_fluent': False,
                 'confidence': 0.0,
                 'error': str(e)
             }
+    
+    def detect_voice_activity(self, audio_path: str, frame_length: int = 2048, 
+                             hop_length: int = 512) -> Dict[str, Any]:
+        """Detect voice activity in audio using multi-feature approach."""
+        try:
+            # Load audio
+            y, sr = librosa.load(audio_path, sr=None)
+            
+            # Calculate multiple features for robust VAD
+            # 1. RMS energy
+            rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+            
+            # 2. Zero-crossing rate
+            zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
+            
+            # 3. Spectral centroid
+            spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
+            
+            # 4. Spectral rolloff
+            spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop_length)[0]
+            
+            # Use adaptive threshold based on noise floor estimation
+            sorted_rms = np.sort(rms)
+            noise_floor = np.mean(sorted_rms[:int(len(sorted_rms) * 0.1)])  # Bottom 10% as noise
+            energy_threshold = noise_floor * 3
+            
+            # Alternative energy threshold if noise floor is too low
+            if energy_threshold < np.percentile(rms, 10):
+                energy_threshold = np.percentile(rms, 10)
+            
+            # ZCR: Human speech has moderate ZCR
+            zcr_low = np.percentile(zcr, 20)
+            zcr_high = np.percentile(zcr, 80)
+            
+            # Spectral: Human voice typically in 85-3000 Hz range
+            voice_freq_mask = (spectral_centroid > 85) & (spectral_centroid < 3000)
+            
+            # Combined voice activity detection
+            # Method 1: Energy + ZCR
+            voice_activity_energy = (rms > energy_threshold) & (zcr > zcr_low) & (zcr < zcr_high)
+            
+            # Method 2: Spectral characteristics
+            voice_activity_spectral = voice_freq_mask & (rms > noise_floor * 1.5)
+            
+            # Combine both methods (OR operation for sensitivity)
+            voice_activity = voice_activity_energy | voice_activity_spectral
+            
+            # Apply median filter to smooth out short gaps
+            voice_activity = median_filter(voice_activity.astype(float), size=7) > 0.5
+            
+            # Post-processing: remove very short segments
+            voice_activity = self._remove_short_segments(voice_activity, min_length=5)
+            
+            # Calculate percentage of frames with voice
+            voice_ratio = np.sum(voice_activity) / len(voice_activity) if len(voice_activity) > 0 else 0
+            
+            # Get time stamps of voice activity
+            times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
+            voice_segments = []
+            
+            # Find continuous voice segments
+            in_segment = False
+            start_time = 0
+            
+            for i, is_voice in enumerate(voice_activity):
+                if is_voice and not in_segment:
+                    start_time = times[i]
+                    in_segment = True
+                elif not is_voice and in_segment:
+                    end_time = times[i]
+                    if end_time - start_time > 0.2:  # Minimum 200ms segments
+                        voice_segments.append((start_time, end_time))
+                    in_segment = False
+            
+            # Handle last segment
+            if in_segment and times[-1] - start_time > 0.2:
+                voice_segments.append((start_time, times[-1]))
+
+            # If we have good energy throughout but no segments, likely continuous speech
+            if len(voice_segments) == 0 and np.mean(rms) > noise_floor * 5:
+                voice_segments = [(0, float(len(y) / sr))]
+                voice_ratio = 0.8  # Assume 80% voice if continuous energy
+            
+            return {
+                'has_voice': voice_ratio > 0.02 or len(voice_segments) > 0,
+                'voice_ratio': float(voice_ratio),
+                'num_segments': len(voice_segments),
+                'total_voice_duration': sum(end - start for start, end in voice_segments),
+                'segments': voice_segments,
+                'audio_duration': float(len(y) / sr),
+                'mean_energy': float(np.mean(rms)),
+                'energy_threshold': float(energy_threshold),
+                'noise_floor': float(noise_floor)
+            }
+            
+        except Exception as e:
+            logger.error(f"Voice activity detection failed: {e}")
+            return {
+                'has_voice': False,
+                'voice_ratio': 0.0,
+                'num_segments': 0,
+                'total_voice_duration': 0.0,
+                'segments': [],
+                'audio_duration': 0.0
+            }
+    
+    def _remove_short_segments(self, activity: np.ndarray, min_length: int) -> np.ndarray:
+        """Remove segments shorter than min_length frames."""
+        result = activity.copy()
+        
+        changes = np.diff(np.concatenate(([0], activity.astype(int), [0])))
+        starts = np.where(changes == 1)[0]
+        ends = np.where(changes == -1)[0]
+        
+        for start, end in zip(starts, ends):
+            if end - start < min_length:
+                result[start:end] = False
+                
+        return result
+    
+    def _find_histogram_peaks(self, hist: np.ndarray, min_distance: int = 3) -> List[int]:
+        """Find peaks in histogram for bimodal distribution detection."""
+        peaks = []
+        
+        for i in range(1, len(hist) - 1):
+            if hist[i] > hist[i-1] and hist[i] > hist[i+1] and hist[i] > 0.05:
+                if not peaks or all(abs(i - p) >= min_distance for p in peaks):
+                    peaks.append(i)
+        
+        return peaks
+    
+    def analyze_speaker_count(self, audio_path: str, vad_info: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Analyze audio to estimate the number of distinct speakers.
+        Uses improved approach based on spectral features, pitch, and temporal analysis.
+        """
+        try:
+            # Load audio
+            y, sr = librosa.load(audio_path, sr=None)
+            
+            # First check if there's any substantial audio
+            if len(y) < sr * 0.5:  # Less than 0.5 seconds
+                return {
+                    'estimated_speakers': 0,
+                    'confidence': 0.0,
+                    'feature_variance_ratio': 0.0,
+                    'has_multiple_speakers': False,
+                    'audio_features': {}
+                }
+            
+            # Extract MFCC features for speaker characteristics
+            mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+            
+            # Calculate spectral features
+            spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+            spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
+            spectral_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
+            
+            # Calculate temporal variations in MFCCs (speaker changes)
+            mfcc_delta = librosa.feature.delta(mfccs)
+            mfcc_delta2 = librosa.feature.delta(mfccs, order=2)
+            
+            # Combine features for analysis
+            # Focus on MFCC variations which are good for speaker discrimination
+            mfcc_temporal_var = np.var(mfccs, axis=1)
+            mfcc_delta_var = np.var(mfcc_delta, axis=1)
+            
+            # Advanced speaker separation using temporal dynamics
+            # Analyze how MFCCs change over time to detect speaker transitions
+            hop_length = 512  # Default hop length
+            window_size = int(sr * 0.5 / hop_length)  # 0.5 second windows
+            if mfccs.shape[1] > window_size * 2:
+                mfcc_windows = []
+                # Use smaller step size for better resolution
+                step_size = max(1, window_size // 4)  # 125ms steps
+                
+                for i in range(0, mfccs.shape[1] - window_size, step_size):
+                    window = mfccs[:, i:i+window_size]
+                    mfcc_windows.append(np.mean(window, axis=1))
+                
+                # Calculate distances between windows to detect speaker changes
+                if len(mfcc_windows) > 2:
+                    mfcc_windows = np.array(mfcc_windows)
+                    distances = []
+                    for i in range(1, len(mfcc_windows)):
+                        dist = np.linalg.norm(mfcc_windows[i] - mfcc_windows[i-1])
+                        distances.append(dist)
+                    
+                    # High distance variance indicates speaker changes
+                    distance_variance = np.var(distances) if distances else 0
+                    max_distance = np.max(distances) if distances else 0
+                    mean_distance = np.mean(distances) if distances else 0
+                    
+                else:
+                    distance_variance = 0
+                    max_distance = 0
+            else:
+                distance_variance = 0
+                max_distance = 0
+            
+            # Calculate feature statistics
+            spectral_var = np.var(spectral_centroids)
+            bandwidth_var = np.var(spectral_bandwidth)
+            
+            # Normalize variations
+            mfcc_norm_var = mfcc_temporal_var / (np.max(mfcc_temporal_var) + 1e-8)
+            delta_norm_var = mfcc_delta_var / (np.max(mfcc_delta_var) + 1e-8)
+            
+            # Multiple speakers cause higher variation in mid-range MFCCs (2-8)
+            mid_mfcc_var_ratio = np.mean(mfcc_norm_var[2:8])
+            delta_var_ratio = np.mean(delta_norm_var[2:8])
+            
+            # Pitch analysis for speaker discrimination
+            pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+            pitch_values = []
+            
+            for t in range(pitches.shape[1]):
+                index = magnitudes[:, t].argmax()
+                pitch = pitches[index, t]
+                if pitch > 80 and pitch < 400:  # Human voice range
+                    pitch_values.append(pitch)
+            
+            pitch_variance = np.std(pitch_values) if len(pitch_values) > 10 else 0
+            pitch_range = max(pitch_values) - min(pitch_values) if len(pitch_values) > 10 else 0
+            
+            speaker_count = 1  # Default to 1 speaker if voice is present
+            confidence = 0.7   # Base confidence
+            
+            # Multiple speaker indicators with weighted scoring
+            multi_speaker_score = 0.0
+            indicators = []
+            
+            # 1. MFCC variation
+            if mid_mfcc_var_ratio > 0.3:
+                score_contrib = min(0.25, (mid_mfcc_var_ratio - 0.3) * 2.5)
+                multi_speaker_score += score_contrib
+                indicators.append(f"mfcc_var({mid_mfcc_var_ratio:.2f})={score_contrib:.2f}")
+                
+            if delta_var_ratio > 0.35:
+                score_contrib = min(0.25, (delta_var_ratio - 0.35) * 2.0)
+                multi_speaker_score += score_contrib
+                indicators.append(f"delta_var({delta_var_ratio:.2f})={score_contrib:.2f}")
+                
+            # 2. Temporal dynamics
+            # Only contribute if there's significant variance AND distance
+            if distance_variance > 1.0:
+                score_contrib = min(0.25, (distance_variance - 1.0) / 3)
+                multi_speaker_score += score_contrib
+                indicators.append(f"temporal_var({distance_variance:.2f})={score_contrib:.2f}")
+            
+            if max_distance > 7.0:
+                score_contrib = min(0.15, (max_distance - 7.0) / 15)
+                multi_speaker_score += score_contrib
+                indicators.append(f"max_transition({max_distance:.2f})={score_contrib:.2f}")
+                
+            # 3. Pitch-based analysis 
+            if len(pitch_values) > 100:  # Need sufficient pitch data
+                # Check for consistent pitch patterns vs varied patterns
+                pitch_percentiles = np.percentile(pitch_values, [10, 25, 50, 75, 90])
+                pitch_iqr = pitch_percentiles[3] - pitch_percentiles[1]  # Interquartile range
+                
+                # Only contribute if BOTH IQR and range are high
+                if pitch_iqr > 60 and pitch_range > 180:
+                    score_contrib = min(0.2, (pitch_iqr - 60) / 100 * 0.2)
+                    multi_speaker_score += score_contrib
+                    indicators.append(f"pitch_spread({pitch_iqr:.1f})={score_contrib:.2f}")
+                
+                # Bimodal pitch distribution is strong indicator
+                if len(pitch_values) > 500:
+                    pitch_hist, pitch_bins = np.histogram(pitch_values, bins=20)
+                    pitch_hist_norm = pitch_hist / np.sum(pitch_hist)
+                    peaks = self._find_histogram_peaks(pitch_hist_norm)
+                    if len(peaks) >= 2:
+                        # Check if peaks are far apart (different speakers)
+                        peak_distance = abs(peaks[1] - peaks[0])
+                        if peak_distance > 3:
+                            score_contrib = min(0.25, peak_distance / 10 * 0.25)
+                            multi_speaker_score += score_contrib
+                            indicators.append(f"bimodal_pitch={len(peaks)}peaks,dist={peak_distance}")
+            
+            # 4. Audio duration and voice ratio analysis
+            if vad_info is None:
+                vad_info = self.voice_features_cache.get('vad_results', {})
+            voice_ratio = vad_info.get('voice_ratio', 0)
+            total_duration = vad_info.get('audio_duration', 0)
+            
+            # 1 voice has much lower voice ratio
+            if voice_ratio > 0.5:  # High voice ratio indicates conversation
+                score_contrib = min(0.3, (voice_ratio - 0.5) * 0.6)
+                multi_speaker_score += score_contrib
+                indicators.append(f"voice_ratio({voice_ratio:.2f})={score_contrib:.2f}")
+            elif voice_ratio < 0.35:  # Low voice ratio strongly suggests single speaker
+                # Strong negative contribution to multi-speaker score
+                multi_speaker_score -= 0.4
+                indicators.append(f"low_voice_ratio({voice_ratio:.2f})=-0.4")
+                
+            # Additional penalty for short duration with low voice ratio
+            if total_duration < 15 and voice_ratio < 0.4:
+                multi_speaker_score -= 0.3
+                indicators.append(f"short_monologue(dur={total_duration:.1f})=-0.3")
+            
+            # 5. Duration check
+            if total_duration > 60 and voice_ratio > 0.6:  # Long conversation
+                multi_speaker_score += 0.2
+                indicators.append(f"long_conversation(dur={total_duration:.1f},ratio={voice_ratio:.2f})=0.2")
+            
+            # 6. Special case detection
+            if pitch_range > 200 and distance_variance > 1.0 and voice_ratio > 0.4:
+                speaker_count = 2
+                confidence = 0.9
+            # High voice ratio with reasonable duration is strong indicator
+            elif voice_ratio > 0.6 and total_duration > 30:
+                speaker_count = 2
+                confidence = 0.85
+            # Clear single speaker pattern
+            elif voice_ratio < 0.35 and total_duration < 20:
+                speaker_count = 1
+                confidence = 0.85
+            else:
+                # Determine speaker count based on score
+                # Require positive score AND minimum indicators for 2 speakers
+                if multi_speaker_score >= 0.4 and voice_ratio > 0.35:
+                    speaker_count = 2
+                    confidence = min(0.9, 0.6 + multi_speaker_score * 0.3)
+                else:
+                    speaker_count = 1  # Default to 1 speaker
+                    # For 1 speaker, boost confidence if indicators are low or negative
+                    if multi_speaker_score < 0:
+                        confidence = 0.9  # Very confident it's 1 speaker
+                    elif multi_speaker_score < 0.2:
+                        confidence = 0.8
+                    else:
+                        confidence = max(0.5, 0.7 - multi_speaker_score * 0.5)
+            
+            # Store VAD results for use in analysis if not passed directly
+            if vad_info and 'voice_ratio' in vad_info:
+                self.voice_features_cache['vad_results'] = vad_info
+            
+            return {
+                'estimated_speakers': speaker_count,
+                'confidence': float(confidence),
+                'feature_variance_ratio': float(mid_mfcc_var_ratio),
+                'has_multiple_speakers': speaker_count >= 2,
+                'multi_speaker_score': float(multi_speaker_score),
+                'distance_variance': float(distance_variance),
+                'max_distance': float(max_distance),
+                'audio_features': {
+                    'mfcc_variance': float(np.mean(mfcc_temporal_var)),
+                    'mfcc_delta_variance': float(np.mean(mfcc_delta_var)),
+                    'spectral_variance': float(spectral_var),
+                    'pitch_variance': float(pitch_variance),
+                    'pitch_range': float(pitch_range),
+                    'num_pitch_values': len(pitch_values)
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Speaker count analysis failed: {e}")
+            return {
+                'estimated_speakers': 0,
+                'confidence': 0.0,
+                'feature_variance_ratio': 0.0,
+                'has_multiple_speakers': False,
+                'audio_features': {}
+            }
+    
+    def analyze_voice_audibility(self, audio_path: str) -> Dict[str, Any]:
+        """
+        Comprehensive voice audibility analysis combining VAD and speaker detection.
+        Returns whether there are 0, 1, or 2 audible voices.
+        """
+        try:
+            vad_results = self.detect_voice_activity(audio_path)
+            
+            if not vad_results['has_voice'] or (vad_results['voice_ratio'] < 0.02 and vad_results['num_segments'] == 0):
+                return {
+                    'num_audible_voices': 0,
+                    'passed_qa': False,
+                    'confidence': 0.9,
+                    'details': 'No audible voices detected',
+                    'vad_info': vad_results,
+                    'speaker_info': None,
+                    'voice_ratio': vad_results['voice_ratio'],
+                    'total_voice_duration': vad_results['total_voice_duration'],
+                    'has_multiple_speakers': False
+                }
+            
+            speaker_results = self.analyze_speaker_count(audio_path, vad_info=vad_results)
+            
+            # Get initial speaker count
+            num_voices = speaker_results['estimated_speakers']
+            
+            # If speaker analysis failed but VAD found voice, assume at least 1 speaker
+            if num_voices == 0 and vad_results['voice_ratio'] > 0.1:
+                num_voices = 1
+                speaker_results['confidence'] = 0.5
+            
+            # Validate speaker count with VAD results
+            if vad_results['voice_ratio'] < 0.05 and vad_results['num_segments'] < 2:
+                # Very minimal voice activity - cap at 1 speaker
+                if num_voices > 1:
+                    num_voices = 1
+                    speaker_results['confidence'] *= 0.7
+            
+            # QA passes only if exactly 2 voices are detected
+            passed_qa = (num_voices == 2)
+            
+            # Calculate combined confidence based on both analyses
+            # Weight speaker confidence more heavily as it's more specific
+            vad_confidence = min(1.0, vad_results['voice_ratio'] * 2)
+            speaker_confidence = speaker_results['confidence']
+            
+            # Combined confidence: 30% VAD, 70% speaker analysis
+            confidence = (0.3 * vad_confidence + 0.7 * speaker_confidence)
+            
+            # Boost confidence if both analyses agree
+            if num_voices == 2 and speaker_results['has_multiple_speakers'] and vad_results['voice_ratio'] > 0.3:
+                confidence = min(0.95, confidence * 1.1)
+            
+            # Generate detailed description
+            if num_voices == 0:
+                details = 'No audible voices detected'
+            elif num_voices == 1:
+                details = 'Only one audible voice detected'
+            elif num_voices == 2:
+                details = 'Two audible voices detected'
+            else:
+                details = f'{num_voices} voices detected (expected 2)'
+            
+            # Add voice activity info to description
+            if vad_results['voice_ratio'] > 0:
+                details += f' - {vad_results["voice_ratio"]:.1%} voice activity'
+            
+            return {
+                'num_audible_voices': num_voices,
+                'passed_qa': passed_qa,
+                'confidence': float(confidence),
+                'details': details,
+                'vad_info': vad_results,
+                'speaker_info': speaker_results,
+                'voice_ratio': vad_results['voice_ratio'],
+                'total_voice_duration': vad_results['total_voice_duration'],
+                'has_multiple_speakers': speaker_results.get('has_multiple_speakers', False)
+            }
+            
+        except Exception as e:
+            logger.error(f"Voice audibility analysis failed: {e}")
+            return {
+                'num_audible_voices': 0,
+                'passed_qa': False,
+                'confidence': 0.0,
+                'details': f'Analysis failed: {str(e)}',
+                'vad_info': None,
+                'speaker_info': None,
+                'voice_ratio': 0.0,
+                'total_voice_duration': 0.0,
+                'has_multiple_speakers': False
+            }
 
 
 class VideoContentAnalyzer:
-    """
-    Thread-safe video content analysis system with modular helpers for frame, audio, and memory management.
-    """
+    """Video content analysis system."""
+    
     def __init__(self, session_id: Optional[str] = None) -> None:
-        import gc
         gc.collect()
         
-        # Ensure unique session ID for proper isolation
-        if session_id:
-            # Validate that the provided session ID is not already active to prevent conflicts
-            with ResourceManager._global_lock:
-                if session_id in ResourceManager._active_sessions_global:
-                    logger.warning(f"Session ID {session_id} already active, generating new ID")
-                    session_id = SessionManager.generate_session_id()
+        self.session_manager = get_session_manager()
+        self.session_id = session_id or self.session_manager.generate_session_id()
         
-        self.session_id = session_id or SessionManager.generate_session_id()
+        self.session_dir = self.session_manager.create_session(self.session_id)
+        
         self.rules: List[DetectionRule] = []
         self.results: List[DetectionResult] = []
         self.temp_files: List[str] = []
@@ -2538,113 +2359,61 @@ class VideoContentAnalyzer:
         self._lock = threading.RLock()
         self._processing_lock = threading.Lock()
         self._is_processing = False
-        self._resource_manager = get_resource_manager()
-        self._memory_monitor: Optional[threading.Thread] = None
-        self._memory_limit_exceeded = False
         self.analysis_start_time: Optional[float] = None
+        self.analysis_end_time: Optional[float] = None
         self.total_frames_processed: int = 0
         self.video_duration: float = 0.0
-        self._processing_stats: Dict[str, Any] = {
-            'frames_processed': 0,
-            'detection_time': 0.0,
-            'ocr_time': 0.0,
-            'audio_time': 0.0
+        self.progress_callback: Optional[callable] = None
+        
+        self.performance_metrics = {
+            'flash_detection_time': 0.0,
+            'alias_detection_time': 0.0,
+            'eval_mode_detection_time': 0.0,
+            'audio_analysis_time': 0.0,
+            'total_analysis_time': 0.0,
+            'frames_analyzed': 0,
+            'audio_extraction_time': 0.0,
+            'ocr_processing_time': 0.0
         }
-        try:
-            self.output_dir = FileManager.validate_and_ensure_directory(
-                Config.OUTPUT_DIR, self.session_id
-            )
-            self.temp_dir = FileManager.create_session_temp_dir(self.session_id)
-        except Exception as e:
-            logger.error(f"Failed to create session directories: {e}")
-            raise RuntimeError(f"Cannot initialize session directories: {e}") from e
+        
         try:
             self.audio_analyzer = self._initialize_audio_analyzer()
         except Exception as e:
-            logger.warning(f"Audio analyzer initialization failed: {e}")
             self.audio_analyzer = None
-        logger.info(f"VideoContentAnalyzer initialized for session: {self.session_id}")
-
-    def _monitor_memory_usage(self) -> None:
-        """
-        Monitor memory usage during analysis with detailed reporting.
-        
-        This method runs in a separate thread and monitors:
-        - Process memory usage
-        - System memory availability
-        - Memory growth patterns
-        - Automatic cleanup triggers
-        """
-        memory_samples = []
-        sample_interval = 5  # seconds
-        
-        while self._is_processing and not self._memory_limit_exceeded:
-            try:
-                process = psutil.Process()
-                memory_info = process.memory_info()
-                system_memory = psutil.virtual_memory()
-                
-                # Record memory sample
-                sample = {
-                    'timestamp': time.time(),
-                    'process_rss': memory_info.rss,
-                    'process_vms': memory_info.vms,
-                    'system_available': system_memory.available,
-                    'system_percent': system_memory.percent
-                }
-                memory_samples.append(sample)
-                
-                # Check process memory limit using dynamic limits
-                memory_limits = Config.get_memory_limits()
-                per_session_gb = memory_limits["per_session_gb"]
-                max_process_memory = (per_session_gb * 1.5) * 1024 * 1024 * 1024
-                
-                if memory_info.rss > max_process_memory:
-                    self._memory_limit_exceeded = True
-                    logger.warning(
-                        f"Process memory limit exceeded: "
-                        f"{memory_info.rss / 1024 / 1024:.1f}MB "
-                        f"(limit: {per_session_gb * 1.5:.1f}GB)"
-                    )
-                    break
-                
-                # Check system memory pressure
-                if system_memory.percent > 95:
-                    logger.warning(
-                        f"High system memory usage: {system_memory.percent:.1f}%"
-                    )
-                
-                # Log periodic statistics
-                if len(memory_samples) % 12 == 0:
-                    self._log_memory_statistics(memory_samples[-12:])
-                
-                time.sleep(sample_interval)
-                
-            except Exception as e:
-                logger.error(f"Memory monitoring error: {e}")
-                time.sleep(sample_interval)
     
-    def _log_memory_statistics(self, samples: List[Dict[str, Any]]) -> None:
-        """
-        Log memory usage statistics from recent samples.
+    def _update_progress(self, percentage: float, message: str):
+        """Update progress via callback if available."""
+        if self.progress_callback:
+            try:
+                self.progress_callback(percentage / 100.0, message)
+            except Exception as e:
+                logger.warning(f"Progress callback failed: {e}")
+    
+    class ProgressTracker:
+        """Context manager for tracking progress within a range."""
         
-        Args:
-            samples: Recent memory usage samples
-        """
-        if not samples:
-            return
-        
-        try:
-            avg_process_mb = sum(s['process_rss'] for s in samples) / len(samples) / 1024 / 1024
-            max_process_mb = max(s['process_rss'] for s in samples) / 1024 / 1024
-            avg_system_percent = sum(s['system_percent'] for s in samples) / len(samples)
+        def __init__(self, analyzer, start_pct: float, end_pct: float, operation_name: str):
+            self.analyzer = analyzer
+            self.start_pct = start_pct
+            self.end_pct = end_pct
+            self.operation_name = operation_name
+            self.range_size = end_pct - start_pct
             
-            logger.debug(
-                f"Memory stats - Process: avg={avg_process_mb:.1f}MB, "
-                f"max={max_process_mb:.1f}MB, System: {avg_system_percent:.1f}%"
-            )
-        except Exception as e:
-            logger.debug(f"Failed to compute memory statistics: {e}")
+        def update(self, progress_ratio: float, message: str = None):
+            """Update progress within the allocated range."""
+            current_pct = self.start_pct + (progress_ratio * self.range_size)
+            display_message = message or f"{self.operation_name}: {progress_ratio*100:.1f}%"
+            self.analyzer._update_progress(current_pct, display_message)
+        
+        def __enter__(self):
+            self.analyzer._update_progress(self.start_pct, f"Starting {self.operation_name}...")
+            return self
+        
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                self.analyzer._update_progress(self.end_pct, f"{self.operation_name} completed")
+            else:
+                self.analyzer._update_progress(self.end_pct, f"{self.operation_name} failed")
     
     def _initialize_audio_analyzer(self) -> Optional[AudioAnalyzer]:
         """Initialize audio analyzer."""
@@ -2652,135 +2421,45 @@ class VideoContentAnalyzer:
             analyzer = AudioAnalyzer()
             return analyzer
         except Exception as e:
-            logger.warning(f"Audio analyzer failed: {e}")
             return None
     
     def __enter__(self):
-        """Context manager entry with resource registration."""
-        video_duration = self.video_duration if hasattr(self, 'video_duration') else 0.0
-        if not self._resource_manager.start_analysis(self.session_id, self, video_duration):
-            raise RuntimeError("Cannot start analysis - resource limits exceeded")
+        """Context manager entry."""
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit with guaranteed cleanup."""
+        """Context manager exit."""
         try:
-            self._cleanup_temp_files_only()
+            with self._lock:
+                self._is_processing = False
         finally:
             pass
     
-    def _cleanup_temp_files_only(self):
-        """Clean up only temporary files, preserve screenshots for UI display."""
+    def cleanup_temp_files(self):
+        """Clean up temporary files."""
         with self._lock:
             try:
                 self._is_processing = False
                 
                 if self.temp_files:
-                    FileManager.cleanup_files(self.temp_files, self.session_id)
+                    for temp_file in self.temp_files:
+                        try:
+                            if os.path.exists(temp_file):
+                                os.unlink(temp_file)
+                                logger.debug(f"Removed temp file: {temp_file}")
+                        except Exception as e:
+                            logger.debug(f"Could not remove temp file {temp_file}: {e}")
                     self.temp_files.clear()
-                
-                if self.screenshot_files:
-                    pass
+                    
+                logger.debug(f"Session {self.session_id} analysis completed, directory preserved")
                 
             except Exception as e:
-                logger.error(f"Temp files cleanup error for session {self.session_id}: {e}")
-    
-    def cleanup(self) -> None:
-        """Thread-safe cleanup of resources."""
-        with self._lock:
-            try:
-                self._is_processing = False
-                
-                if self.temp_files:
-                    FileManager.cleanup_files(self.temp_files, self.session_id)
-                    self.temp_files.clear()
-                
-                if self.screenshot_files:
-                    pass
-                
-                self._cleanup_session_directory()
-                
-                try:
-                    analysis_results_path = "analysis_output/results.json"
-                    if os.path.exists(analysis_results_path):
-                        os.unlink(analysis_results_path)
-                except Exception as e:
-                    logger.warning(f"Failed to auto-clean analysis results file: {e}")
-                
-            except Exception as e:
-                logger.error(f"Cleanup error for session {self.session_id}: {e}")
-     
-    def cleanup_screenshots(self, preserve_for_export=False):
-        """Clean up screenshot files when session truly ends."""
-        try:
-            if self.screenshot_files:
-                if preserve_for_export:
-                    return
-                FileManager.cleanup_files(self.screenshot_files, self.session_id)
-                self.screenshot_files.clear()
-        except Exception as e:
-            logger.error(f"Error cleaning up screenshots: {e}")
-
-    def add_rule(self, rule: DetectionRule) -> None:
-        """Thread-safe rule addition."""
-        with self._lock:
-            self._validate_rule_input(rule)
-            
-            if self._is_processing:
-                raise RuntimeError("Cannot modify rules during active analysis")
-            
-            self._replace_existing_rule(rule)
-            self.rules.append(rule)
-    
-    def _validate_rule_input(self, rule: DetectionRule) -> None:
-        """Rule validation."""
-        if not isinstance(rule, DetectionRule):
-            raise ValueError("Rule must be DetectionRule instance")
-        
-        if not rule.name or len(rule.name.strip()) == 0:
-            raise ValueError("Rule name cannot be empty")
-        
-        # Validate that the name is sanitized
-        sanitized_name = InputValidator.sanitize_user_input(rule.name, 100)
-        if rule.name != sanitized_name:
-            raise ValueError(f"Rule name contains unsafe characters. Use: {sanitized_name}")
-        
-        if rule.parameters:
-            self._validate_rule_parameters(rule.parameters)
-    
-    def _validate_rule_parameters(self, parameters: Dict[str, Any]) -> None:
-        """Validate rule parameters for security."""
-        dangerous_keys = ['__', 'eval', 'exec', 'import', 'open', 'file']
-        
-        for key, value in parameters.items():
-            if any(dangerous in key.lower() for dangerous in dangerous_keys):
-                raise ValueError(f"Potentially dangerous parameter key: {key}")
-            
-            if isinstance(value, str):
-                parameters[key] = InputValidator.sanitize_user_input(value)
-            
-            elif 'path' in key.lower() and isinstance(value, str):
-                if not PathValidator.validate_file_path(value):
-                    raise ValueError(f"Invalid file path in parameter {key}: {value}")
-    
-    def _replace_existing_rule(self, rule: DetectionRule) -> None:
-        """Replace existing rule with same name."""
-        existing_rule = next((r for r in self.rules if r.name == rule.name), None)
-        if existing_rule:
-            self.rules.remove(existing_rule)
-    
-    def get_active_rules(self) -> List[DetectionRule]:
-        """Thread-safe access to enabled rules."""
-        with self._lock:
-            return [rule for rule in self.rules if rule.enabled]
-    
-    def get_rules_by_type(self, detection_type: DetectionType) -> List[DetectionRule]:
-        """Get rules by detection type with thread safety."""
-        return [rule for rule in self.get_active_rules() if rule.detection_type == detection_type]
+                logger.error(f"Temp cleanup error for session {self.session_id}: {e}")
     
     def analyze_video(self, video_path: str, 
-                     frame_interval: float = Config.DEFAULT_FRAME_INTERVAL) -> List[DetectionResult]:
-        """Thread-safe video analysis."""
+                     frame_interval: float = Config.DEFAULT_FRAME_INTERVAL,
+                     progress_callback: callable = None) -> List[DetectionResult]:
+        """Thread-safe video analysis with progress tracking."""
         
         if not self._processing_lock.acquire(blocking=False):
             raise RuntimeError("Analysis already in progress for this session")
@@ -2788,19 +2467,12 @@ class VideoContentAnalyzer:
         try:
             with self._lock:
                 self._is_processing = True
-                self._memory_limit_exceeded = False
-            
-            if self._memory_monitor is None or not self._memory_monitor.is_alive():
-                self._memory_monitor = threading.Thread(
-                    target=self._monitor_memory_usage, daemon=True
-                )
-                self._memory_monitor.start()
+                self.progress_callback = progress_callback
             
             self._validate_analysis_inputs(video_path, frame_interval)
             
-            active_rules = self.get_active_rules()
+            active_rules = self.rules
             if not active_rules:
-                logger.warning(f"No active rules configured (session: {self.session_id})")
                 return []
             
             self._initialize_analysis()
@@ -2817,29 +2489,32 @@ class VideoContentAnalyzer:
         finally:
             with self._lock:
                 self._is_processing = False
+                self.progress_callback = None
             self._processing_lock.release()
     
     def _validate_analysis_inputs(self, video_path: str, frame_interval: float) -> None:
-        """Input validation with security checks."""
-        
-        if not PathValidator.validate_file_path(video_path):
-            raise ValueError(f"Invalid or unsafe video path: {video_path}")
+        """Input validation."""
         
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
-        
-        if not PathValidator.validate_file_size(video_path):
-            raise ValueError("Video file exceeds maximum allowed size")
-        
-        if not (Config.MIN_FRAME_INTERVAL <= frame_interval <= Config.MAX_FRAME_INTERVAL):
-            raise ValueError(f"Frame interval must be {Config.MIN_FRAME_INTERVAL}-{Config.MAX_FRAME_INTERVAL}")
     
     def _initialize_analysis(self) -> None:
         """Initialize analysis state with thread safety."""
         with self._lock:
             self.results = []
             self.analysis_start_time = datetime.now().timestamp()
+            self.analysis_end_time = None
             self.total_frames_processed = 0
+            self.performance_metrics = {
+                'flash_detection_time': 0.0,
+                'alias_detection_time': 0.0,
+                'eval_mode_detection_time': 0.0,
+                'audio_analysis_time': 0.0,
+                'total_analysis_time': 0.0,
+                'frames_analyzed': 0,
+                'audio_extraction_time': 0.0,
+                'ocr_processing_time': 0.0
+            }
     
     def _create_analysis_context(self, video_path: str) -> Dict[str, Any]:
         """Create analysis context."""
@@ -2876,10 +2551,14 @@ class VideoContentAnalyzer:
     def _execute_analysis(self, context: Dict[str, Any], frame_interval: float) -> None:
         """Execute the video analysis."""
         try:
+            self._update_progress(5, "Preparing analysis parameters...")
             frame_params = self._calculate_frame_parameters(
                 context, frame_interval
             )
             
+            self._update_progress(10, "Starting audio analysis...")
+
+            audio_start_time = time.time()
             if context['audio_path']:
                 self._process_audio_analysis(
                     context['audio_path'], 
@@ -2887,14 +2566,33 @@ class VideoContentAnalyzer:
                     frame_params['end_time'], 
                     frame_interval
                 )
+            else:
+                self._update_progress(20, "No audio analysis needed")
+            self.performance_metrics['audio_analysis_time'] = time.time() - audio_start_time
             
+            self._update_progress(25, "Audio analysis complete, starting video frame processing...")
+
+            video_start_time = time.time()
             self._process_video_frames(context, frame_params, frame_interval)
+            video_processing_time = time.time() - video_start_time
+            
+            self._update_progress(95, "Finalizing analysis results...")
+
+            self.analysis_end_time = datetime.now().timestamp()
+            self.performance_metrics['total_analysis_time'] = self.analysis_end_time - (self.analysis_start_time or 0)
+            
+            logger.info(f"Performance breakdown - Flash: {self.performance_metrics['flash_detection_time']:.2f}s, "
+                       f"Alias Name: {self.performance_metrics['alias_detection_time']:.2f}s, "
+                       f"Eval Mode: {self.performance_metrics['eval_mode_detection_time']:.2f}s, "
+                       f"Audio: {self.performance_metrics['audio_analysis_time']:.2f}s")
             
         finally:
             if context.get('cap'):
                 context['cap'].release()
             
-            duration = datetime.now().timestamp() - (self.analysis_start_time or 0)
+            if not self.analysis_end_time:
+                self.analysis_end_time = datetime.now().timestamp()
+                self.performance_metrics['total_analysis_time'] = self.analysis_end_time - (self.analysis_start_time or 0)
     
     def _calculate_frame_parameters(self, context: Dict[str, Any], 
                                    frame_interval: float) -> Dict[str, Any]:
@@ -2918,174 +2616,414 @@ class VideoContentAnalyzer:
     def _process_video_frames(self, context: Dict[str, Any], 
                              frame_params: Dict[str, Any], 
                              frame_interval: float) -> None:
-        """Process video frames for detection with optimizations."""
+        """Process video frames for detection."""
         cap = context['cap']
         fps = context['fps']
         
-        visual_rules = [rule for rule in self.get_active_rules() 
-                       if rule.detection_type not in [DetectionType.AUDIO_LANGUAGE, 
-                                                     DetectionType.VOICE_AUDIBILITY]]
-        
+        visual_rules = [rule for rule in self.rules 
+                       if rule.detection_type not in [DetectionType.LANGUAGE_FLUENCY, 
+                                     DetectionType.VOICE_AUDIBILITY]]
+
         if not visual_rules:
-            logger.info("No visual rules to process, skipping frame processing")
+            return
+
+        flash_rules = [rule for rule in visual_rules if "2.5 Flash" in rule.name]
+        alias_name_rules = [rule for rule in visual_rules if "Alias Name" in rule.name]
+        eval_mode_rules = [rule for rule in visual_rules if "Eval Mode" in rule.name]
+
+        if flash_rules or alias_name_rules or eval_mode_rules:
+            self._process_text_detection_rules(cap, fps, flash_rules, eval_mode_rules, frame_params)
+
+        self.total_frames_processed = 0
+    
+    def _process_text_detection_rules(self, cap: cv2.VideoCapture, fps: float,
+                                               flash_rules: List[DetectionRule], 
+                                               eval_mode_rules: List[DetectionRule],
+                                               frame_params: Dict[str, Any]) -> None:
+        """Process text detection rules."""        
+        flash_detected = False
+        flash_detection_timestamp = None
+        
+        alias_name_rules = [rule for rule in self.rules if "Alias Name" in rule.name]
+        
+        if flash_rules:
+            self._update_progress(30, "Analyzing first 5 seconds for '2.5 Flash' and 'Alias Name' detection...")
+            flash_start_time = time.time()
+            flash_detection_timestamp = self._process_flash_and_alias_detection_frame_by_frame(cap, fps, flash_rules, alias_name_rules)
+            flash_detected = flash_detection_timestamp is not None
+            detection_time = time.time() - flash_start_time
+            self.performance_metrics['flash_detection_time'] = detection_time
+            self.performance_metrics['alias_detection_time'] = detection_time
+            
+            if flash_detected:
+                self._update_progress(50, f"'2.5 Flash' detected at {flash_detection_timestamp:.1f}s! Searching for 'Eval Mode'...")
+            else:
+                self._update_progress(45, "'2.5 Flash' not found in first 5 seconds. Continuing with 'Eval Mode' search...")
+        
+        if flash_detected and self._check_if_eval_mode_already_detected():
+            logger.info("Both 2.5 Flash and Eval Mode detected - stopping text analysis immediately")
+            self._update_progress(90, "Both text elements detected! Analysis nearly complete...")
             return
         
-        processed = 0
-        total_frames = (frame_params['end_frame'] - frame_params['start_frame']) // frame_params['frame_step']
-        logger.info(f"Processing {total_frames} frames with {len(visual_rules)} visual rules")
+        if eval_mode_rules:
+            eval_start_time = time.time()
+            if flash_detected:
+                logger.info(f"2.5 Flash found at {flash_detection_timestamp:.2f}s - starting Eval Mode search from this point")
+                self._update_progress(55, f"Searching for 'Eval Mode' starting from {flash_detection_timestamp:.1f}s...")
+                self._process_eval_mode_adaptive_search(cap, fps, eval_mode_rules, flash_detection_timestamp, frame_params)
+            else:
+                logger.info("2.5 Flash not detected in first 5 seconds - starting Eval Mode search from 5 seconds")
+                self._update_progress(50, "Searching for 'Eval Mode' starting from 5 seconds...")
+                self._process_eval_mode_adaptive_search(cap, fps, eval_mode_rules, 5.0, frame_params)
+            
+            self.performance_metrics['eval_mode_detection_time'] = time.time() - eval_start_time
+            self._update_progress(85, "Text detection analysis completed.")
+    
+    def _check_if_eval_mode_already_detected(self) -> bool:
+        """Check if Eval Mode has already been detected."""
+        with self._lock:
+            for result in self.results:
+                if "Eval Mode" in result.rule_name and result.detected:
+                    return True
+        return False
+    
+    def _process_eval_mode_adaptive_search(self, cap: cv2.VideoCapture, fps: float,
+                                         eval_mode_rules: List[DetectionRule],
+                                         start_time: float, frame_params: Dict[str, Any]) -> None:
+        """Process Eval Mode detection with adaptive interval strategy:
+        - 1-second intervals for first 5 seconds of search
+        - 10-second intervals after that
+        """
+        logger.info(f"Starting adaptive Eval Mode search from {start_time:.2f}s")
         
-        for frame_idx in range(frame_params['start_frame'], 
-                              frame_params['end_frame'], 
-                              frame_params['frame_step']):
-            if self._process_single_frame_optimized(cap, frame_idx, fps, visual_rules):
-                processed += 1
-                if processed % 50 == 0:
-                    logger.info(f"Processed {processed}/{total_frames} frames ({processed/total_frames*100:.1f}%)")
+        current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
         
-        self.total_frames_processed = processed
-        logger.info(f"Frame processing completed: {processed} frames")
+        try:
+            phase1_end_time = start_time + 5.0
+            phase1_interval = 1.0
+            
+            self._update_progress(60, f"Phase 1: Searching 'Eval Mode' with 1s intervals ({start_time:.1f}s-{phase1_end_time:.1f}s)")
+            logger.info(f"Phase 1: Searching with {phase1_interval}s intervals from {start_time:.2f}s to {phase1_end_time:.2f}s")
+            eval_detected = self._search_eval_mode_in_time_range(
+                cap, fps, eval_mode_rules, start_time, phase1_end_time, phase1_interval, 60, 70
+            )
+            
+            if eval_detected:
+                logger.info("Eval Mode found in Phase 1 - stopping search")
+                self._update_progress(80, "'Eval Mode' detected! Text analysis complete.")
+                return
+            
+            phase2_start_time = phase1_end_time
+            phase2_end_time = frame_params['end_frame'] / fps
+            phase2_interval = 10.0
+            
+            if phase2_start_time < phase2_end_time:
+                self._update_progress(72, f"Phase 2: Searching 'Eval Mode' with 10s intervals ({phase2_start_time:.1f}s-{phase2_end_time:.1f}s)")
+                logger.info(f"Phase 2: Searching with {phase2_interval}s intervals from {phase2_start_time:.2f}s to {phase2_end_time:.2f}s")
+                eval_detected = self._search_eval_mode_in_time_range(
+                    cap, fps, eval_mode_rules, phase2_start_time, phase2_end_time, phase2_interval, 72, 82
+                )
+                
+                if eval_detected:
+                    self._update_progress(85, "'Eval Mode' detected! Text analysis complete.")
+            
+        finally:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
+    
+    def _search_frames_for_text(self, cap: cv2.VideoCapture, fps: float, 
+                                rules: List[DetectionRule], start_time: float, 
+                                end_time: float, interval: float,
+                                progress_start: float = 60, progress_end: float = 80,
+                                search_type: str = "generic") -> Optional[float]:
+        """Generic frame search method for text detection rules."""
+        start_frame = max(0, int(start_time * fps))
+        end_frame = int(end_time * fps)
+        frame_step = max(1, int(interval * fps))
+        
+        frames_processed = 0
+        total_frames_in_range = (end_frame - start_frame) // frame_step
+        current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        
+        try:
+            for frame_idx in range(start_frame, end_frame, frame_step):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                
+                if not ret or frame is None or frame.size == 0:
+                    continue
+                
+                timestamp = frame_idx / fps
+                frames_processed += 1
+                self.performance_metrics['frames_analyzed'] += 1
+                
+                if total_frames_in_range > 0:
+                    phase_progress = frames_processed / total_frames_in_range
+                    current_progress = progress_start + (progress_end - progress_start) * phase_progress
+                    self._update_progress(current_progress, 
+                                        f"Searching '{search_type}' at {timestamp:.1f}s ({interval}s interval)")
+                
+                for rule in rules:
+                    try:
+                        result = self._apply_visual_rule(rule, frame, timestamp, frame_idx)
+                        
+                        with self._lock:
+                            self.results.append(result)
+                            
+                        if result.detected:
+                            logger.info(f"✓ {search_type} detected at {timestamp:.2f}s (frame {frame_idx}) with {interval}s interval")
+                            return timestamp
+                            
+                    except Exception as e:
+                        logger.error(f"{search_type} rule {rule.name} failed at frame {frame_idx}: {e}")
+                
+                log_frequency = 10 if interval < 5.0 else 3
+                if frames_processed % log_frequency == 0:
+                    logger.info(f"{search_type} search progress: {frames_processed} frames processed ({timestamp:.1f}s, {interval}s interval)")
+            
+            logger.info(f"{search_type} search completed for range {start_time:.1f}s-{end_time:.1f}s: processed {frames_processed} frames with {interval}s interval - NOT DETECTED")
+            return None
+            
+        finally:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
+    
+    def _search_eval_mode_in_time_range(self, cap: cv2.VideoCapture, fps: float,
+                                       eval_mode_rules: List[DetectionRule],
+                                       start_time: float, end_time: float, 
+                                       interval: float, 
+                                       progress_start: float = 60, 
+                                       progress_end: float = 80) -> bool:
+        """Search for Eval Mode in a specific time range with given interval."""
+        detection_timestamp = self._search_frames_for_text(
+            cap, fps, eval_mode_rules, start_time, end_time, interval,
+            progress_start, progress_end, "Eval Mode"
+        )
+        return detection_timestamp is not None
+    
+    def _process_flash_and_alias_detection_frame_by_frame(self, cap: cv2.VideoCapture, fps: float, 
+                                                         flash_rules: List[DetectionRule], 
+                                                         alias_name_rules: List[DetectionRule]) -> Optional[float]:
+        """Analyze the first 5 seconds frame by frame for both "2.5 Flash" and "Alias Name" text.
+        Returns the timestamp of flash detection if found, None otherwise."""
+        if not flash_rules and not alias_name_rules:
+            return None
+        
+        logger.info("Processing 2.5 Flash and Alias Name detection using frame-by-frame analysis in first 5 seconds...")
+        
+        combined_rules = flash_rules + alias_name_rules
+        
+        flash_detection_timestamp = self._search_frames_for_combined_text(
+            cap, fps, flash_rules, alias_name_rules, 0.0, 5.0, 1.0, 30, 45
+        )
+        
+        if flash_detection_timestamp is None:
+            logger.info(f"2.5 Flash analysis completed: analyzed 5 frames (at 0s, 1s, 2s, 3s, 4s) - NOT DETECTED")
+            
+            with self._lock:
+                for flash_rule in flash_rules:
+                    summary_result = DetectionResult(
+                        rule_name=flash_rule.name,
+                        timestamp=5.0,
+                        frame_number=int(4.0 * fps),
+                        detected=False,
+                        details={
+                            'frame_by_frame_analysis': True,
+                            'analysis_window': '0-5 seconds (5 frames at 0s, 1s, 2s, 3s, 4s)',
+                            'frames_analyzed': 5,
+                            'search_method': 'selective_frame_sampling'
+                        }
+                    )
+                    self.results.append(summary_result)
+                
+                for alias_rule in alias_name_rules:
+                    summary_result = DetectionResult(
+                        rule_name=alias_rule.name,
+                        timestamp=5.0,
+                        frame_number=int(4.0 * fps),
+                        detected=False,
+                        details={
+                            'frame_by_frame_analysis': True,
+                            'analysis_window': '0-5 seconds (5 frames at 0s, 1s, 2s, 3s, 4s)',
+                            'frames_analyzed': 5,
+                            'search_method': 'selective_frame_sampling'
+                        }
+                    )
+                    self.results.append(summary_result)
+        
+        return flash_detection_timestamp
+
+    def _search_frames_for_combined_text(self, cap: cv2.VideoCapture, fps: float, 
+                                        flash_rules: List[DetectionRule], 
+                                        alias_name_rules: List[DetectionRule],
+                                        start_time: float, end_time: float, interval: float,
+                                        progress_start: float = 30, progress_end: float = 45) -> Optional[float]:
+        """Search for both flash and alias name text in the same frames."""
+        start_frame = max(0, int(start_time * fps))
+        end_frame = int(end_time * fps)
+        frame_step = max(1, int(interval * fps))
+        
+        frames_processed = 0
+        total_frames_in_range = (end_frame - start_frame) // frame_step
+        current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        flash_detection_timestamp = None
+        alias_detection_logged = False
+        alias_screenshot_saved = False
+        flash_screenshot_saved = False
+        
+        try:
+            for frame_idx in range(start_frame, end_frame, frame_step):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                
+                if not ret or frame is None or frame.size == 0:
+                    continue
+                
+                timestamp = frame_idx / fps
+                frames_processed += 1
+                self.performance_metrics['frames_analyzed'] += 1
+                
+                if total_frames_in_range > 0:
+                    phase_progress = frames_processed / total_frames_in_range
+                    current_progress = progress_start + (progress_end - progress_start) * phase_progress
+                    self._update_progress(current_progress, 
+                                        f"Searching '2.5 Flash' and 'Alias Name' at {timestamp:.1f}s")
+                
+                flash_detected_this_frame = False
+                for rule in flash_rules:
+                    try:
+                        if flash_screenshot_saved:
+                            rule_params = rule.parameters.copy()
+                            rule_params['save_screenshot'] = False
+                            modified_rule = DetectionRule(
+                                name=rule.name,
+                                detection_type=rule.detection_type,
+                                parameters=rule_params
+                            )
+                            result = self._apply_visual_rule(modified_rule, frame, timestamp, frame_idx)
+                        else:
+                            result = self._apply_visual_rule(rule, frame, timestamp, frame_idx)
+                        
+                        with self._lock:
+                            self.results.append(result)
+                            
+                        if result.detected and flash_detection_timestamp is None:
+                            flash_detection_timestamp = timestamp
+                            flash_detected_this_frame = True
+                            flash_screenshot_saved = True
+                            logger.info(f"✓ 2.5 Flash detected at {timestamp:.2f}s (frame {frame_idx})")
+                            
+                    except Exception as e:
+                        logger.error(f"Flash rule {rule.name} failed at frame {frame_idx}: {e}")
+                
+                for rule in alias_name_rules:
+                    try:
+                        if alias_screenshot_saved:
+                            rule_params = rule.parameters.copy()
+                            rule_params['save_screenshot'] = False
+                            modified_rule = DetectionRule(
+                                name=rule.name,
+                                detection_type=rule.detection_type,
+                                parameters=rule_params
+                            )
+                            result = self._apply_visual_rule(modified_rule, frame, timestamp, frame_idx)
+                        else:
+                            result = self._apply_visual_rule(rule, frame, timestamp, frame_idx)
+                        
+                        with self._lock:
+                            self.results.append(result)
+                            
+                        if result.detected:
+                            if not alias_detection_logged:
+                                alias_detection_logged = True
+                                logger.info(f"✓ Alias Name detected at {timestamp:.2f}s (frame {frame_idx})")
+                            if not alias_screenshot_saved:
+                                alias_screenshot_saved = True
+                            
+                    except Exception as e:
+                        logger.error(f"Alias Name rule {rule.name} failed at frame {frame_idx}: {e}")
+                
+                flash_found = flash_detection_timestamp is not None
+                alias_found = alias_detection_logged
+                
+                if flash_rules and alias_name_rules:
+                    if flash_found and alias_found:
+                        logger.info(f"✓ Both 2.5 Flash and Alias Name detected - stopping search early at {timestamp:.2f}s")
+                        break
+                elif flash_rules and not alias_name_rules:
+                    if flash_found:
+                        logger.info(f"✓ 2.5 Flash detected - stopping search early at {timestamp:.2f}s")
+                        break
+                elif alias_name_rules and not flash_rules:
+                    if alias_found:
+                        logger.info(f"✓ Alias Name detected - stopping search early at {timestamp:.2f}s")
+                        break
+                
+                log_frequency = 10 if interval < 5.0 else 3
+                if frames_processed % log_frequency == 0:
+                    logger.info(f"Combined text search progress: {frames_processed} frames processed ({timestamp:.1f}s)")
+            
+            logger.info(f"Combined text search completed for range {start_time:.1f}s-{end_time:.1f}s: processed {frames_processed} frames")
+            return flash_detection_timestamp
+            
+        finally:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
     
     def _setup_audio_analysis(self, video_path: str) -> Optional[str]:
         """Setup audio extraction for audio rules."""
-        audio_rules = [rule for rule in self.get_active_rules() 
-                      if rule.detection_type in [DetectionType.AUDIO_LANGUAGE, 
-                                               DetectionType.VOICE_AUDIBILITY]]
+        audio_rules = [rule for rule in self.rules 
+                  if rule.detection_type in [DetectionType.LANGUAGE_FLUENCY, 
+                               DetectionType.VOICE_AUDIBILITY]]
         
         if not audio_rules or not self.audio_analyzer:
             return None
         
         try:
-            audio_filename = FileManager.create_temp_filename("temp_audio", session_id=self.session_id)
-            audio_path = os.path.join(self.temp_dir, audio_filename)
-            
-            if not PathValidator.validate_file_path(audio_path):
-                logger.error(f"Invalid audio path: {audio_path}")
-                return None
-            
-            logger.info(f"Extracting audio: {os.path.basename(video_path)} -> {os.path.basename(audio_path)} (session: {self.session_id})")
+            self._update_progress(6, "Extracting audio from video...")
+            audio_extraction_start = time.time()
+            audio_path = self.session_manager.create_temp_file(self.session_id, "temp_audio", ".wav")
             
             if self.audio_analyzer.extract_audio(video_path, audio_path):
+                self.performance_metrics['audio_extraction_time'] = time.time() - audio_extraction_start
+                
                 if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
                     self.temp_files.append(audio_path)
                     
+                    self._update_progress(8, "Loading Whisper model for language analysis...")
                     try:
+                        whisper_load_start = time.time()
                         self.audio_analyzer.load_whisper_model()
+                        self.performance_metrics['whisper_model_load_time'] = time.time() - whisper_load_start
+                        self._update_progress(9, "Whisper model loaded successfully")
                     except Exception as e:
                         logger.warning(f"Whisper model load failed: {e}")
+                        self.performance_metrics['whisper_model_load_time'] = 0.0
                     
                     return audio_path
                 else:
-                    logger.warning("Audio extraction produced invalid file")
                     return None
             else:
-                logger.warning("Audio extraction failed")
+                self.performance_metrics['audio_extraction_time'] = time.time() - audio_extraction_start
                 return None
                 
         except Exception as e:
-            logger.error(f"Audio setup failed (session: {self.session_id}): {e}")
+            self.performance_metrics['audio_extraction_time'] = time.time() - audio_extraction_start if 'audio_extraction_start' in locals() else 0.0
             return None
     
-    def cleanup(self) -> None:
-        """Clean up resources and temporary files."""
-        try:
-            # Clear audio cache to free memory
-            if hasattr(self, 'audio_analyzer') and self.audio_analyzer:
-                self.audio_analyzer._clear_audio_cache()
-            
-            super().cleanup() if hasattr(super(), 'cleanup') else None
-        except Exception as e:
-            logger.warning(f"Cleanup warning: {e}")
-    
-    def _process_single_frame(self, cap: cv2.VideoCapture, frame_idx: int, fps: float) -> bool:
-        """Process single frame with memory monitoring."""
-        try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                return False
-            
-            if frame is None or frame.size == 0:
-                logger.warning(f"Invalid frame at index {frame_idx}")
-                return False
-                
-            timestamp = frame_idx / fps
-            
-            visual_rules = [rule for rule in self.get_active_rules() 
-                           if rule.detection_type not in [DetectionType.AUDIO_LANGUAGE, 
-                                                         DetectionType.VOICE_AUDIBILITY]]
-            
-            for rule in visual_rules:
-                try:
-                    result = self._apply_visual_rule(rule, frame, timestamp, frame_idx)
-                    if result.detected:
-                        logger.info(f"✓ Detection: {rule.name} at {timestamp:.2f}s")
-                    
-                    with self._lock:
-                        self.results.append(result)
-                        
-                except Exception as e:
-                    logger.error(f"Rule {rule.name} failed at frame {frame_idx} (session: {self.session_id}): {e}")
-                    
-            return True
-            
-        except Exception as e:
-            logger.error(f"Frame processing failed at {frame_idx} (session: {self.session_id}): {e}")
-            return False
-
-    def _process_single_frame_optimized(self, cap: cv2.VideoCapture, frame_idx: int, 
-                                      fps: float, visual_rules: List[DetectionRule]) -> bool:
-        """Optimized frame processing with pre-filtered rules."""
-        try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                return False
-            
-            if frame is None or frame.size == 0:
-                logger.warning(f"Invalid frame at index {frame_idx}")
-                return False
-                
-            timestamp = frame_idx / fps
-            
-            for rule in visual_rules:
-                try:
-                    result = self._apply_visual_rule(rule, frame, timestamp, frame_idx)
-                    if result.detected:
-                        logger.info(f"✓ Detection: {rule.name} at {timestamp:.2f}s")
-                    
-                    with self._lock:
-                        self.results.append(result)
-                        
-                except Exception as e:
-                    logger.error(f"Rule {rule.name} failed at frame {frame_idx} (session: {self.session_id}): {e}")
-                    
-            return True
-            
-        except Exception as e:
-            logger.error(f"Frame processing failed at {frame_idx} (session: {self.session_id}): {e}")
-            return False
-    
     def _save_frame(self, frame: np.ndarray, rule_name: str, timestamp: float) -> Optional[str]:
-        """Save frame as screenshot with session isolation."""
+        """Save frame as screenshot in session directory."""
         try:
-            # Check if session is still active
-            with ResourceManager._global_lock:
-                if self.session_id not in ResourceManager._active_sessions_global and \
-                   self.session_id not in ResourceManager._export_pending_sessions:
-                    return None
-            
-            safe_rule_name = FileManager.sanitize_filename(rule_name)
+            safe_rule_name = re.sub(r'[^\w-]', '_', rule_name)[:50]
             filename = f"{safe_rule_name}_{timestamp:.2f}s.png"
-            filepath = os.path.join(self.output_dir, filename)
             
-            if FileManager.save_frame(frame, filepath, self.session_id):
+            filepath = self.session_manager.save_frame(self.session_id, frame, filename)
+            
+            if filepath:
                 with self._lock:
                     self.screenshot_files.append(filepath)
                 return filepath
             return None
                 
         except Exception as e:
-            logger.error(f"Frame save failed for rule {rule_name} (session: {self.session_id}): {e}")
+            logger.error(f"Frame save error: {e}")
             return None
     
     def _apply_visual_rule(self, rule: DetectionRule, frame: np.ndarray,
@@ -3094,17 +3032,17 @@ class VideoContentAnalyzer:
         start_time = datetime.now().timestamp()
         
         try:
-            result = self._execute_rule_detection(rule, frame, timestamp, frame_number)
+            result = self._execute_detection_rule(rule, frame, timestamp, frame_number)
             result.processing_time = datetime.now().timestamp() - start_time
             return result
         except Exception as e:
-            logger.error(f"Visual rule '{rule.name}' failed: {e}")
+            logger.error(f"Rule execution failed for {rule.name}: {e}")
             return DetectionResult(
                 rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
-                detected=False, confidence=0.0, details={'error': str(e)}
+                detected=False, details={'error': str(e)}
             )
     
-    def _execute_rule_detection(self, rule: DetectionRule, frame: np.ndarray,
+    def _execute_detection_rule(self, rule: DetectionRule, frame: np.ndarray,
                                timestamp: float, frame_number: int) -> DetectionResult:
         """Execute specific detection type."""        
         detection_methods = {
@@ -3114,466 +3052,394 @@ class VideoContentAnalyzer:
         if rule.detection_type in detection_methods:
             return detection_methods[rule.detection_type](rule, frame, timestamp, frame_number)
         else:
-            logger.error(f"Detection type {rule.detection_type} not implemented")
             raise NotImplementedError(f"Detection type {rule.detection_type} not implemented")
     
     def _process_audio_analysis(self, audio_path: str, start_time: float, 
                               end_time: float, frame_interval: float) -> None:
-        """Process audio for language detection and voice audibility analysis."""
+        """Audio analysis for language detection and voice audibility."""
         if not self.audio_analyzer:
             return
         
         try:
-            audio_rules = [rule for rule in self.get_active_rules() 
-                          if rule.detection_type in [DetectionType.AUDIO_LANGUAGE, 
+            audio_rules = [rule for rule in self.rules 
+                          if rule.detection_type in [DetectionType.LANGUAGE_FLUENCY, 
                                                    DetectionType.VOICE_AUDIBILITY]]
             
             if not audio_rules:
                 return
             
-            try:
-                self.audio_analyzer._get_cached_audio(audio_path)
-                logger.info("Audio data cached for reuse")
-            except Exception as e:
-                logger.warning(f"Audio caching failed: {e}")
-            
             voice_audibility_rules = [r for r in audio_rules if r.detection_type == DetectionType.VOICE_AUDIBILITY]
+            language_rules = [r for r in audio_rules if r.detection_type == DetectionType.LANGUAGE_FLUENCY]
+            
+            total_audio_tasks = len(voice_audibility_rules) + len(language_rules)
+            completed_tasks = 0
             
             if voice_audibility_rules:
-                voice_audibility_result = self.audio_analyzer.detect_voice_audibility(audio_path, frame_interval)
-                
-                for rule in voice_audibility_rules:
-                    result = self._create_voice_audibility_result(rule, voice_audibility_result, start_time, 0)
-                    if result:
-                        self.results.append(result)
+                self._update_progress(12, "Analyzing voice audibility...")
+                completed_tasks = self._process_voice_audibility_rules(
+                    voice_audibility_rules, audio_path, start_time, completed_tasks, total_audio_tasks
+                )
             
-            language_rules = [r for r in audio_rules if r.detection_type == DetectionType.AUDIO_LANGUAGE]
             if language_rules:
-                voice_segments = self.audio_analyzer.detect_voice_activity(audio_path, frame_interval)
-                logger.info(f"Voice segments found: {len(voice_segments)}")
-                self._process_voice_segments(voice_segments, audio_path, start_time)
+                self._update_progress(18, "Analyzing language fluency...")
+                self._process_language_fluency_rules(
+                    language_rules, audio_path, start_time, completed_tasks, total_audio_tasks
+                )
                         
         except Exception as e:
             logger.error(f"Audio analysis failed: {e}")
-        finally:
-            # Clean up audio cache after processing to free memory
-            try:
-                self.audio_analyzer._clear_audio_cache()
-            except:
-                pass
     
-    def _create_voice_audibility_result(self, rule: DetectionRule, 
-                                      audibility_result: Dict[str, Any],
-                                      start_time: float, frame_number: int) -> Optional[DetectionResult]:
-        """Create detection result for voice audibility analysis."""
+    def _process_voice_audibility_rules(self, rules: List[DetectionRule], audio_path: str, 
+                                       start_time: float, completed_tasks: int, 
+                                       total_audio_tasks: int) -> int:
+        """Process voice audibility rules."""
+        for rule in rules:
+            try:
+                result = self.audio_analyzer.analyze_voice_audibility(audio_path)
+                
+                if result:
+                    detection_result = DetectionResult(
+                        rule_name=rule.name,
+                        detected=result['passed_qa'],
+                        timestamp=start_time,
+                        frame_number=int(start_time * 30),
+                        details={
+                            'num_audible_voices': result['num_audible_voices'],
+                            'voice_detected': result['num_audible_voices'] > 0,
+                            'both_voices_audible': result['num_audible_voices'] == 2,
+                            'details': result['details'],
+                            'voice_ratio': result.get('voice_ratio', 0.0),
+                            'total_voice_duration': result.get('total_voice_duration', 0.0),
+                            'has_multiple_speakers': result.get('has_multiple_speakers', False),
+                            'audio_features': result.get('speaker_info', {}).get('audio_features', {}) if result.get('speaker_info') else {}
+                        }
+                    )
+                    self.results.append(detection_result)
+                
+                completed_tasks += 1
+                progress = 12 + (completed_tasks / total_audio_tasks) * 8
+                self._update_progress(int(progress), f"Voice audibility analysis complete ({completed_tasks}/{total_audio_tasks})")
+                
+            except Exception as e:
+                logger.error(f"Voice audibility analysis failed for rule {rule.name}: {e}")
+                completed_tasks += 1
+        
+        return completed_tasks
+    
+    def _process_language_fluency_rules(self, rules: List[DetectionRule], audio_path: str, 
+                                       start_time: float, completed_tasks: int, 
+                                       total_audio_tasks: int) -> None:
+        """Process language fluency rules."""
         try:
-            if 'error' in audibility_result:
-                return DetectionResult(
-                    rule_name=rule.name,
-                    timestamp=start_time,
-                    frame_number=frame_number,
-                    detected=False,
-                    confidence=0.0,
-                    details={'error': audibility_result['error']}
+            try:
+                y, sr = librosa.load(audio_path, sr=None)
+                audio_duration = len(y) / sr
+            except:
+                audio_duration = 0
+            
+            for i, rule in enumerate(rules):
+                target_language = rule.parameters.get('target_language')
+                
+                self._update_progress(18 + i, f"Transcribing audio for {Config.get_language_display_name(target_language)}...")
+                
+                fluency_result = self.audio_analyzer.analyze_full_audio_fluency(audio_path, target_language)
+                
+                detection_result = self._create_language_detection_result(
+                    rule, fluency_result, target_language, start_time, audio_duration
                 )
-            
-            both_audible = audibility_result.get('both_voices_audible', False)
-            confidence = audibility_result.get('confidence', 0.0)
-            
-            params = rule.parameters
-            min_confidence = params.get('min_confidence', 0.3)
-            min_duration = params.get('min_duration', 3.0)
-            
-            actual_duration = audibility_result.get('total_voice_duration', 0.0)
-            detected = (both_audible and 
-                       confidence >= min_confidence and 
-                       actual_duration >= min_duration)
-            
-            details = {
-                'both_voices_audible': both_audible,
-                'confidence': confidence,
-                'voice_segments_count': audibility_result.get('voice_segments_count', 0),
-                'total_voice_duration': actual_duration,
-                'voice_diversity_score': audibility_result.get('voice_diversity_score', 0.0),
-                'analysis_details': audibility_result.get('analysis_details', 'No details available'),
-                'detection_criteria': {
-                    'min_confidence_required': min_confidence,
-                    'min_duration_required': min_duration,
-                    'confidence_criteria_met': confidence >= min_confidence,
-                    'duration_criteria_met': actual_duration >= min_duration,
-                    'audibility_criteria_met': both_audible
-                }
-            }
-            
+                
+                self.results.append(detection_result)
+                
+                completed_tasks += 1
+                progress = 18 + ((completed_tasks - len([r for r in rules if r != rule])) / total_audio_tasks) * 7
+                self._update_progress(int(progress), f"Language analysis complete for {Config.get_language_display_name(target_language)}")
+                
+        except Exception as e:
+            logger.error(f"Language fluency analysis failed: {e}")
+    
+    def _create_language_detection_result(self, rule: DetectionRule, fluency_result: Optional[Dict[str, Any]], 
+                                         target_language: str, start_time: float, 
+                                         audio_duration: float) -> DetectionResult:
+        """Create detection result for language analysis."""
+        if fluency_result is None:
             return DetectionResult(
                 rule_name=rule.name,
                 timestamp=start_time,
-                frame_number=frame_number,
-                detected=detected,
-                confidence=confidence,
-                details=details
+                frame_number=0,
+                detected=False,
+                details={
+                    'target_language': target_language,
+                    'detected_language': 'unknown',
+                    'is_fluent': False,
+                    'fluency_score': 0.0,
+                    'transcription': '',
+                    'audio_duration': audio_duration,
+                    'total_words': 0,
+                    'avg_word_length': 0,
+                    'full_audio_analysis': True,
+                    'analysis_type': 'Full Audio Transcription',
+                    'analysis_failed_reason': 'No audible voices detected for transcription.',
+                    'fluency_indicators': {
+                        'word_count': 0,
+                        'avg_word_length': 0,
+                        'language_match': False,
+                        'has_transcription': False,
+                        'audio_duration': audio_duration,
+                    }
+                }
             )
-            
-        except Exception as e:
-            logger.error(f"Voice audibility result creation failed: {e}")
-            return None
-    
-    def _process_voice_segments(self, voice_segments: List[Tuple[float, float, bool]],
-                               audio_path: str, start_time: float) -> None:
-        """Process individual voice segments with batch optimization."""
-        audio_rules = self.get_rules_by_type(DetectionType.AUDIO_LANGUAGE)
-        
-        if not audio_rules:
-            return
-            
-        voice_only_segments = [(ts, end_ts) for ts, end_ts, has_voice in voice_segments if has_voice]
-        
-        if len(voice_only_segments) > 5:
-            # For many segments, use batch processing
-            self._process_voice_segments_batch(voice_only_segments, audio_path, start_time, audio_rules)
         else:
-            # For few segments, process individually
-            for timestamp, end_timestamp, has_voice in voice_segments:
-                if not has_voice:
-                    continue
-                
-                adjusted_timestamp = timestamp + start_time
-                
-                for rule in audio_rules:
-                    try:
-                        result = self._apply_audio_rule(rule, audio_path, timestamp, 
-                                                       end_timestamp, adjusted_timestamp)
-                        if result is not None:
-                            self.results.append(result)
-                    except Exception as e:
-                        logger.error(f"Audio rule {rule.name} failed: {e}")
-
-    def _process_voice_segments_batch(self, voice_segments: List[Tuple[float, float]], 
-                                    audio_path: str, start_time: float, 
-                                    audio_rules: List[DetectionRule]) -> None:
-        """Process voice segments in batches for better performance."""
-        try:
-            # Sample key segments instead of processing all
-            total_segments = len(voice_segments)
-            max_segments = 10  # Process at most 10 segments
-            
-            if total_segments <= max_segments:
-                segments_to_process = voice_segments
-            else:
-                # Sample evenly across the timeline
-                step = total_segments // max_segments
-                segments_to_process = [voice_segments[i] for i in range(0, total_segments, step)][:max_segments]
-            
-            logger.info(f"Processing {len(segments_to_process)} of {total_segments} voice segments (batch mode)")
-            
-            for timestamp, end_timestamp in segments_to_process:
-                adjusted_timestamp = timestamp + start_time
-                
-                for rule in audio_rules:
-                    try:
-                        result = self._apply_audio_rule(rule, audio_path, timestamp, 
-                                                       end_timestamp, adjusted_timestamp)
-                        if result is not None:
-                            self.results.append(result)
-                    except Exception as e:
-                        logger.error(f"Audio rule {rule.name} failed: {e}")
-                        
-        except Exception as e:
-            logger.error(f"Batch voice segment processing failed: {e}")
-    
-    def _apply_audio_rule(self, rule: DetectionRule, audio_path: str, 
-                         segment_start: float, segment_end: float, 
-                         timestamp: float) -> Optional[DetectionResult]:
-        """Apply audio detection rule."""
-        frame_number = int(timestamp)
-        start_time = datetime.now().timestamp()
-        
-        try:
-            result = None
-            if rule.detection_type == DetectionType.AUDIO_LANGUAGE:
-                result = self._detect_language(rule, audio_path, segment_start, 
-                                           segment_end, timestamp, frame_number)
-            else:
-                raise NotImplementedError(f"Audio type {rule.detection_type} not supported")
-            
-            if result is not None:
-                result.processing_time = datetime.now().timestamp() - start_time
-            
-            return result
-                
-        except Exception as e:
-            logger.error(f"Audio rule '{rule.name}' failed: {e}")
             return DetectionResult(
-                rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
-                detected=False, confidence=0.0, details={'error': str(e)},
-                processing_time=datetime.now().timestamp() - start_time
+                rule_name=rule.name,
+                timestamp=start_time,
+                frame_number=0,
+                detected=fluency_result.get('is_fluent', False),
+                details={
+                    'target_language': target_language,
+                    'detected_language': fluency_result.get('detected_language', 'unknown'),
+                    'is_fluent': fluency_result.get('is_fluent', False),
+                    'fluency_score': fluency_result.get('fluency_score', 0.0),
+                    'transcription': fluency_result.get('transcription', ''),
+                    'audio_duration': audio_duration,
+                    'total_words': fluency_result.get('total_words', 0),
+                    'avg_word_length': fluency_result.get('avg_word_length', 0),
+                    'full_audio_analysis': True,
+                    'analysis_type': 'Full Audio Transcription',
+                    'fluency_indicators': {
+                        'word_count': fluency_result.get('total_words', 0),
+                        'avg_word_length': fluency_result.get('avg_word_length', 0),
+                        'language_match': fluency_result.get('detected_language') == Config.locale_to_whisper_language(target_language),
+                        'has_transcription': len(fluency_result.get('transcription', '')) > 0,
+                        'audio_duration': audio_duration,
+                    }
+                }
             )
-    
-    def _detect_language(self, rule: DetectionRule, audio_path: str, 
-                        segment_start: float, segment_end: float, 
-                        timestamp: float, frame_number: int) -> Optional[DetectionResult]:
-        """Detect language fluency."""
-        params = rule.parameters
-        target_language = params.get('target_language', 'en-US')
-        
-        try:
-            segment_path = self._create_audio_segment(audio_path, segment_start, 
-                                                    segment_end, timestamp)
-            
-            fluency_result = self.audio_analyzer.analyze_language_fluency(segment_path, target_language)
-            if fluency_result is None:
-                return None
-            
-            return self._create_language_detection_result(rule, timestamp, frame_number,
-                                                        fluency_result, target_language,
-                                                        segment_end - segment_start)
-                
-        except Exception as e:
-            logger.error(f"Language detection failed: {e}")
-            return DetectionResult(
-                rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
-                detected=False, confidence=0.0, details={'error': str(e)}
-            )
-    
-    def _create_audio_segment(self, audio_path: str, segment_start: float,
-                             segment_end: float, timestamp: float) -> str:
-        """Create audio segment file with optimized caching."""
-        from pydub import AudioSegment
-        import tempfile
-        
-        segment_filename = FileManager.sanitize_filename(f"audio_segment_{timestamp:.2f}_{os.getpid()}.wav")
-        segment_path = os.path.join(self.temp_dir, segment_filename)
-        
-        try:
-            y, sr = self.audio_analyzer._get_cached_audio(audio_path)
-            
-            # Convert to segment directly from numpy array (faster than loading from file)
-            start_sample = int(segment_start * sr)
-            end_sample = int(segment_end * sr)
-            segment_data = y[start_sample:end_sample]
-            
-            # Convert to AudioSegment more efficiently
-            import io
-            import wave
-            
-            # Create in-memory WAV data
-            buffer = io.BytesIO()
-            with wave.open(buffer, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # Mono
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(sr)
-                wav_file.writeframes((segment_data * 32767).astype(np.int16).tobytes())
-            
-            buffer.seek(0)
-            segment = AudioSegment.from_wav(buffer)
-            segment.export(segment_path, format="wav")
-            
-        except Exception as e:
-            # Fallback to original method if optimization fails
-            logger.warning(f"Fast segment creation failed, using fallback: {e}")
-            audio = AudioSegment.from_wav(audio_path)
-            segment = audio[int(segment_start * 1000):int(segment_end * 1000)]
-            segment.export(segment_path, format="wav")
-        
-        self.temp_files.append(segment_path)
-        return segment_path
-    
-    def _create_language_detection_result(self, rule: DetectionRule, timestamp: float,
-                                        frame_number: int, fluency_result: Dict[str, Any],
-                                        target_language: str, 
-                                        segment_duration: float) -> DetectionResult:
-        """Create language detection result."""
-        detected = fluency_result.get('is_fluent', False)
-        confidence = fluency_result.get('fluency_score', 0.0)
-        
-        details = {
-            'target_language': target_language,
-            'detected_language': fluency_result.get('detected_language', 'unknown'),
-            'is_fluent': detected,
-            'fluency_score': confidence,
-            'transcription': fluency_result.get('transcription', ''),
-            'segment_duration': segment_duration,
-            'fluency_indicators': fluency_result.get('fluency_indicators', {})
-        }
-        
-        return DetectionResult(
-            rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
-            detected=detected, confidence=confidence, details=details
-        )
     
     def _find_text_bounding_box(self, expected_text: str, boxes: dict) -> Optional[List[int]]:
         """Find bounding box for expected text using fuzzy matching."""
         expected_words = expected_text.lower().split()
-        found_boxes = self._find_word_boxes(expected_words, boxes)
-        
-        if found_boxes:
-            return self._calculate_combined_bounding_box(found_boxes)
-        
-        return None
-    
-    def _find_word_boxes(self, expected_words: List[str], boxes: dict) -> List[Tuple[int, int, int, int]]:
-        """Find bounding boxes for expected words."""
         found_boxes = []
         
         for word in expected_words:
-            best_match_box = self._find_best_word_match(word, boxes, found_boxes)
+            best_match_box = None
+            best_similarity = 0
+            
+            for i, box_word in enumerate(boxes['text']):
+                box_word_clean = box_word.strip().lower()
+                if not box_word_clean:
+                    continue
+                
+                box = (boxes['left'][i], boxes['top'][i], boxes['width'][i], boxes['height'][i])
+                
+                if box_word_clean == word:
+                    best_match_box = box
+                    break
+                
+                similarity = TextMatcher.calculate_similarity(word, box_word_clean)
+                if similarity > best_similarity and similarity >= 0.65 and box not in found_boxes:
+                    best_similarity = similarity
+                    best_match_box = box
+            
             if best_match_box:
                 found_boxes.append(best_match_box)
         
-        return found_boxes
-    
-    def _find_best_word_match(self, word: str, boxes: dict, 
-                             existing_boxes: List[Tuple[int, int, int, int]]) -> Optional[Tuple[int, int, int, int]]:
-        """Find best matching box for a word."""
-        best_match_box = None
-        best_similarity = 0
+        if len(found_boxes) < len(expected_words):
+            whole_phrase_boxes = []
+            for i, box_word in enumerate(boxes['text']):
+                box_word_clean = box_word.strip().lower()
+                if not box_word_clean:
+                    continue
+                
+                box = (boxes['left'][i], boxes['top'][i], boxes['width'][i], boxes['height'][i])
+                
+                if expected_text.lower() == "roaring tiger":
+                    if TextMatcher._match_roaring_tiger_variants(box_word_clean):
+                        whole_phrase_boxes.append(box)
+                else:
+                    if all(word in box_word_clean for word in expected_words):
+                        whole_phrase_boxes.append(box)
+            
+            if whole_phrase_boxes:
+                found_boxes = whole_phrase_boxes
         
-        for i, box_word in enumerate(boxes['text']):
-            box_word_clean = box_word.strip().lower()
-            if not box_word_clean:
-                continue
-            
-            box = (boxes['left'][i], boxes['top'][i], boxes['width'][i], boxes['height'][i])
-            
-            if box_word_clean == word:
-                return box
-            
-            similarity = TextMatcher.calculate_similarity(word, box_word_clean)
-            if similarity > best_similarity and similarity >= 0.65 and box not in existing_boxes:
-                best_similarity = similarity
-                best_match_box = box
+        if found_boxes:
+            x1 = min(box[0] for box in found_boxes)
+            y1 = min(box[1] for box in found_boxes)
+            x2 = max(box[0] + box[2] for box in found_boxes)
+            y2 = max(box[1] + box[3] for box in found_boxes)
+            return [x1, y1, x2-x1, y2-y1]
         
-        return best_match_box
-    
-    def _calculate_combined_bounding_box(self, boxes: List[Tuple[int, int, int, int]]) -> List[int]:
-        """Calculate combined bounding box from multiple boxes."""
-        x1 = min(box[0] for box in boxes)
-        y1 = min(box[1] for box in boxes)
-        x2 = max(box[0] + box[2] for box in boxes)
-        y2 = max(box[1] + box[3] for box in boxes)
-        return [x1, y1, x2-x1, y2-y1]
+        return None
     
     def _detect_text(self, rule: DetectionRule, frame: np.ndarray, 
                     timestamp: float, frame_number: int) -> DetectionResult:
-        """OCR-based text detection."""
+        """OCR-based text detection pipeline."""
         params = rule.parameters
         
         try:
-            roi_info = self._prepare_text_roi(frame, params)
-            if roi_info['error']:
-                logger.warning(f"ROI preparation failed: {roi_info['error']}")
+            roi, roi_offset = self._extract_roi_from_frame(frame, params)
+            if roi is None:
                 return DetectionResult(
                     rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
-                    detected=False, confidence=0.0, details=roi_info['error']
+                    detected=False, details={'error': 'Invalid region bounds', 'roi_size': (0, 0)}
                 )
             
-            processed_image = self._preprocess_for_ocr(roi_info['roi'], params)
+            ocr_start_time = time.time()
+            text, boxes = self._process_ocr_pipeline(roi, params)
+            ocr_time = time.time() - ocr_start_time
+            self.performance_metrics['ocr_processing_time'] += ocr_time
             
-            ocr_results = self._perform_ocr(processed_image)
-            
-            detection_result = self._analyze_text_detection(ocr_results, params, roi_info['offset'])
+            detected, text_bounding_box, detection_method = self._analyze_ocr_results(
+                text, boxes, params, roi_offset
+            )
             
             screenshot_path = None
-            if params.get('save_screenshot', True) and detection_result['detected']:
-                screenshot_path = self._create_text_screenshot(
-                    frame, detection_result['text_bounding_box'], 
-                    detection_result['expected_text'], rule.name, timestamp
-                )
+            if params.get('save_screenshot', True) and (detected or 'pro_incorrect' in detection_method):
+                if params.get('expected_text') == TargetTexts.FLASH_TEXT:
+                    if 'pro_incorrect' in detection_method:
+                        screenshot_path = self._create_flash_pro_screenshot(
+                            frame, text_bounding_box, TargetTexts.PRO_TEXT, rule.name, timestamp, is_correct=False
+                        )
+                    elif 'flash_correct' in detection_method:
+                        screenshot_path = self._create_flash_pro_screenshot(
+                            frame, text_bounding_box, TargetTexts.FLASH_TEXT, rule.name, timestamp, is_correct=True
+                        )
+                    else:
+                        screenshot_path = self._create_text_screenshot(
+                            frame, text_bounding_box, params.get('expected_text', ''), rule.name, timestamp
+                        )
+                else:
+                    screenshot_path = self._create_text_screenshot(
+                        frame, text_bounding_box, params.get('expected_text', ''), rule.name, timestamp
+                    )
+            
+            actual_detected_text = text
+            if params.get('expected_text') == TargetTexts.FLASH_TEXT:
+                if 'pro_incorrect' in detection_method:
+                    actual_detected_text = f"{text} (2.5 Pro detected - incorrect model)"
+                elif 'flash_correct' in detection_method:
+                    actual_detected_text = f"{text} (2.5 Flash detected - correct model)"
             
             return DetectionResult(
                 rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
-                detected=detection_result['detected'], confidence=detection_result['confidence'],
-                details=detection_result['details'], screenshot_path=screenshot_path
+                detected=detected, 
+                details={
+                    'detected_text': actual_detected_text,
+                    'expected_text': params.get('expected_text', ''),
+                    'full_match': text.lower() == params.get('expected_text', '').lower() if params.get('expected_text') else False,
+                    'text_bounding_box': text_bounding_box,
+                    'ocr_words': [word.strip() for word in boxes['text'] if word.strip()],
+                    'detection_method': detection_method,
+                    'roi_offset': roi_offset,
+                    'word_count': len([word for word in boxes['text'] if word.strip()]),
+                    'model_validation': self._get_model_validation_info(detection_method, params.get('expected_text'))
+                }, 
+                screenshot_path=screenshot_path
             )
             
         except Exception as e:
             logger.error(f"OCR failed for rule {rule.name}: {e}")
             return DetectionResult(
                 rule_name=rule.name, timestamp=timestamp, frame_number=frame_number,
-                detected=False, confidence=0.0, details={'error': str(e)}
+                detected=False, details={'error': str(e)}
             )
     
-    def _prepare_text_roi(self, frame: np.ndarray, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Prepare region of interest for text detection."""
+    def _get_model_validation_info(self, detection_method: str, expected_text: str) -> Dict[str, Any]:
+        """Get model validation information for Flash/Pro detection."""
+        if expected_text != TargetTexts.FLASH_TEXT:
+            return {}
+        
+        if 'flash_correct' in detection_method:
+            return {
+                'status': 'correct_model',
+                'found_text': '2.5 Flash',
+                'validation_result': 'pass'
+            }
+        elif 'pro_incorrect' in detection_method:
+            return {
+                'status': 'incorrect_model', 
+                'found_text': '2.5 Pro',
+                'validation_result': 'fail_incorrect_model'
+            }
+        else:
+            return {
+                'status': 'not_found',
+                'found_text': None,
+                'validation_result': 'fail_not_found'
+            }
+    
+    def _extract_roi_from_frame(self, frame: np.ndarray, params: Dict[str, Any]) -> Tuple[Optional[np.ndarray], Tuple[int, int]]:
+        """Extract region of interest from frame."""
         if 'region' not in params:
-            return {'roi': frame, 'offset': (0, 0), 'error': None}
+            return frame, (0, 0)
         
         x1, y1, x2, y2 = params['region']
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
         
         roi = frame[y1:y2, x1:x2]
-        
-        if roi.size == 0:
-            return {
-                'roi': None, 'offset': None,
-                'error': {'error': 'Invalid region bounds', 'roi_size': (0, 0)}
-            }
-        
-        return {'roi': roi, 'offset': (x1, y1), 'error': None}
+        return roi if roi.size > 0 else None, (x1, y1)
     
-    def _preprocess_for_ocr(self, roi: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
-        """Preprocess image for OCR."""
+    def _process_ocr_pipeline(self, roi: np.ndarray, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Process OCR pipeline: preprocessing + OCR."""
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
         preprocess_config = params.get('preprocess', {})
-        
         if preprocess_config.get('denoise', Config.OCR_DENOISING_ENABLED):
             gray = cv2.fastNlMeansDenoising(gray)
-        
         if preprocess_config.get('threshold', Config.OCR_THRESHOLD_ENABLED):
             gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         
-        return gray
+        text = pytesseract.image_to_string(gray, config=Config.OCR_CONFIG).strip()
+        boxes = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=Config.OCR_CONFIG)
+        return text, boxes
     
-    def _perform_ocr(self, image: np.ndarray) -> Dict[str, Any]:
-        """Perform OCR on preprocessed image."""
-        text = pytesseract.image_to_string(image, config=Config.OCR_CONFIG).strip()
-        boxes = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, 
-                                        config=Config.OCR_CONFIG)
-        return {'text': text, 'boxes': boxes}
-    
-    def _analyze_text_detection(self, ocr_results: Dict[str, Any], params: Dict[str, Any],
-                               roi_offset: Tuple[int, int]) -> Dict[str, Any]:
+    def _analyze_ocr_results(self, text: str, boxes: Dict[str, Any], params: Dict[str, Any], 
+                            roi_offset: Tuple[int, int]) -> Tuple[bool, Optional[List[int]], str]:
         """Analyze OCR results for text detection."""
-        text = ocr_results['text']
-        boxes = ocr_results['boxes']
-        
         expected_text = params.get('expected_text', '')
-        detected, confidence, text_bounding_box, detection_method = False, 0.0, None, 'none'
         
         if expected_text:
-            detected, detection_method = TextMatcher.match_text(text, expected_text)
-            confidence = 1.0 if detected else 0.0
-            
-            if detected:
-                text_bounding_box = self._find_text_bounding_box(expected_text, boxes)
-                if text_bounding_box and roi_offset != (0, 0):
-                    text_bounding_box[0] += roi_offset[0]
-                    text_bounding_box[1] += roi_offset[1]
+            if expected_text == TargetTexts.FLASH_TEXT:
+                return self._analyze_flash_pro_detection(text, boxes, roi_offset)
+            else:
+                detected, detection_method = TextMatcher.match_text(text, expected_text)
+                text_bounding_box = None
+                if detected:
+                    text_bounding_box = self._find_text_bounding_box(expected_text, boxes)
+                    if text_bounding_box and roi_offset != (0, 0):
+                        text_bounding_box[0] += roi_offset[0]
+                        text_bounding_box[1] += roi_offset[1]
+                return detected, text_bounding_box, detection_method
         elif 'unexpected_text' in params:
             unexpected = params['unexpected_text']
             detected = unexpected.lower() in text.lower()
-            confidence, detection_method = 1.0 if detected else 0.0, 'unexpected'
+            return detected, None, 'unexpected'
         else:
-            detected, confidence, detection_method = len(text) > 0, min(len(text) / 10.0, 1.0), 'presence'
+            detected = len(text) > 0
+            return detected, None, 'presence'
+    
+    def _analyze_flash_pro_detection(self, text: str, boxes: Dict[str, Any], 
+                                   roi_offset: Tuple[int, int]) -> Tuple[bool, Optional[List[int]], str]:
+        """Special analysis for Flash/Pro detection."""
+        flash_detected, flash_method = TextMatcher.match_text(text, TargetTexts.FLASH_TEXT)
         
-        return {
-            'detected': detected,
-            'confidence': confidence,
-            'text_bounding_box': text_bounding_box,
-            'expected_text': expected_text,
-            'details': {
-                'detected_text': text,
-                'expected_text': expected_text,
-                'full_match': text.lower() == expected_text.lower() if expected_text else False,
-                'text_bounding_box': text_bounding_box,
-                'ocr_words': [word.strip() for word in boxes['text'] if word.strip()],
-                'detection_method': detection_method,
-                'roi_offset': roi_offset,
-                'word_count': len([word for word in boxes['text'] if word.strip()])
-            }
-        }
+        pro_detected, pro_method = TextMatcher.match_text(text, TargetTexts.PRO_TEXT)
+        
+        if flash_detected:
+            text_bounding_box = self._find_text_bounding_box(TargetTexts.FLASH_TEXT, boxes)
+            if text_bounding_box and roi_offset != (0, 0):
+                text_bounding_box[0] += roi_offset[0]
+                text_bounding_box[1] += roi_offset[1]
+            return True, text_bounding_box, f'flash_correct_{flash_method}'
+        elif pro_detected:
+            text_bounding_box = self._find_text_bounding_box(TargetTexts.PRO_TEXT, boxes)
+            if text_bounding_box and roi_offset != (0, 0):
+                text_bounding_box[0] += roi_offset[0]
+                text_bounding_box[1] += roi_offset[1]
+            return False, text_bounding_box, f'pro_incorrect_{pro_method}'
+        else:
+            return False, None, 'neither_found'
     
     def _create_text_screenshot(self, frame: np.ndarray, text_bounding_box: Optional[List[int]], 
                               expected_text: str, rule_name: str, timestamp: float) -> Optional[str]:
@@ -3582,14 +3448,13 @@ class VideoContentAnalyzer:
             frame_copy = frame.copy()
             
             if text_bounding_box:
-                self._draw_text_annotation(frame_copy, text_bounding_box, expected_text)
+                if expected_text == TargetTexts.FLASH_TEXT:
+                    detected_text = expected_text
+                    self._apply_detection_annotations(frame_copy, text_bounding_box, detected_text, is_correct=True)
+                else:
+                    self._apply_detection_annotations(frame_copy, text_bounding_box, expected_text, is_correct=True)
             else:
-                cv2.putText(frame_copy, f"Searching for: {expected_text}", (10, 30), 
-                           Config.ANNOTATION_FONT, Config.ANNOTATION_FONT_SCALE, 
-                           Config.COLORS['YELLOW'], Config.ANNOTATION_THICKNESS)
-                cv2.putText(frame_copy, f"Frame @ {timestamp:.2f}s", (10, 60), 
-                           Config.ANNOTATION_FONT, 0.5, 
-                           Config.COLORS['WHITE'], 1)
+                self._apply_search_annotations(frame_copy, expected_text, timestamp)
             
             screenshot_path = self._save_frame(frame_copy, rule_name, timestamp)
             if screenshot_path and os.path.exists(screenshot_path):
@@ -3602,1439 +3467,170 @@ class VideoContentAnalyzer:
             logger.error(f"Screenshot creation failed for {rule_name}: {e}")
             return None
     
-    def _draw_text_annotation(self, frame: np.ndarray, text_bounding_box: List[int], 
-                             expected_text: str) -> None:
-        """Draw text detection annotation on frame."""
+    def _create_flash_pro_screenshot(self, frame: np.ndarray, text_bounding_box: Optional[List[int]], 
+                                   detected_text: str, rule_name: str, timestamp: float, is_correct: bool = True) -> Optional[str]:
+        """Create annotated screenshot for Flash/Pro detection."""
+        try:
+            frame_copy = frame.copy()
+            
+            if text_bounding_box:
+                self._apply_detection_annotations(frame_copy, text_bounding_box, detected_text, is_correct)
+            else:
+                self._apply_search_annotations(frame_copy, detected_text, timestamp)
+            
+            screenshot_path = self._save_frame(frame_copy, rule_name, timestamp)
+            if screenshot_path and os.path.exists(screenshot_path):
+                return screenshot_path
+            else:
+                logger.error(f"Failed to save Flash/Pro screenshot for {rule_name}")
+                return None
+            
+        except Exception as e:
+            logger.error(f"Flash/Pro screenshot creation failed for {rule_name}: {e}")
+            return None
+    
+    def _apply_detection_annotations(self, frame: np.ndarray, text_bounding_box: List[int], detected_text: str, is_correct: bool = True) -> None:
+        """Apply annotations for text detection (correct or incorrect)."""
         x1, y1, w, h = text_bounding_box
         x2, y2 = x1 + w, y1 + h
         
-        cv2.rectangle(frame, (x1, y1), (x2, y2), 
-                     Config.COLORS['GREEN'], Config.ANNOTATION_THICKNESS)
+        color = Config.ANNOTATION_COLORS['GREEN'] if is_correct else Config.ANNOTATION_COLORS['RED']
         
-        text_label = f"Detected: {expected_text}"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, Config.ANNOTATION_THICKNESS)
+        
+        text_label = f"Detected: {detected_text}"
+        if not is_correct:
+            text_label = f"Wrong Model: {detected_text}"
+            
         cv2.putText(frame, text_label, (x1, y1-10), 
                    Config.ANNOTATION_FONT, Config.ANNOTATION_FONT_SCALE, 
-                   Config.COLORS['GREEN'], Config.ANNOTATION_THICKNESS)
+                   color, Config.ANNOTATION_THICKNESS)
     
-    def export_results(self, output_path: str, format_type: str = 'json', cleanup_after_export: bool = False) -> bool:
-        """Export analysis results with QA data to session-specific directory."""
-        # If only filename provided, use session output directory
+    def _apply_search_annotations(self, frame: np.ndarray, expected_text: str, timestamp: float) -> None:
+        """Apply annotations for search context (no detection)."""
+        cv2.putText(frame, f"Searching for: {expected_text}", (10, 30), 
+                   Config.ANNOTATION_FONT, Config.ANNOTATION_FONT_SCALE, 
+                   Config.ANNOTATION_COLORS['YELLOW'], Config.ANNOTATION_THICKNESS)
+        cv2.putText(frame, f"Frame @ {timestamp:.2f}s", (10, 60), 
+                   Config.ANNOTATION_FONT, 0.5, 
+                   Config.ANNOTATION_COLORS['WHITE'], 1)
+    
+    def export_results(self, output_path: str) -> bool:
+        """Export analysis results to session directory."""
         if not os.path.dirname(output_path) or output_path == os.path.basename(output_path):
-            output_path = os.path.join(str(self.output_dir), output_path)
+            output_path = os.path.join(self.session_dir, output_path)
         
-        qa_checker = QualityAssuranceChecker(self.results)
-        exporter = ResultExporter(self.results, self._create_export_metadata(), qa_checker.qa_results)
-        success = exporter.export(output_path)
-        
-        if success and cleanup_after_export and os.path.basename(output_path) not in ["results.json", "./results.json"]:
-            try:
-                root_results_path = "results.json"
-                if os.path.exists(root_results_path):
-                    os.unlink(root_results_path)
-            except Exception as e:
-                logger.warning(f"Failed to clean up results file: {e}")
-        
-        return success
-    
-    def _create_export_metadata(self) -> Dict[str, Any]:
-        """Create metadata for export."""
-        return {
-            'export_timestamp': datetime.now().isoformat(),
-            'total_detections': len(self.results),
-            'total_frames_processed': self.total_frames_processed,
-            'analysis_duration': datetime.now().timestamp() - (self.analysis_start_time or 0),
-            'active_rules': len(self.get_active_rules())
-        }
-    
+        try:
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            
+            qa_checker = QualityAssuranceChecker(self.results)
+            
+            data = {
+                'metadata': {
+                    'export_timestamp': datetime.now().isoformat(),
+                    'total_frames_processed': self.total_frames_processed,
+                    'analysis_duration': self.performance_metrics['total_analysis_time'],
+                    'active_rules': len(self.rules),
+                    'video_duration': self.video_duration,
+                    'session_id': self.session_id
+                },
+                'performance_metrics': {
+                    'total_analysis_time': self.performance_metrics['total_analysis_time'],
+                    'flash_detection_time': self.performance_metrics['flash_detection_time'],
+                    'eval_mode_detection_time': self.performance_metrics['eval_mode_detection_time'],
+                    'audio_analysis_time': self.performance_metrics['audio_analysis_time'],
+                    'audio_extraction_time': self.performance_metrics['audio_extraction_time'],
+                    'ocr_processing_time': self.performance_metrics['ocr_processing_time'],
+                    'frames_analyzed': self.performance_metrics['frames_analyzed'],
+                    'analysis_efficiency': {
+                        'frames_per_second': self.total_frames_processed / self.performance_metrics['total_analysis_time'] if self.performance_metrics['total_analysis_time'] > 0 else 0,
+                        'video_to_analysis_ratio': self.video_duration / self.performance_metrics['total_analysis_time'] if self.performance_metrics['total_analysis_time'] > 0 else 0,
+                        'ocr_time_per_frame': self.performance_metrics['ocr_processing_time'] / max(1, self.total_frames_processed)
+                    }
+                },
+                'results': [result.to_dict() for result in self.results],
+                'qa_results': qa_checker.qa_results
+            }
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Export failed: {e}")
+            return False
+
     def _get_video_duration(self) -> float:
         """Get the stored video duration."""
         return self.video_duration
 
 
-class ResultExporter:
-    """
-    Handles exporting analysis results in JSON format.
-    """
+def create_detection_rules(target_language: str) -> List[DetectionRule]:
+    """Create the standard detection rules for video analysis."""
+    target_language = target_language.strip()
+    language_name = Config.get_language_display_name(target_language)
 
-    def __init__(self, results: List[DetectionResult], metadata: Dict[str, Any], qa_results: Optional[Dict[str, Dict[str, Any]]] = None):
-        self.results = results
-        self.metadata = metadata
-        self.qa_results = qa_results
-
-    def export(self, output_path: str) -> bool:
-        """
-        Export results to JSON format.
-        Args:
-            output_path: Path to export file
-        Returns:
-            True if export succeeded, False otherwise
-        """
-        try:
-            full_output_path = self._resolve_output_path(output_path)
-            self._export_json(full_output_path)
-            return True
-        except Exception as e:
-            logger.error(f"Export failed: {e}")
-            return False
-
-    def _resolve_output_path(self, output_path: str) -> str:
-        """
-        Ensure output directory exists and return full output file path.
-        """
-        if not os.path.dirname(output_path):
-            return output_path
-        output_dir = os.path.dirname(output_path) or "."
-        FileManager.ensure_directory(output_dir)
-        return os.path.join(output_dir, os.path.basename(output_path))
-
-    def _export_json(self, output_path: str) -> None:
-        """Export results as JSON."""
-        data = {
-            'metadata': self.metadata,
-            'results': [result.to_dict() for result in self.results]
-        }
-        
-        if self.qa_results:
-            data['qa_results'] = self.qa_results
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, default=str, ensure_ascii=False)
-
-
-def create_detection_rules(target_language: str = 'en-US') -> List[DetectionRule]:
-    """
-    Create the standard detection rules for video analysis.
-    
-    Always creates the same set of rules:
-    - Text Detection for "2.5 Flash" 
-    - Text Detection for "Eval Mode: Native Audio Output"
-    - Audio Language Detection
-    - Voice Audibility Detection
-    
-    Args:
-        target_language: Language code for audio detection (e.g., 'en-US', 'es-MX')
-        
-    Returns:
-        List of configured detection rules
-    """
     rules = []
-    
-    # Sanitize input
-    safe_target_language = InputValidator.sanitize_user_input(target_language, 10)
-    language_name = Config.SUPPORTED_LANGUAGES.get(safe_target_language, safe_target_language.upper())
-    
-    # Text Detection Rule: "2.5 Flash"
-    for text in TargetTexts.FLASH_TEXTS:
-        safe_text = InputValidator.sanitize_user_input(text, 100)
-        rules.append(DetectionRule(
-            name=f"Text Detection: {safe_text}",
-            detection_type=DetectionType.TEXT,
-            parameters={
-                'expected_text': safe_text,
-                'save_screenshot': True,
-                'preprocess': {
-                    'denoise': Config.OCR_DENOISING_ENABLED,
-                    'threshold': Config.OCR_THRESHOLD_ENABLED
-                }
-            },
-            enabled=True
-        ))
-    
-    # Text Detection Rule: "Eval Mode: Native Audio Output"
-    safe_eval_text = InputValidator.sanitize_user_input(TargetTexts.EVAL_MODE_TEXT, 100)
     rules.append(DetectionRule(
-        name=f"Text Detection: {safe_eval_text}",
+        name=f"Text Detection: {TargetTexts.FLASH_TEXT}",
         detection_type=DetectionType.TEXT,
         parameters={
-            'expected_text': safe_eval_text,
+            'expected_text': TargetTexts.FLASH_TEXT,
             'save_screenshot': True,
             'preprocess': {
                 'denoise': Config.OCR_DENOISING_ENABLED,
                 'threshold': Config.OCR_THRESHOLD_ENABLED
             }
-        },
-        enabled=True
+        }
     ))
-    
-    # Audio Language Detection Rule
+    rules.append(DetectionRule(
+        name=f"Text Detection: Alias Name",
+        detection_type=DetectionType.TEXT,
+        parameters={
+            'expected_text': TargetTexts.ALIAS_NAME_TEXT,
+            'save_screenshot': True,
+            'preprocess': {
+                'denoise': Config.OCR_DENOISING_ENABLED,
+                'threshold': Config.OCR_THRESHOLD_ENABLED
+            }
+        }
+    ))
+    rules.append(DetectionRule(
+        name=f"Text Detection: {TargetTexts.EVAL_MODE_TEXT}",
+        detection_type=DetectionType.TEXT,
+        parameters={
+            'expected_text': TargetTexts.EVAL_MODE_TEXT,
+            'save_screenshot': True,
+            'preprocess': {
+                'denoise': Config.OCR_DENOISING_ENABLED,
+                'threshold': Config.OCR_THRESHOLD_ENABLED
+            }
+        }
+    ))
     rules.append(DetectionRule(
         name=f"Language Detection: Fluent {language_name}",
-        detection_type=DetectionType.AUDIO_LANGUAGE,
+        detection_type=DetectionType.LANGUAGE_FLUENCY,
         parameters={
-            'target_language': safe_target_language,
+            'target_language': target_language,
             'min_fluency_score': 0.6
-        },
-        enabled=True
+        }
     ))
-    
-    # Voice Audibility Detection Rule
     rules.append(DetectionRule(
         name="Voice Audibility: Both Voices Audible",
         detection_type=DetectionType.VOICE_AUDIBILITY,
         parameters={
             'min_confidence': 0.3,
             'min_duration': 3.0
-        },
-        enabled=True
+        }
     ))
-
     return rules
 
 
-class ScreenManager:
-    """Manages the three-screen interface state."""
-    
-    @staticmethod
-    def initialize_session_state():
-        """Initialize session state variables for screen management."""
-        if 'current_screen' not in st.session_state:
-            st.session_state.current_screen = 'input'
-        
-        if 'session_id' not in st.session_state:
-            st.session_state.session_id = SessionManager.generate_session_id()
-        
-        if 'question_id' not in st.session_state:
-            st.session_state.question_id = ""
-        if 'alias_email' not in st.session_state:
-            st.session_state.alias_email = ""
-        if 'is_authorized' not in st.session_state:
-            st.session_state.is_authorized = False
-        if 'video_file' not in st.session_state:
-            st.session_state.video_file = None
-        if 'selected_language' not in st.session_state:
-            st.session_state.selected_language = 'en-US'
-        if 'frame_interval' not in st.session_state:
-            st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
-        if 'assigned_qa' not in st.session_state:
-            st.session_state.assigned_qa = None
-        
-        if 'analysis_results' not in st.session_state:
-            st.session_state.analysis_results = None
-        if 'analyzer_instance' not in st.session_state:
-            st.session_state.analyzer_instance = None
-        if 'qa_checker' not in st.session_state:
-            st.session_state.qa_checker = None
-        if 'export_in_progress' not in st.session_state:
-            st.session_state.export_in_progress = False
-        if 'export_completed' not in st.session_state:
-            st.session_state.export_completed = False
-        if 'analysis_in_progress' not in st.session_state:
-            st.session_state.analysis_in_progress = False
-        if 'analysis_started' not in st.session_state:
-            st.session_state.analysis_started = False
-        if 'validation_error_shown' not in st.session_state:
-            st.session_state.validation_error_shown = False
-    
-    @staticmethod
-    def navigate_to_screen(screen: str):
-        """Navigate to a specific screen."""
-        if st.session_state.get('current_screen') == 'input' and screen != 'input':
-            for key in list(st.session_state.keys()):
-                if key.startswith('input_') or key in ['FormSubmitter:input-', 'FormSubmitter:analysis-']:
-                    try:
-                        del st.session_state[key]
-                    except:
-                        pass
-        
-        st.session_state.current_screen = screen
-        st.rerun()
-    
-    @staticmethod
-    def reset_session_for_new_analysis():
-        """Completely reset session state for a new analysis."""
-        # Store the current screen value
-        target_screen = 'input'
-        
-        # Get all session state keys to clear
-        keys_to_clear = list(st.session_state.keys())
-        
-        # Clear all session state
-        for key in keys_to_clear:
-            try:
-                del st.session_state[key]
-            except:
-                logger.warning(f"Failed to clear session state key: {key}")
-        
-        # Re-initialize essential session state with a NEW session ID
-        st.session_state.current_screen = target_screen
-        st.session_state.session_id = SessionManager.generate_session_id()  # Generate new session ID
-        st.session_state.question_id = ""
-        st.session_state.alias_email = ""
-        st.session_state.video_file = None
-        st.session_state.selected_language = 'en-US'
-        st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
-        st.session_state.analysis_results = None
-        st.session_state.analyzer_instance = None
-        st.session_state.qa_checker = None
-        st.session_state.export_in_progress = False
-        st.session_state.export_completed = False
-        st.session_state.analysis_in_progress = False
-        st.session_state.analysis_started = False
-        st.session_state.validation_error_shown = False
-        
-        try:
-            if hasattr(st, 'cache_data') and hasattr(st.cache_data, 'clear'):
-                st.cache_data.clear()
-        except:
-            pass
-        
-        try:
-            if hasattr(st, 'cache_resource') and hasattr(st.cache_resource, 'clear'):
-                st.cache_resource.clear()
-        except:
-            pass
-        
-        logger.info(f"Reset session for new analysis with new session ID: {st.session_state.session_id}")
-        st.rerun()
-    
-    @staticmethod
-    def get_current_screen() -> str:
-        """Get the current screen."""
-        return st.session_state.get('current_screen', 'input')
-    
-    @staticmethod
-    def _cleanup_previous_session():
-        """Clean up screenshots and files from the current session only."""
-        try:
-            current_session_id = st.session_state.get('session_id')
-            if current_session_id:
-                # Clean up only the current session, not all sessions
-                from video_analyzer import ResourceManager
-                resource_manager = ResourceManager()
-                resource_manager.force_cleanup_session(current_session_id)
-                
-                session_dir = os.path.join('analysis_output', current_session_id)
-                if os.path.exists(session_dir):
-                    from pathlib import Path
-                    # Only clean up screenshots from THIS session
-                    for file_path in Path(session_dir).glob("*.png"):
-                        try:
-                            file_path.unlink()
-                            logger.debug(f"Removed screenshot: {file_path}")
-                        except Exception as e:
-                            logger.warning(f"Failed to remove screenshot {file_path}: {e}")
-                    
-                    # Remove session directory if empty
-                    try:
-                        if not any(Path(session_dir).iterdir()):
-                            os.rmdir(session_dir)
-                            logger.debug(f"Removed empty session directory: {session_dir}")
-                    except OSError:
-                        pass
-            else:
-                logger.debug("No current session ID to clean up")
-                        
-        except Exception as e:
-            logger.error(f"Session cleanup error: {e}")
-
-
-class InputScreen:
-    """
-    First screen: Input form for analysis parameters.
-    """
-    _verifier = None
-
-    @classmethod
-    def _get_verifier(cls):
-        """Get or create the SoT verifier instance."""
-        if cls._verifier is None:
-            cls._verifier = GoogleSheetsVerifier()
-        return cls._verifier
-
-    @staticmethod
-    def render():
-        """Render the input screen UI."""
-        # Clear all containers first
-        main_container = st.container()
-        
-        # Only render if on input screen
-        if ScreenManager.get_current_screen() != 'input':
-            main_container.empty()
-            return
-            
-        with main_container:
-            InputScreen._render_title_and_divider()
-            InputScreen._render_form_fields()
-            InputScreen._render_config_section()
-            st.divider()
-            InputScreen._render_validation_and_navigation()
-
-    @staticmethod
-    def _render_title_and_divider():
-        """Render title and divider for input screen."""
-        with st.container():
-            st.title("1️⃣ Video Content Analyzer")
-            st.divider()
-
-    @staticmethod
-    def _render_form_fields():
-        """Render form input fields."""
-        # Only render if on input screen
-        if ScreenManager.get_current_screen() != 'input':
-            return
-            
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            question_id = st.text_input(
-                "Question ID *",
-                value=st.session_state.question_id,
-                placeholder="Enter question identifier",
-                help="Unique identifier for this analysis session (must be authorized in SoT Video Verifier sheet)",
-                disabled=st.session_state.get('analysis_in_progress', False)
-            )
-            st.session_state.question_id = question_id
-        with col2:
-            alias_email = st.text_input(
-                "Alias Email Address *",
-                value=st.session_state.alias_email,
-                placeholder="alias-email@gmail.com",
-                help="Email address for this analysis session (must be authorized in SoT Video Verifier sheet)",
-                disabled=st.session_state.get('analysis_in_progress', False)
-            )
-            st.session_state.alias_email = alias_email
-        with col3:
-            qa_email = st.text_input(
-                "QA Email Address *",
-                value=st.session_state.get('assigned_qa', '') or '',
-                placeholder="qa.analyst@invisible.email",
-                help="Enter QA email address (must be authorized in QA sheet)",
-                disabled=st.session_state.get('analysis_in_progress', False)
-            )
-            st.session_state.assigned_qa = qa_email
-        st.divider()
-        st.subheader("📁 Video File")
-        video_file = st.file_uploader(
-            "Upload Video File *",
-            type=Config.SUPPORTED_VIDEO_FORMATS,
-            help=f"Supported formats: {', '.join(Config.SUPPORTED_VIDEO_FORMATS)} (Max: {Config.MAX_FILE_SIZE // 1024 // 1024}MB)",
-            disabled=st.session_state.get('analysis_in_progress', False)
-        )
-        st.session_state.video_file = video_file
-
-    @staticmethod
-    def _render_config_section():
-        """Render configuration section with language and frame interval settings."""
-        if ScreenManager.get_current_screen() != 'input':
-            return
-        st.subheader("⚙️ Analysis Configuration")
-        col1, col2 = st.columns(2)
-        with col1:
-            language_options = InputScreen._get_language_options()
-            language_keys = list(language_options.keys())
-            # Use the first supported language as default if current is not in the list
-            current_language = st.session_state.get('selected_language')
-            if current_language not in language_keys:
-                current_language = language_keys[0]
-                st.session_state.selected_language = current_language
-            selected_language = st.selectbox(
-                "Target Language *",
-                options=language_keys,
-                format_func=lambda x: language_options[x],
-                index=language_keys.index(current_language),
-                help="Expected language for fluency analysis and SoT verification",
-                disabled=st.session_state.get('analysis_in_progress', False)
-            )
-            st.session_state.selected_language = selected_language
-        with col2:
-            frame_interval = st.slider(
-                "Frame Interval (seconds)",
-                min_value=Config.MIN_FRAME_INTERVAL,
-                max_value=10.0,
-                value=st.session_state.frame_interval,
-                step=1.0,
-                help="Time interval between analyzed frames (less interval more accuracy but slower analysis)",
-                disabled=st.session_state.get('analysis_in_progress', False)
-            )
-            st.session_state.frame_interval = frame_interval
-
-    @staticmethod
-    def _get_language_options() -> Dict[str, str]:
-        """Get language options without flags, using locale codes."""
-        return Config.get_language_options()
-
-    @staticmethod
-    def _render_validation_and_navigation():
-        """Render validation messages and navigation buttons."""
-        if ScreenManager.get_current_screen() != 'input':
-            return
-        errors = InputScreen._validate_inputs()
-        display_errors = [error for error in errors if error != "validation_error"]
-        if errors:
-            for error in display_errors:
-                st.error(f"❌ {error}")
-            st.warning("⚠️ Please complete all required fields and ensure authorization before proceeding.")
-        
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col2:
-            # Check if analysis is already in progress
-            is_disabled = bool(errors) or st.session_state.get('analysis_in_progress', False)
-            button_text = "Validating..." if st.session_state.get('analysis_in_progress', False) else "Start Analysis"
-            
-            if st.button(button_text, type="primary", use_container_width=True, disabled=is_disabled, key="input_start_analysis_btn"):
-                st.session_state.analysis_in_progress = True
-                st.rerun()
-                
-        if st.session_state.get('analysis_in_progress', False) and not st.session_state.get('analysis_started', False):
-            st.session_state.analysis_started = True
-            InputScreen._handle_start_analysis()
-
-    @staticmethod
-    def _handle_start_analysis():
-        """Handle the Start Analysis button click: authorization and state cleanup."""
-        question_id = st.session_state.question_id.strip()
-        alias_email = st.session_state.alias_email.strip()
-        qa_email = st.session_state.get('assigned_qa', '').strip()
-        selected_language = st.session_state.get('selected_language', 'en-US')
-        
-        try:
-            if question_id and alias_email and qa_email:
-                verifier = InputScreen._get_verifier()
-                is_main_authorized, main_message = verifier.verify_authorization(
-                    question_id, alias_email, selected_language
-                )
-                is_qa_authorized, qa_message = verifier.verify_qa_email(qa_email)
-                
-                authorization_errors = []
-                if not is_main_authorized:
-                    authorization_errors.append(f"**Main Authorization Failed**: {main_message}")
-                if not is_qa_authorized:
-                    authorization_errors.append(f"**QA Authorization Failed**: {qa_message}")
-                
-                if authorization_errors:
-                    st.session_state.analysis_in_progress = False
-                    st.session_state.analysis_started = False
-                    st.session_state.validation_error_shown = True
-                    for error in authorization_errors:
-                        st.error(f"❌ {error}")
-                    st.rerun()
-                    return
-                
-                time.sleep(1)
-                
-                InputScreen._cleanup_previous_analysis_state()
-                import gc
-                gc.collect()
-                try:
-                    cv2.destroyAllWindows()
-                except:
-                    pass
-                
-                logger.info("Memory cleanup completed before starting new analysis")
-                
-                st.session_state.analysis_in_progress = False
-                st.session_state.analysis_started = False
-                ScreenManager.navigate_to_screen('analysis')
-            
-        except Exception as e:
-            st.session_state.analysis_in_progress = False
-            st.session_state.analysis_started = False
-            st.session_state.validation_error_shown = True
-            logger.error(f"Authorization check error: {e}")
-            st.error(f"❌ **Authorization Check Failed**: Unable to verify credentials - {str(e)}")
-            st.rerun()
-            return
-
-    @staticmethod
-    def _cleanup_previous_analysis_state():
-        """Clean up previous analysis state from session."""
-        st.session_state.analysis_results = None
-        st.session_state.analyzer_instance = None
-        st.session_state.qa_checker = None
-        st.session_state.export_in_progress = False
-        st.session_state.export_completed = False
-        st.session_state.analysis_in_progress = False
-        st.session_state.analysis_started = False
-        st.session_state.validation_error_shown = False
-        if hasattr(st.session_state, 'analysis_session_id'):
-            del st.session_state.analysis_session_id
-        if hasattr(st.session_state, 'preserved_screenshots'):
-            del st.session_state.preserved_screenshots
-
-    @staticmethod
-    def _validate_inputs() -> List[str]:
-        """Validate all input parameters and return errors for logic but not display."""
-        errors = []
-        if not st.session_state.question_id.strip():
-            errors.append("validation_error")
-        if not st.session_state.alias_email.strip():
-            errors.append("validation_error")
-        elif not InputScreen._is_valid_email(st.session_state.alias_email):
-            errors.append("Please enter a valid email address")
-        if not st.session_state.video_file:
-            errors.append("validation_error")
-        qa_email = st.session_state.get('assigned_qa', '')
-        if not qa_email or not qa_email.strip():
-            errors.append("validation_error")
-        return errors
-
-    @staticmethod
-    def _is_valid_email(email: str) -> bool:
-        """Basic email validation."""
-        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return re.match(pattern, email) is not None
-
-
-class AnalysisScreen:
-    """
-    Second screen: Analysis progress and results.
-    """
-    @staticmethod
-    def render():
-        """Render the analysis screen."""
-        st.title("2️⃣ Video Analysis in Progress")
-        st.divider()
-        
-        if st.session_state.analysis_results is not None:
-            AnalysisScreen._render_completed_analysis()
-        else:
-            AnalysisScreen._start_analysis()
-
-    @staticmethod
-    def _start_analysis():
-        """Start the video analysis process."""
-        st.subheader("🔄 Processing Video...")
-        overall_progress = st.progress(0, text="Initializing analysis...")
-        try:
-            session_id = st.session_state.session_id
-            video_path, temp_files = StreamlitInterface.create_temp_video(
-                st.session_state.video_file, session_id
-            )
-            if not video_path:
-                st.error("❌ Failed to process video file")
-                return
-            overall_progress.progress(10, text="Video processed, initializing analyzer...")
-            with VideoContentAnalyzer(session_id=session_id) as analyzer:
-                AnalysisScreen._setup_and_run_analysis(analyzer, video_path, overall_progress)
-            time.sleep(2)
-            st.rerun()
-        except Exception as e:
-            st.error(f"❌ Analysis failed: {str(e)}")
-            logger.error(f"Analysis error: {e}")
-            AnalysisScreen._render_analysis_error_buttons()
-
-    @staticmethod
-    def _setup_and_run_analysis(analyzer, video_path, overall_progress):
-        default_rules = create_detection_rules(target_language=st.session_state.selected_language)
-        active_count = 0
-        for rule in default_rules:
-            logger.info(f"Rule created: {rule.name} (type: {rule.detection_type.value})")
-        for rule in default_rules:
-            try:
-                analyzer.add_rule(rule)
-                active_count += 1
-            except Exception as e:
-                logger.error(f"Failed to add rule {rule.name}: {e}")
-        active_rules = analyzer.get_active_rules()
-        rule_types = {}
-        for rule in active_rules:
-            rule_type = rule.detection_type.value
-            rule_types[rule_type] = rule_types.get(rule_type, 0) + 1
-        rule_summary = ", ".join(f"{count} {type}" for type, count in rule_types.items())
-        overall_progress.progress(20, text=f"Added {active_count} analysis rules...")
-        overall_progress.progress(30, text="Starting video analysis...")
-        results = analyzer.analyze_video(
-            video_path,
-            frame_interval=st.session_state.frame_interval
-        )
-        overall_progress.progress(90, text="Analysis complete, generating report...")
-        analyzer.export_results("results.json")
-        video_duration = analyzer._get_video_duration() if hasattr(analyzer, '_get_video_duration') else 0.0
-        if video_duration == 0.0:
-            try:
-                cap = cv2.VideoCapture(video_path)
-                if cap.isOpened():
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    video_duration = total_frames / fps if fps > 0 else 0.0
-                    cap.release()
-            except Exception as e:
-                logger.warning(f"Failed to calculate video duration: {e}")
-                video_duration = 0.0
-        st.session_state.video_duration = video_duration
-        st.session_state.analysis_results = results
-        st.session_state.analysis_session_id = analyzer.session_id
-        st.session_state.analyzer_instance = analyzer
-        st.session_state.qa_checker = QualityAssuranceChecker(results)
-        screenshot_count = sum(1 for result in results if result.screenshot_path and os.path.exists(result.screenshot_path))
-        overall_progress.progress(100, text="Analysis complete!")
-
-    @staticmethod
-    def _render_analysis_error_buttons():
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🔄 Retry Analysis"):
-                st.rerun()
-        with col2:
-            if st.button("⬅️ Back to Input"):
-                ScreenManager.navigate_to_screen('input')
-
-    @staticmethod
-    def _render_completed_analysis():
-        """Render completed analysis results."""
-        st.subheader("📊 Analysis Results")
-        AnalysisScreen._preserve_screenshots()
-        results = st.session_state.analysis_results
-        AnalysisScreen._render_metrics(results)
-        st.divider()
-        if results:
-            AnalysisScreen._render_individual_detections(results)
-        st.divider()
-        AnalysisScreen._render_navigation_buttons()
-
-    @staticmethod
-    def _preserve_screenshots():
-        if hasattr(st.session_state, 'analysis_results') and st.session_state.analysis_results:
-            if not hasattr(st.session_state, 'preserved_screenshots'):
-                st.session_state.preserved_screenshots = set()
-            for result in st.session_state.analysis_results:
-                if hasattr(result, 'screenshot_path') and result.screenshot_path:
-                    st.session_state.preserved_screenshots.add(result.screenshot_path)
-
-    @staticmethod
-    def _render_metrics(results):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Detections", len(results))
-        with col2:
-            positive_detections = sum(1 for r in results if r.detected)
-            st.metric("Positive Detections", positive_detections)
-        with col3:
-            detection_rate = positive_detections / len(results) if results else 0
-            st.metric("Detection Rate", f"{detection_rate:.1%}")
-        with col4:
-            avg_confidence = sum(r.confidence for r in results) / len(results) if results else 0
-            st.metric("Avg Confidence", f"{avg_confidence:.2f}")
-
-    @staticmethod
-    def _render_individual_detections(results):
-        text_results = [r for r in results if 'Text Detection' in r.rule_name]
-        audio_results = [r for r in results if 'Language Detection' in r.rule_name or 'Voice Audibility' in r.rule_name]
-        if text_results:
-            with st.expander(f"📝 Text Detections ({len(text_results)})", expanded=True):
-                for result in text_results[:15]:
-                    AnalysisScreen._render_text_detection_result(result)
-        if audio_results:
-            with st.expander(f"🎵 Audio Analysis ({len(audio_results)})", expanded=True):
-                for result in audio_results[:15]:
-                    AnalysisScreen._render_audio_detection_result(result)
-
-    @staticmethod
-    def _render_navigation_buttons():
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("⬅️ New Analysis", use_container_width=True):
-                AnalysisScreen._cleanup_and_reset_for_new_analysis()
-        with col2:
-            if st.button("📋 View QA Report", type="primary", use_container_width=True):
-                ScreenManager.navigate_to_screen('qa')
-
-    @staticmethod
-    def _cleanup_and_reset_for_new_analysis():
-        # Only clean up the CURRENT session, not all sessions
-        current_session_id = st.session_state.get('analysis_session_id', st.session_state.get('session_id'))
-        resource_manager = get_resource_manager()
-        
-        # Clean up only the current session
-        if current_session_id:
-            try:
-                resource_manager.force_cleanup_session(current_session_id)
-                resource_manager.cleanup_session_directories(current_session_id)
-            except Exception as e:
-                logger.error(f"❌ Error cleaning up current session {current_session_id}: {e}")
-        
-        # Only clean up orphaned sessions
-        try:
-            if os.path.exists(Config.OUTPUT_DIR):
-                current_time = time.time()
-                for item in os.listdir(Config.OUTPUT_DIR):
-                    item_path = os.path.join(Config.OUTPUT_DIR, item)
-                    if os.path.isdir(item_path) and item != current_session_id:
-                        try:
-                            # Only clean up directories older than 1 hour
-                            dir_mtime = os.path.getmtime(item_path)
-                            if current_time - dir_mtime > 3600:  # 1 hour
-                                resource_manager.cleanup_session_directories(item)
-                        except Exception as e:
-                            logger.debug(f"Skipped cleanup of session {item}: {e}")
-        except Exception as e:
-            logger.debug(f"Error scanning for orphaned sessions: {e}")
-        
-        ScreenManager._cleanup_previous_session()
-        import gc
-        gc.collect()
-        try:
-            cv2.destroyAllWindows()
-        except:
-            pass
-        ScreenManager.reset_session_for_new_analysis()
-
-    @staticmethod
-    def _render_text_detection_result(result):
-        status_icon = "✅" if result.detected else "❌"
-        confidence_color = "green" if result.confidence > 0.7 else "orange" if result.confidence > 0.4 else "red"
-        with st.container():
-            st.markdown(f"### {status_icon} {result.rule_name}")
-            col1, col2, col3 = st.columns([2, 1, 1])
-            with col1:
-                st.write(f"**Timestamp:** {result.timestamp:.2f}s")
-                st.write(f"**Frame:** {result.frame_number}")
-            with col2:
-                st.markdown(f"**Confidence**")
-                st.markdown(f":{confidence_color}[{result.confidence:.1%}]")
-            with col3:
-                st.markdown("**Status**")
-                st.write("✅ Detected" if result.detected else "❌ Not Found")
-            if hasattr(result, 'details') and result.details:
-                with st.expander("🔍 Detection Details", expanded=False):
-                    if isinstance(result.details, dict):
-                        if 'detected_text' in result.details:
-                            st.markdown("**Detected Text:**")
-                            st.code(result.details['detected_text'])
-                        if 'bbox' in result.details:
-                            st.markdown("**Bounding Box:**")
-                            bbox = result.details['bbox']
-                            if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-                                st.write(f"x: {bbox[0]}, y: {bbox[1]}, width: {bbox[2]}, height: {bbox[3]}")
-                        if 'text_confidence' in result.details:
-                            st.markdown(f"**OCR Confidence:** {result.details['text_confidence']:.2f}")
-                        other_details = {k: v for k, v in result.details.items() if k not in ['detected_text', 'bbox', 'text_confidence']}
-                        if other_details:
-                            st.json(other_details)
-                    else:
-                        st.write(str(result.details))
-            AnalysisScreen._render_screenshot_section(result)
-        st.divider()
-
-    @staticmethod
-    def _render_screenshot_section(result):
-        """Render screenshot section."""
-        if result.screenshot_path:
-            if os.path.isabs(result.screenshot_path):
-                screenshot_path = result.screenshot_path
-            else:
-                if hasattr(st.session_state, 'analysis_session_id') and st.session_state.analysis_session_id:
-                    session_dir = os.path.join(Config.OUTPUT_DIR, st.session_state.analysis_session_id)
-                    screenshot_path = os.path.join(session_dir, result.screenshot_path)
-                else:
-                    screenshot_path = result.screenshot_path
-            exists = os.path.exists(screenshot_path)
-            if exists:
-                try:
-                    file_size = os.path.getsize(result.screenshot_path)
-                    is_readable = os.access(result.screenshot_path, os.R_OK)
-                    st.markdown("**Screenshot**")
-                    with st.expander("🖼️ View", expanded=False):
-                        if is_readable and file_size > 0:
-                            st.image(result.screenshot_path, caption=f"Detection at {result.timestamp:.2f}s", width=300)
-                        else:
-                            st.error(f"File exists but not readable (size: {file_size}, readable: {is_readable})")
-                except Exception as e:
-                    st.markdown("**Screenshot**")
-                    st.error(f"Error accessing file: {e}")
-            else:
-                st.markdown("**Screenshot**")
-                st.write("❌ *File not found*")
-                st.caption(f"Path: {result.screenshot_path}")
-        else:
-            st.markdown("**Screenshot**")
-            st.write("❌ *Not generated*")
-            if not result.detected:
-                st.caption("No detection found")
-            else:
-                st.caption("Detection found but screenshot missing")
-
-    @staticmethod
-    def _render_audio_detection_result(result):
-        status_icon = "✅" if result.detected else "❌"
-        confidence_color = "green" if result.confidence > 0.7 else "orange" if result.confidence > 0.4 else "red"
-        with st.container():
-            st.markdown(f"### {status_icon} {result.rule_name}")
-            col1, col2, col3 = st.columns([2, 1, 2])
-            with col1:
-                st.write(f"**Timestamp:** {result.timestamp:.2f}s")
-                st.write(f"**Segment:** {result.frame_number}")
-            with col2:
-                st.markdown(f"**Confidence**")
-                st.markdown(f":{confidence_color}[{result.confidence:.1%}]")
-            with col3:
-                st.markdown("**Status**")
-                st.write("✅ Detected" if result.detected else "❌ Not Found")
-            if hasattr(result, 'details') and result.details:
-                with st.expander("🎵 Audio Analysis Details", expanded=False):
-                    if isinstance(result.details, dict):
-                        if 'Language Detection' in result.rule_name:
-                            if 'detected_language' in result.details:
-                                st.markdown(f"**Detected Language:** {result.details['detected_language']}")
-                            if 'language_confidence' in result.details:
-                                st.markdown(f"**Language Confidence:** {result.details['language_confidence']:.2f}")
-                            if 'fluency_score' in result.details:
-                                st.markdown(f"**Fluency Score:** {result.details['fluency_score']:.2f}")
-                            if 'details' in result.details:
-                                nested_details = result.details['details']
-                                if isinstance(nested_details, dict):
-                                    if 'transcript' in nested_details:
-                                        st.markdown("**Transcript:**")
-                                        st.code(nested_details['transcript'])
-                                    if 'word_count' in nested_details:
-                                        st.markdown(f"**Word Count:** {nested_details['word_count']}")
-                                    if 'avg_confidence' in nested_details:
-                                        st.markdown(f"**Avg Word Confidence:** {nested_details['avg_confidence']:.2f}")
-                        elif 'Voice Audibility' in result.rule_name:
-                            if 'audio_features' in result.details:
-                                features = result.details['audio_features']
-                                if isinstance(features, dict):
-                                    st.markdown("**Audio Features:**")
-                                    for feature, value in features.items():
-                                        if isinstance(value, (int, float)):
-                                            st.write(f"• {feature}: {value:.3f}")
-                                        else:
-                                            st.write(f"• {feature}: {value}")
-                            if 'voice_detected' in result.details:
-                                st.markdown(f"**Voice Activity:** {'Yes' if result.details['voice_detected'] else 'No'}")
-                            if 'rms_energy' in result.details:
-                                st.markdown(f"**RMS Energy:** {result.details['rms_energy']:.4f}")
-                        excluded_keys = ['detected_language', 'language_confidence', 'fluency_score', 'details', 'audio_features', 'voice_detected', 'rms_energy']
-                        other_details = {k: v for k, v in result.details.items() if k not in excluded_keys}
-                        if other_details:
-                            st.markdown("**Additional Details:**")
-                            st.json(other_details)
-                    else:
-                        st.write(str(result.details))
-        st.divider()
-
-
-class QAScreen:
-    """
-    Third screen: Quality Assurance results and export.
-    """
-    @staticmethod
-    def render():
-        """Render the QA screen."""
-        st.title("🛡️ Quality Assurance Report")
-        if st.session_state.qa_checker:
-            QAScreen._render_qa_results()
-        else:
-            st.error("❌ No QA data available. Please run analysis first.")
-            if st.button("⬅️ Back to Analysis"):
-                ScreenManager.navigate_to_screen('analysis')
-
-    @staticmethod
-    def _render_qa_results():
-        """Render detailed QA results."""
-        qa_checker = st.session_state.qa_checker
-        overall = qa_checker.get_qa_summary()
-        QAScreen._render_overall_status(overall)
-        st.progress(overall['score'], text=f"Overall Quality Score: {overall['score']:.1%}")
-        st.divider()
-        detailed_results = qa_checker.get_detailed_results()
-        QAScreen._render_detailed_checks(detailed_results)
-        st.divider()
-        QAScreen._render_navigation_and_export()
-
-    @staticmethod
-    def _render_overall_status(overall):
-        if overall['passed']:
-            st.success(f"✅ **Quality Assurance: PASSED** - All requirements met!")
-        else:
-            st.error(f"❌ **Quality Assurance: FAILED** - {overall['checks_passed']}/{overall['total_checks']} checks passed")
-
-    @staticmethod
-    def _render_detailed_checks(detailed_results):
-        checks = [
-            ('🔥 Flash Text Detection', 'flash_predominance', 'Video should contain "2.5 Flash" text'),
-            ('⚙️ Eval Mode Detection', 'eval_mode_predominance', 'Video should show "Eval Mode: Native Audio Output"'),
-            ('🗣️ Language Fluency', 'language_fluency', 'Audio should demonstrate fluent speech in target language'),
-            ('👥 Voice Audibility', 'voice_audibility', 'Both user and model voices should be clearly audible')
-        ]
-        for icon_title, check_key, description in checks:
-            if check_key in detailed_results:
-                QAScreen._render_single_check(icon_title, check_key, description, detailed_results[check_key])
-
-    @staticmethod
-    def _render_single_check(icon_title, check_key, description, check_result):
-        status_icon = "✅ PASS" if check_result['passed'] else "❌ FAIL"
-        with st.expander(f"{icon_title} - {status_icon}", expanded=not check_result['passed']):
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.markdown(f"**Description:** {description}")
-                st.markdown(f"**Result:** {check_result['details']}")
-                if 'percentage' in check_result:
-                    st.progress(
-                        min(check_result['percentage'] / 100, 1.0),
-                        text=f"Coverage: {check_result['percentage']:.1f}%"
-                    )
-                if 'confidence' in check_result and check_result['confidence'] > 0:
-                    st.progress(
-                        check_result['confidence'],
-                        text=f"Confidence: {check_result['confidence']:.1%}"
-                    )
-            with col2:
-                if check_result['passed']:
-                    st.success("✅ PASS")
-                else:
-                    st.error("❌ FAIL")
-                st.metric("Score", f"{check_result['score']:.1%}")
-    
-    @staticmethod
-    def _render_navigation_and_export():
-        """Render navigation and export options."""
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("⬅️ Back to Results", use_container_width=True):
-                ScreenManager.navigate_to_screen('analysis')
-        
-        with col2:
-            if st.button("🔄 New Analysis", use_container_width=True):
-                # Only clean up the current session, not all sessions
-                current_session_id = st.session_state.get('analysis_session_id', st.session_state.get('session_id'))
-                
-                # Clean up only the current session
-                if current_session_id:
-                    # Clean up current session directories
-                    analysis_session_dir = os.path.join(Config.OUTPUT_DIR, current_session_id)
-                    if os.path.exists(analysis_session_dir):
-                        try:
-                            shutil.rmtree(analysis_session_dir)
-                        except Exception as e:
-                            logger.error(f"❌ QA Screen: Failed to delete analysis_output directory {analysis_session_dir}: {e}")
-                    
-                    temp_session_dir = os.path.join(Config.TEMP_DIR, current_session_id)
-                    if os.path.exists(temp_session_dir):
-                        try:
-                            shutil.rmtree(temp_session_dir)
-                        except Exception as e:
-                            logger.error(f"❌ QA Screen: Failed to delete temp directory {temp_session_dir}: {e}")
-                # Only clean up orphaned sessions that are old
-                try:
-                    current_time = time.time()
-                    if os.path.exists(Config.OUTPUT_DIR):
-                        for item in os.listdir(Config.OUTPUT_DIR):
-                            if item != current_session_id and os.path.isdir(os.path.join(Config.OUTPUT_DIR, item)):
-                                item_path = os.path.join(Config.OUTPUT_DIR, item)
-                                try:
-                                    # Only clean up directories older than 1 hour
-                                    dir_mtime = os.path.getmtime(item_path)
-                                    if current_time - dir_mtime > 3600:  # 1 hour
-                                        shutil.rmtree(item_path)
-                                except Exception as e:
-                                    logger.debug(f"QA Screen: Skipped cleanup of session {item}: {e}")
-                    
-                    if os.path.exists(Config.TEMP_DIR):
-                        for item in os.listdir(Config.TEMP_DIR):
-                            if item != current_session_id and os.path.isdir(os.path.join(Config.TEMP_DIR, item)):
-                                item_path = os.path.join(Config.TEMP_DIR, item)
-                                try:
-                                    # Only clean up directories older than 1 hour
-                                    dir_mtime = os.path.getmtime(item_path)
-                                    if current_time - dir_mtime > 3600:  # 1 hour
-                                        shutil.rmtree(item_path)
-                                except Exception as e:
-                                    logger.debug(f"QA Screen: Skipped cleanup of temp session {item}: {e}")
-                except Exception as e:
-                    logger.debug(f"QA Screen: Error scanning for orphaned sessions: {e}")
-                
-                ScreenManager._cleanup_previous_session()
-                
-                # Perform memory cleanup
-                import gc
-                gc.collect()
-                
-                try:
-                    cv2.destroyAllWindows()
-                except:
-                    pass
-                
-                ScreenManager.reset_session_for_new_analysis()
-        
-        with col3:
-            # Determine button state
-            export_disabled = st.session_state.get('export_in_progress', False) or st.session_state.get('export_completed', False)
-            export_button_text = "📤 Export Report"
-            
-            if st.session_state.get('export_in_progress', False):
-                export_button_text = "⏳ Exporting..."
-            elif st.session_state.get('export_completed', False):
-                export_button_text = "✅ Export Completed"
-            
-            if st.button(export_button_text, type="primary", use_container_width=True, disabled=export_disabled):
-                try:
-                    st.session_state.export_in_progress = True
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.session_state.export_in_progress = False
-                    st.error(f"❌ Export failed: {str(e)}")
-                    logger.error(f"Export exception: {e}")
-                    st.rerun()
-            
-            # Handle the actual export process if in progress
-            if st.session_state.get('export_in_progress', False):
-                try:
-                        # Mark session for export to prevent cleanup
-                        session_id = st.session_state.get('analysis_session_id')
-                        if session_id:
-                            ResourceManager.mark_session_for_export(session_id)
-                        
-                        # Use secure configuration
-                        config = ConfigurationManager.get_secure_config()
-                        gas_url = config["apps_script_url"]
-                        sheet_name = config["default_sheet_name"]
-                        overwrite_data = False
-                        
-                        export_data = QAScreen._prepare_export_data()
-                        
-                        screenshot_count = len(export_data.get('screenshots', []))
-                        if screenshot_count > 0:
-                            st.info(f"📷 Exporting to Google Sheets and uploading {screenshot_count} screenshots to Google Drive...")
-                            if screenshot_count > 25:
-                                st.info(f"⏰ Large screenshot set detected. Extended timeout will be used to prevent timeouts...")
-                        
-                        success, message = QAScreen._send_to_google_sheets(gas_url, sheet_name, export_data, overwrite_data)
-                        
-                        # Update status based on result
-                        st.session_state.export_in_progress = False
-                        
-                        # Unmark session for export and allow cleanup
-                        if session_id:
-                            ResourceManager.unmark_session_for_export(session_id)
-                            ResourceManager.unregister_active_session(session_id)
-                        
-                        if success:
-                            st.session_state.export_completed = True
-                            st.rerun()
-                        else:
-                            st.error(f"❌ Export failed: {message}")
-                            logger.error(f"Export error: {message}")
-                            st.rerun()
-                            
-                except Exception as e:
-                    st.session_state.export_in_progress = False
-                    # Ensure cleanup in case of exception
-                    session_id = st.session_state.get('analysis_session_id')
-                    if session_id:
-                        ResourceManager.unmark_session_for_export(session_id)
-                        ResourceManager.unregister_active_session(session_id)
-                    st.error(f"❌ Export failed: {str(e)}")
-                    logger.error(f"Export exception: {e}")
-                    st.rerun()
-
-    @staticmethod
-    def _prepare_export_data() -> Dict[str, Any]:
-        """Prepare analysis data for SoT export."""
-        try:
-            # Verify session integrity before export
-            session_id = st.session_state.get('analysis_session_id')
-            if session_id:
-                # Check if session still has output directory
-                session_output_dir = Path(Config.OUTPUT_DIR) / session_id
-                if not session_output_dir.exists():
-                    logger.warning(f"Session output directory missing: {session_output_dir}")
-                else:
-                    logger.debug(f"Session output directory exists: {session_output_dir}")
-            
-            qa_checker = st.session_state.qa_checker
-            analysis_results = st.session_state.analysis_results
-            
-            if not qa_checker:
-                logger.error("No QA checker available in session state")
-                raise ValueError("QA checker not available")
-                
-            if not analysis_results:
-                logger.error("No analysis results available in session state")
-                raise ValueError("Analysis results not available")
-            
-            session_info = {
-                "timestamp": datetime.now().isoformat(),
-                "export_time": datetime.now().isoformat(),
-                "session_id": st.session_state.get('analysis_session_id', 'unknown'),
-                "question_id": st.session_state.get('question_id', ''),
-                "assigned_qa": st.session_state.get('assigned_qa', ''),
-                "alias_email": st.session_state.get('alias_email', ''),
-                "video_file": st.session_state.video_file.name if st.session_state.video_file else 'unknown',
-                "video_length": f"{st.session_state.get('video_duration', 0):.1f}s" if 'video_duration' in st.session_state else 'unknown',
-                "selected_language": st.session_state.get('selected_language', 'en-US'),
-                "frame_interval": st.session_state.get('frame_interval', 2.0)
-            }
-            
-            qa_summary = qa_checker.get_qa_summary()
-            
-            detailed_qa = qa_checker.get_detailed_results()
-            
-            total_results = len(analysis_results)
-            positive_detections = sum(1 for r in analysis_results if r.detected)
-            text_detections = len([r for r in analysis_results if 'Text Detection' in r.rule_name and r.detected])
-            audio_detections = len([r for r in analysis_results if ('Language Detection' in r.rule_name or 'Voice Audibility' in r.rule_name) and r.detected])
-            unique_rules = len(set(r.rule_name for r in analysis_results))
-            
-            analysis_stats = {
-                "total_detections": int(total_results),
-                "positive_detections": int(positive_detections),
-                "detection_rate": positive_detections / total_results if total_results > 0 else 0,
-                "text_detections": int(text_detections),
-                "audio_detections": int(audio_detections),
-                "avg_confidence": sum(r.confidence for r in analysis_results) / total_results if total_results > 0 else 0
-            }
-            
-            detection_details = []
-            screenshot_data = []
-            
-            for i, result in enumerate(analysis_results):
-                if hasattr(result, 'screenshot_path') and result.screenshot_path and os.path.exists(result.screenshot_path):
-                    try:
-                        import base64
-                        import cv2
-                        import numpy as np
-                        
-                        img = cv2.imread(result.screenshot_path)
-                        if img is not None:
-                            height, width = img.shape[:2]
-                            
-                            max_dimension = 1200
-                            if max(height, width) > max_dimension:
-                                scale = max_dimension / max(height, width)
-                                new_width = int(width * scale)
-                                new_height = int(height * scale)
-                                img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                            
-                            encode_param = [int(cv2.IMWRITE_PNG_COMPRESSION), 6]
-                            success, buffer = cv2.imencode('.png', img, encode_param)
-                            
-                            if success:
-                                img_data = base64.b64encode(buffer.tobytes()).decode('utf-8')
-                                
-                                screenshot_info = {
-                                    "filename": os.path.basename(result.screenshot_path),
-                                    "data": img_data,
-                                    "original_path": result.screenshot_path,
-                                    "rule_name": result.rule_name,
-                                    "timestamp": result.timestamp
-                                }
-                                screenshot_data.append(screenshot_info)
-                            else:
-                                logger.error(f"Failed to encode screenshot: {result.screenshot_path}")
-                        else:
-                            logger.error(f"Failed to read image: {result.screenshot_path}")
-                    except Exception as e:
-                        logger.error(f"Failed to prepare screenshot {result.screenshot_path}: {e}")
-                elif hasattr(result, 'screenshot_path') and result.screenshot_path:
-                    logger.warning(f"Screenshot file not found: {result.screenshot_path}")
-            
-            for i, result in enumerate(analysis_results[:20]):
-                detail = {
-                    "rule_name": result.rule_name,
-                    "detected": result.detected,
-                    "confidence": result.confidence,
-                    "timestamp": result.timestamp,
-                    "frame_number": result.frame_number
-                }
-                
-                if hasattr(result, 'screenshot_path') and result.screenshot_path:
-                    detail["screenshot_path"] = result.screenshot_path
-                
-                if hasattr(result, 'detected_text') and result.detected_text:
-                    detail["detected_text"] = result.detected_text
-                
-                if hasattr(result, 'details') and result.details:
-                    if isinstance(result.details, dict):
-                        if 'detected_language' in result.details:
-                            detail["detected_language"] = result.details['detected_language']
-                        if 'language_confidence' in result.details:
-                            detail["language_confidence"] = result.details['language_confidence']
-                        if 'fluency_score' in result.details:
-                            detail["fluency_score"] = result.details['fluency_score']
-                
-                detection_details.append(detail)
-            
-            export_data = {
-                "session_info": session_info,
-                "qa_summary": qa_summary,
-                "qa_details": detailed_qa,
-                "analysis_stats": analysis_stats,
-                "detection_details": detection_details,
-                "screenshots": screenshot_data
-            }
-            
-            export_data = QAScreen._make_json_serializable(export_data)
-            
-            return export_data
-            
-        except Exception as e:
-            logger.error(f"Error preparing export data: {e}")
-            raise
-
-    @staticmethod
-    def _make_json_serializable(obj):
-        """Convert any non-JSON serializable objects to JSON serializable format."""
-        import numpy as np
-        
-        if isinstance(obj, dict):
-            return {k: QAScreen._make_json_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [QAScreen._make_json_serializable(item) for item in obj]
-        elif isinstance(obj, np.bool_):
-            return bool(obj)
-        elif isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif hasattr(obj, '__dict__'):
-            return QAScreen._make_json_serializable(obj.__dict__)
-        elif obj is None:
-            return None
-        else:
-            try:
-                json.dumps(obj)
-                return obj
-            except (TypeError, ValueError):
-                return str(obj)
-
-    @staticmethod
-    def _send_to_google_sheets(gas_url: str, sheet_name: str, data: Dict[str, Any], overwrite: bool) -> tuple[bool, str]:
-        """Send data to Google Sheets via Google Apps Script with security validation."""
-        try:
-            # Validate the URL before making the request
-            if not URLValidator.validate_url(gas_url):
-                return False, "Invalid or untrusted URL provided"
-            
-            screenshot_count = len(data.get('screenshots', []))
-            
-            try:
-                test_json = json.dumps(data)
-            except Exception as json_error:
-                logger.error(f"JSON serialization failed: {json_error}")
-                return False, f"Data contains non-serializable objects: {str(json_error)}"
-            
-            payload = {
-                "action": "writeData",
-                "sheetName": sheet_name,
-                "overwrite": overwrite,
-                "data": data
-            }
-            
-            # Extended timeout based on screenshot count
-            try:
-                config = ConfigurationManager.get_secure_config()
-                base_timeout = config["timeout_base"]
-                max_retries = config["max_retries"]
-            except SecurityError:
-                base_timeout = 45
-                max_retries = 2
-                
-            if screenshot_count > 50:
-                timeout_seconds = 300  # 5 minutes for 50+ screenshots
-            elif screenshot_count > 40:
-                timeout_seconds = 240  # 4 minutes for 40-50 screenshots
-            elif screenshot_count > 30:
-                timeout_seconds = 180  # 3 minutes for 30-40 screenshots
-            elif screenshot_count > 20:
-                timeout_seconds = 150  # 2.5 minutes for 20-30 screenshots
-            elif screenshot_count > 15:
-                timeout_seconds = 120  # 2 minutes for 15-20 screenshots
-            elif screenshot_count > 10:
-                timeout_seconds = 90   # 1.5 minutes for 10-15 screenshots
-            elif screenshot_count > 5:
-                timeout_seconds = 60   # 1 minute for 5-10 screenshots
-            else:
-                timeout_seconds = 45   # 45 seconds for ≤5 screenshots
-            
-            retry_delay = 5  # seconds
-            
-            for attempt in range(max_retries + 1):
-                try:
-                    if attempt > 0:
-                        import time
-                        time.sleep(retry_delay)
-                    
-                    response = requests.post(
-                        gas_url,
-                        json=payload,
-                        headers={'Content-Type': 'application/json'},
-                        timeout=timeout_seconds
-                    )
-                    break
-                    
-                except requests.exceptions.Timeout:
-                    if attempt == max_retries:
-                        logger.warning(f"Request timed out after {timeout_seconds}s (final attempt), but Google Apps Script may still be processing...")
-                        if screenshot_count > 0:
-                            return True, f"Export initiated successfully! {screenshot_count} screenshots are being uploaded to Google Drive. Check the Google Sheet in a few minutes."
-                        else:
-                            return False, f"Request timeout - Google Apps Script may be slow to respond"
-                    else:
-                        logger.warning(f"Request timed out on attempt {attempt + 1}/{max_retries + 1}, retrying...")
-                        continue
-                        
-                except requests.exceptions.RequestException as e:
-                    if attempt == max_retries:
-                        logger.error(f"Request failed after {max_retries} retries: {e}")
-                        return False, f"Network error after retries: {str(e)}"
-                    else:
-                        logger.warning(f"Request failed on attempt {attempt + 1}/{max_retries + 1}, retrying: {e}")
-                        continue
-            
-            response.raise_for_status()
-            
-            try:
-                result = response.json()
-            except Exception as json_error:
-                logger.error(f"Failed to parse JSON response: {json_error}")
-                logger.error(f"Raw response text: {response.text}")
-                return False, f"Invalid JSON response from Google Apps Script"
-            
-            if result.get("success") or result.get("status") == "success":
-                logger.info("Export successful!")
-                
-                try:
-                    # Clean up session data after successful export
-                    resource_manager = get_resource_manager()
-                    session_id = st.session_state.get('analysis_session_id') or st.session_state.get('session_id')
-                    
-                    if session_id:
-                        session_data = resource_manager.get_session_data(session_id)
-                        if session_data and 'analyzer' in session_data:
-                            session_data['analyzer'].cleanup_screenshots(preserve_for_export=False)
-                            resource_manager.cleanup_session_directories(session_id)
-                        else:
-                            # Clean up by session ID even if not in active sessions
-                            resource_manager.cleanup_session_directories(session_id)
-                    else:
-                        logger.warning("No session ID found for cleanup")
-                        
-                except Exception as e:
-                    logger.warning(f"Error cleaning up session data after export: {e}")
-                
-                folder_link = result.get("folderLink", "")
-                if folder_link:
-                    return True, f"Successfully exported to Google Sheets! Screenshots uploaded to Drive folder."
-                else:
-                    return True, f"Successfully exported to Google Sheets! Sheet: {sheet_name}"
-            else:
-                error_msg = result.get('message', result.get('error', 'Unknown error'))
-                logger.error(f"Export failed with message: {error_msg}")
-                return False, f"Export failed: {error_msg}"
-                
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Timeout error during export: {e}")
-            screenshot_count = len(data.get('screenshots', [])) if data else 0
-            if screenshot_count > 0:
-                return True, f"Export initiated! {screenshot_count} screenshots are being uploaded to Google Drive. The process may take a few minutes to complete. Check your Google Sheet for the Drive folder link."
-            else:
-                return False, f"Request timeout - Google Apps Script may be slow to respond"
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error during export: {e}")
-            return False, f"Network error: {str(e)}"
-        except Exception as e:
-            logger.error(f"Unexpected export error: {e}")
-            return False, f"Export failed: {str(e)}"
-
-
 class StreamlitInterface:
-    """
-    Streamlit web interface with three-screen navigation.
-    """
+    """Streamlit web interface with three-screen navigation."""
     @staticmethod
     def setup_page():
         """Configure Streamlit page and apply custom styles."""
@@ -5078,12 +3674,18 @@ class StreamlitInterface:
         current_screen = ScreenManager.get_current_screen()
         input_state = "completed" if current_screen in ['analysis', 'qa'] else ("active" if current_screen == 'input' else "")
         analysis_state = "completed" if current_screen == 'qa' else ("active" if current_screen == 'analysis' else "")
-        qa_state = "active" if current_screen == 'qa' else ""
+        
+        submission_completed = st.session_state.get('submission_locked', False)
+        if submission_completed:
+            qa_state = "completed"
+        else:
+            qa_state = "active" if current_screen == 'qa' else ""
+            
         st.markdown(f"""
         <div class="step-indicator">
             <div class="step {input_state}"><span>1️⃣ Input Parameters</span></div>
             <div class="step {analysis_state}"><span>2️⃣ Video Analysis</span></div>
-            <div class="step {qa_state}"><span>3️⃣ QA Report</span></div>
+            <div class="step {qa_state}"><span>3️⃣ Submit Video</span></div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -5100,8 +3702,9 @@ class StreamlitInterface:
             if video_suffix not in Config.SUPPORTED_VIDEO_FORMATS:
                 st.error(f"Unsupported file format: {video_suffix}")
                 return None, []
-            session_id = session_id or SessionManager.generate_session_id()
-            safe_filename = FileManager.sanitize_filename(video_file.name)
+            session_id = session_id or get_session_manager().generate_session_id()
+            
+            safe_filename = re.sub(r'[^\w.-]', '_', video_file.name)[:100]
             
             file_size = getattr(video_file, 'size', 0)
             if file_size > 100 * 1024 * 1024:  # Files > 100MB
@@ -5115,7 +3718,6 @@ class StreamlitInterface:
                 total_written = 0
                 video_file.seek(0)
                 
-                # Add progress indication for large files
                 if file_size > 50 * 1024 * 1024:
                     progress_bar = st.progress(0, text="Uploading video...")
                     
@@ -5130,7 +3732,6 @@ class StreamlitInterface:
                         return None, []
                     tmp.write(chunk)
                     
-                    # Update progress for large files
                     if file_size > 50 * 1024 * 1024:
                         progress = min(1.0, total_written / file_size)
                         progress_bar.progress(progress, text=f"Uploading video... {progress*100:.1f}%")
@@ -5139,10 +3740,7 @@ class StreamlitInterface:
                     progress_bar.empty()
                 
                 tmp.flush()
-                os.fsync(tmp.fileno())  # Force write to disk
-                if not PathValidator.validate_file_size(tmp.name):
-                    os.unlink(tmp.name)
-                    return None, []
+                os.fsync(tmp.fileno())
                 return tmp.name, [tmp.name]
         except Exception as e:
             logger.error(f"Temp video creation failed: {e}")
@@ -5151,9 +3749,7 @@ class StreamlitInterface:
 
 
 class QualityAssuranceChecker:
-    """
-    Quality Assurance checker for video analysis results.
-    """
+    """Quality Assurance checker for video analysis results."""
     def __init__(self, results: List[DetectionResult]):
         self.results = results
         self.qa_results = self._perform_qa_checks()
@@ -5163,8 +3759,9 @@ class QualityAssuranceChecker:
         if not self.results:
             return self._create_empty_qa_results()
         checks = [
-            ('flash_predominance', self._check_flash_predominance),
-            ('eval_mode_predominance', self._check_eval_mode_predominance),
+            ('flash_presence', self._check_flash_presence),
+            ('alias_name_presence', self._check_alias_name_presence),
+            ('eval_mode_presence', self._check_eval_mode_presence),
             ('language_fluency', self._check_language_fluency),
             ('voice_audibility', self._check_voice_audibility)
         ]
@@ -5188,63 +3785,95 @@ class QualityAssuranceChecker:
             'details': 'No detections found'
         }
         return {
-            'flash_predominance': empty_check.copy(),
-            'eval_mode_predominance': empty_check.copy(),
+            'flash_presence': empty_check.copy(),
+            'alias_name_presence': empty_check.copy(),
+            'eval_mode_presence': empty_check.copy(),
             'language_fluency': empty_check.copy(),
             'voice_audibility': empty_check.copy(),
             'overall': {
                 'passed': False,
                 'score': 0.0,
                 'checks_passed': 0,
-                'total_checks': 4,
+                'total_checks': 5,
                 'status': 'FAIL'
             }
         }
 
-    def _check_flash_predominance(self) -> Dict[str, Any]:
-        """Check if '2.5 Flash' appears in any text detection."""
-        all_text_detections = [r for r in self.results if self._is_flash_text_detection(r)]
-        if not all_text_detections:
+    def _check_flash_presence(self) -> Dict[str, Any]:
+        """Check if '2.5 Flash' appears in any text detection with Pro model validation."""
+        flash_results = [r for r in self.results if '2.5 Flash' in r.rule_name]
+        
+        if not flash_results:
             return {
                 'passed': False,
                 'score': 0.0,
-                'details': 'No text detection results found',
-                'flash_found': False
+                'details': "❌ '2.5 Flash' model was not found in any OCR text detections at the start of the video. Please ensure to use the correct model and try again.",
+                'flash_found': False,
+                'flash_count': 0,
+                'validation_status': 'not_found'
             }
-        flash_found, flash_detections = self._find_flash_in_detections(all_text_detections)
-        details = (f"✅ '2.5 Flash' found in OCR text ({len(flash_detections)} detections)"
-                   if flash_found else "❌ '2.5 Flash' not found in any OCR text detections")
+        
+        positive_flash_results = [r for r in flash_results if r.detected]
+        
+        if positive_flash_results:
+            return {
+                'passed': True,
+                'score': 1.0,
+                'details': "✅ '2.5 Flash' model found with OCR text detections. Correct usage confirmed.",
+                'flash_found': True,
+                'flash_count': len(positive_flash_results),
+                'validation_status': 'correct_model'
+            }
+        
+        pro_incorrect_results = []
+        for result in flash_results:
+            model_validation = result.details.get('model_validation', {})
+            if model_validation.get('status') == 'incorrect_model':
+                pro_incorrect_results.append(result)
+        
+        if pro_incorrect_results:
+            return {
+                'passed': False,
+                'score': 0.0,
+                'details': "❌ Incorrect Model: '2.5 Pro' was detected instead of '2.5 Flash'. Please ensure you are using the correct Gemini model and try again.",
+                'flash_found': False,
+                'flash_count': 0,
+                'pro_found': True,
+                'pro_count': len(pro_incorrect_results),
+                'validation_status': 'incorrect_model'
+            }
+        else:
+            return {
+                'passed': False,
+                'score': 0.0,
+                'details': "❌ '2.5 Flash' model was not found in any OCR text detections at the start of the video. Please ensure to use the correct model and try again.",
+                'flash_found': False,
+                'flash_count': 0,
+                'validation_status': 'not_found'
+            }
+
+    def _check_alias_name_presence(self) -> Dict[str, Any]:
+        """Check if 'Roaring tiger' appears in any text detection."""
+        alias_name_results = [r for r in self.results if 'Alias Name' in r.rule_name and r.detected]
+        
+        if not alias_name_results:
+            return {
+                'passed': False,
+                'score': 0.0,
+                'details': "❌ 'Roaring tiger' text was not found in any OCR text detections. Please ensure the correct alias name is visible and try again.",
+                'alias_name_found': False,
+                'alias_name_count': 0,
+                'total_text_detections': len([r for r in self.results if 'Alias Name' in r.rule_name])
+            }
+        
         return {
-            'passed': flash_found,
-            'score': 1.0 if flash_found else 0.0,
-            'details': details,
-            'flash_found': flash_found,
-            'flash_count': len(flash_detections),
-            'total_text_detections': len(all_text_detections)
+            'passed': True,
+            'score': 1.0,
+            'details': "✅ 'Roaring tiger' text found with OCR text detections. Alias name confirmed.",
+            'alias_name_found': True,
+            'alias_name_count': len(alias_name_results),
+            'total_text_detections': len([r for r in self.results if 'Alias Name' in r.rule_name])
         }
-
-    def _is_flash_text_detection(self, r) -> bool:
-        if any(keyword in r.rule_name.lower() for keyword in ['text', 'ocr', '2.5']):
-            return True
-        if r.details and 'detected_text' in r.details:
-            return True
-        if r.details and isinstance(r.details, dict):
-            for key, value in r.details.items():
-                if isinstance(value, str) and any(target in value.lower() for target in ['2.5', 'flash']):
-                    return True
-        return False
-
-    def _find_flash_in_detections(self, detections):
-        flash_found = False
-        flash_detections = []
-        for result in detections:
-            detected_text = self._extract_detected_text(result)
-            if detected_text:
-                flash_patterns = ['2.5 flash', '2.5flash', '2.5_flash', '2.5-flash']
-                if any(pattern in detected_text for pattern in flash_patterns):
-                    flash_found = True
-                    flash_detections.append(result)
-        return flash_found, flash_detections
 
     def _extract_detected_text(self, result):
         if not result.detected or not result.details:
@@ -5261,132 +3890,208 @@ class QualityAssuranceChecker:
             return detected_text.lower().strip()
         return ''
 
-    def _check_eval_mode_predominance(self) -> Dict[str, Any]:
-        """Check if 'Eval Mode: Native Audio Output' appears in any text detection."""
-        all_text_detections = [r for r in self.results if self._is_eval_mode_text_detection(r)]
+    def _check_text_detection(self, filter_keywords, target_keywords, patterns, 
+                             success_message, failure_message, result_key, count_key,
+                             custom_pattern_check=None) -> Dict[str, Any]:
+        """Generic method for checking text detection patterns."""
+        all_text_detections = [r for r in self.results if self._is_text_detection(r, filter_keywords, target_keywords)]
         if not all_text_detections:
             return {
                 'passed': False,
                 'score': 0.0,
                 'details': 'No text detection results found',
-                'eval_mode_found': False
+                result_key: False
             }
-        eval_mode_found, eval_mode_detections = self._find_eval_mode_in_detections(all_text_detections)
-        details = (f"✅ 'Eval Mode: Native Audio Output' found in OCR text ({len(eval_mode_detections)} detections)"
-                   if eval_mode_found else "❌ 'Eval Mode: Native Audio Output' not found in any OCR text detections")
+        
+        found, detections = self._find_patterns_in_detections(all_text_detections, patterns, custom_pattern_check)
+        details = success_message if found else failure_message
+        
         return {
-            'passed': eval_mode_found,
-            'score': 1.0 if eval_mode_found else 0.0,
+            'passed': found,
+            'score': 1.0 if found else 0.0,
             'details': details,
-            'eval_mode_found': eval_mode_found,
-            'eval_mode_count': len(eval_mode_detections),
+            result_key: found,
+            count_key: len(detections),
             'total_text_detections': len(all_text_detections)
         }
 
-    def _is_eval_mode_text_detection(self, r) -> bool:
-        if any(keyword in r.rule_name.lower() for keyword in ['text', 'ocr', 'eval']):
+    def _is_text_detection(self, r, filter_keywords, target_keywords) -> bool:
+        """Generic method to check if a result is a text detection of specific type."""
+        if any(keyword in r.rule_name.lower() for keyword in filter_keywords):
             return True
         if r.details and 'detected_text' in r.details:
             return True
         if r.details and isinstance(r.details, dict):
             for key, value in r.details.items():
-                if isinstance(value, str) and any(target in value.lower() for target in ['eval', 'mode', 'native', 'audio']):
+                if isinstance(value, str) and any(target in value.lower() for target in target_keywords):
                     return True
         return False
 
-    def _find_eval_mode_in_detections(self, detections):
-        eval_mode_found = False
-        eval_mode_detections = []
+    def _find_patterns_in_detections(self, detections, patterns, custom_pattern_check=None):
+        """Generic method to find patterns in detection results."""
+        found = False
+        matching_detections = []
         for result in detections:
             detected_text = self._extract_detected_text(result)
             if detected_text:
-                eval_mode_patterns = ['eval mode', 'native audio', 'eval mode: native audio output']
-                if any(pattern in detected_text for pattern in eval_mode_patterns):
-                    if 'eval mode' in detected_text and 'native audio' in detected_text:
-                        eval_mode_found = True
-                        eval_mode_detections.append(result)
-                    elif 'eval mode: native audio output' in detected_text:
-                        eval_mode_found = True
-                        eval_mode_detections.append(result)
-        return eval_mode_found, eval_mode_detections
+                if custom_pattern_check:
+                    if custom_pattern_check(detected_text, patterns):
+                        found = True
+                        matching_detections.append(result)
+                else:
+                    if any(pattern in detected_text for pattern in patterns):
+                        found = True
+                        matching_detections.append(result)
+        return found, matching_detections
+
+    def _eval_mode_pattern_check(self, detected_text, patterns) -> bool:
+        """Custom pattern check for eval mode that requires both 'eval mode' and 'native audio'."""
+        if any(pattern in detected_text for pattern in patterns):
+            if 'eval mode' in detected_text and 'native audio' in detected_text:
+                return True
+            elif 'eval mode: native audio output' in detected_text:
+                return True
+        return False
+
+    def _check_eval_mode_presence(self) -> Dict[str, Any]:
+        """Check if 'Eval Mode: Native Audio Output' appears in any text detection."""
+        return self._check_text_detection(
+            filter_keywords=['text', 'ocr', 'eval'],
+            target_keywords=['eval', 'mode', 'native', 'audio'],
+            patterns=['eval mode', 'native audio', 'eval mode: native audio output'],
+            success_message="✅ 'Eval Mode: Native Audio Output' mode found with OCR text detections. Correct usage confirmed.",
+            failure_message="❌ 'Eval Mode: Native Audio Output' mode was not found in any OCR text detections. Please ensure to use the correct mode and try again.",
+            result_key='eval_mode_found',
+            count_key='eval_mode_count',
+            custom_pattern_check=self._eval_mode_pattern_check
+        )
 
     def _check_language_fluency(self) -> Dict[str, Any]:
-        """Check if language is fluent for the majority of the duration."""
-        fluency_detections = [r for r in self.results if r.detected and r.rule_name.startswith('Language Detection')]
-        total_audio_segments = len([r for r in self.results if 'Language Detection' in r.rule_name])
-        fluent_count = len(fluency_detections)
-        if total_audio_segments == 0:
+        """Check if language fluency requirements are met in the video."""
+        language_results = [r for r in self.results if 'Language Detection' in r.rule_name]
+        
+        if not language_results:
             return {
                 'passed': False,
                 'score': 0.0,
-                'details': 'No audio analysis performed',
-                'fluent_count': 0,
-                'total_segments': 0,
-                'percentage': 0.0,
-                'avg_fluency_score': 0.0
+                'details': '❌ No language analysis performed',
+                'detected_language': 'unknown',
+                'transcription_preview': ''
             }
-        percentage = (fluent_count / total_audio_segments) * 100
-        threshold = 60.0
-        avg_fluency_score = 0.0
-        fluency_scores = []
-        all_language_results = [r for r in self.results if 'Language Detection' in r.rule_name]
-        for detection in all_language_results:
-            score = None
-            if isinstance(detection.details, dict) and 'details' in detection.details:
-                nested_details = detection.details['details']
-                if isinstance(nested_details, dict) and 'fluency_score' in nested_details:
-                    score = nested_details['fluency_score']
-            if score is None and isinstance(detection.details, dict) and 'fluency_score' in detection.details:
-                score = detection.details['fluency_score']
-            if score is None and detection.detected:
-                score = detection.confidence
-            if score is None:
-                score = 0.0
-            if isinstance(score, (int, float)) and 0.0 <= score <= 1.0:
-                fluency_scores.append(score)
-        if fluency_scores:
-            avg_fluency_score = sum(fluency_scores) / len(fluency_scores)
-        coverage_pass = percentage >= threshold
-        fluency_pass = avg_fluency_score >= 0.6
-        passed = (coverage_pass and avg_fluency_score >= 0.5) or (fluency_pass and percentage >= 50.0)
-        coverage_score = min(percentage / threshold, 1.0)
-        fluency_score_normalized = avg_fluency_score
-        composite_score = (coverage_score * 0.6) + (fluency_score_normalized * 0.4)
+        
+        result = language_results[0]
+        
+        if not isinstance(result.details, dict):
+            return {
+                'passed': False,
+                'score': 0.0,
+                'details': '❌ Invalid language analysis result',
+                'detected_language': 'unknown',
+                'transcription_preview': ''
+            }
+        
+        detected_language = result.details.get('detected_language', 'unknown')
+        transcription = result.details.get('transcription', '')
+        fluency_score = result.details.get('fluency_score', 0.0)
+        total_words = result.details.get('total_words', 0)
+        is_fluent = result.detected
+        
+        if is_fluent:
+            details = "✅ The analysis detected the expected language. Fluency in spoken language has been confirmed."
+        else:
+            details = "❌ The analysis detected incorrect language usage. The fluency in the spoken language is not accurate."
+        
+        if transcription:
+            preview = transcription[:50] + "..." if len(transcription) > 50 else transcription
+        
         return {
-            'passed': passed,
-            'score': composite_score,
-            'details': f"Fluent speech detected in {fluent_count}/{total_audio_segments} segments ({percentage:.1f}%)",
-            'fluent_count': fluent_count,
-            'total_segments': total_audio_segments,
-            'percentage': percentage,
-            'avg_fluency_score': avg_fluency_score,
-            'threshold': threshold
+            'passed': is_fluent,
+            'score': fluency_score,
+            'details': details,
+            'detected_language': detected_language,
+            'total_words': total_words,
+            'transcription_preview': transcription[:100] if transcription else '',
+            'avg_fluency_score': fluency_score
         }
 
     def _check_voice_audibility(self) -> Dict[str, Any]:
         """Check if both user and model voices are audible in the video."""
-        voice_audibility_results = [r for r in self.results if 'Voice Audibility' in r.rule_name]
-        if not voice_audibility_results:
+        voice_results = [r for r in self.results if 'Voice Audibility' in r.rule_name]
+        
+        if not voice_results:
             return {
                 'passed': False,
                 'score': 0.0,
-                'details': 'No voice audibility analysis performed',
+                'details': '❌ No voice audibility analysis performed',
                 'both_voices_audible': False,
-                'confidence': 0.0
+                'issues_detected': ['No voice audibility data available'],
+                'quality_summary': 'Voice audibility analysis not available'
             }
-        best_result = max(voice_audibility_results, key=lambda x: x.confidence)
-        details = best_result.details if best_result.details else {}
+        
+        latest_result = voice_results[-1]
+        details = latest_result.details
+        
+        num_voices = details.get('num_audible_voices', 0)
         both_voices_audible = details.get('both_voices_audible', False)
-        confidence = best_result.confidence
-        passed = both_voices_audible and confidence >= 0.3
+        voice_ratio = details.get('voice_ratio', 0.0)
+        total_voice_duration = details.get('total_voice_duration', 0.0)
+        has_multiple_speakers = details.get('has_multiple_speakers', False)
+        
+        passed = both_voices_audible and num_voices == 2
+        
+        if num_voices == 2:
+            score = 1.0
+        elif num_voices == 1:
+            score = 0.5
+        else:
+            score = 0.0
+        
+        if voice_ratio < 0.1:
+            score *= 0.5
+        
+        issues = []
+        if num_voices == 0:
+            issues.append('No audible voices detected in the audio')
+        elif num_voices == 1:
+            issues.append('Only one voice detected - expected both user and model voices')
+        elif num_voices > 2:
+            issues.append(f'Too many voices detected ({num_voices}) - expected exactly 2')
+        
+        if voice_ratio < 0.1:
+            issues.append(f'Very low voice activity ({voice_ratio:.1%} of audio)')
+        
+        if total_voice_duration < 3.0:
+            issues.append(f'Insufficient voice duration ({total_voice_duration:.1f}s)')
+        
+        if passed:
+            quality_summary = 'Both user and model voices are clearly audible'
+        elif num_voices == 1:
+            quality_summary = 'Only one voice is audible - missing either user or model voice'
+        elif num_voices == 0:
+            quality_summary = 'No voices detected in the audio'
+        else:
+            quality_summary = f'{num_voices} voices detected - audio quality may be compromised'
+        
+        if num_voices == 0:
+            detailed_desc = '❌ No audible voices were detected in the video. Please ensure that both user and model voices are present.'
+        elif num_voices == 1:
+            detailed_desc = '❌ Only one voice was detected; either the user\'s or the model\'s voice is absent in the video. Please ensure that both the user and model voices are clearly audible.'
+        elif num_voices == 2:
+            detailed_desc = '✅ The analysis identified two distinct audible voices in the video. Both user and model voices are present'
+        else:
+            detailed_desc = f'❌ {num_voices} voices detected, which may indicate background noise or more speakers than just the user and model. Please review your video and try again.'
+        
         return {
             'passed': passed,
-            'score': confidence if both_voices_audible else 0.0,
-            'details': f"Both voices audible: {both_voices_audible} (confidence: {confidence:.1%})",
+            'score': score,
+            'details': detailed_desc,
             'both_voices_audible': both_voices_audible,
-            'confidence': confidence,
-            'voice_diversity_score': details.get('voice_diversity_score', 0.0),
-            'audio_duration': details.get('audio_duration', 0.0)
+            'num_voices_detected': num_voices,
+            'voice_ratio': voice_ratio,
+            'total_voice_duration': total_voice_duration,
+            'has_multiple_speakers': has_multiple_speakers,
+            'issues_detected': issues,
+            'quality_summary': quality_summary
         }
 
     def get_qa_summary(self) -> Dict[str, Any]:
@@ -5410,14 +4115,13 @@ class ApplicationRunner:
             StreamlitInterface.setup_page()
             ScreenManager.initialize_session_state()
             
-            # Render sidebar
             ApplicationRunner._render_sidebar()
             
             st.markdown("""
             <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 30px;">
                 <h1 style="color: white; margin: 0; font-size: 2.5rem;">🎥 Gemini Live Video Verifier</h1>
                 <p style="color: white; font-size: 1.1rem; margin: 10px 0 0 0; opacity: 0.9;">
-                    Multi-modal video analysis system for content detection, language fluency, and quality assurance validation
+                    Multi-modal video analysis tool for content detection, language fluency, and quality assurance validation
                 </p>
             </div>
             """, unsafe_allow_html=True)
@@ -5429,7 +4133,6 @@ class ApplicationRunner:
             main_content_area = st.container()
             
             with main_content_area:
-                # Analysis Information section
                 if current_screen == 'input':
                     st.markdown("""
                     <div style="background: linear-gradient(135deg, #e8f4f8 0%, #f0f9ff 100%); padding: 20px; border-radius: 10px; margin-bottom: 20px; border-left: 4px solid #2196F3;">
@@ -5443,31 +4146,26 @@ class ApplicationRunner:
                     
                     with col1:
                         st.markdown("""
-                        **What will be analyzed:**
-                        - **Text Detection**: OCR-based content recognition (2.5 Flash, Eval Mode)
-                        - **Language Fluency**: Multi-language speech verification
-                        - **Voice Audibility**: Detection of multiple distinct voices
-                        - **Quality Assurance**: Automated validation of content requirements
+                        **What will be analyzed from your video:**
+                        - **Text Detection**: Keyword recognition using OCR for "2.5 Flash," "Roaring Tiger," and "Eval Mode: Native Audio Output" to verify proper model and alias usage
+                        - **Language Fluency**: Multi-language speech verification ensures the spoken language matches the expected language, with a minimum fluency score required
+                        - **Voice Audibility**: Detection of multiple distinct voices to confirm both user and model voices are clearly audible
                         """)
                     
                     with col2:
                         st.markdown("""
                         **Process:**
-                        1. Video frames will be processed at the specified interval
-                        2. Audio will be extracted and analyzed for language and voice patterns
-                        3. Text content will be extracted using OCR
-                        4. Results will be compiled and quality-checked
-                        5. Comprehensive report will be generated
+                        1. Input your unique Question ID and Alias Email
+                        2. Upload your video file in MP4 format with a maximum size of 1GB, a minimum duration of 30 seconds, and a portrait mobile resolution
+                        3. The system will automatically analyze the video for text, language, and audio quality
+                        4. View detailed results and quality assurance checks
+                        5. A Google Drive link will be provided for you to submit your video for further processing
+                        6. If any issues are detected, you will be prompted to re-record and upload a new video
                         """)
                     
                     st.divider()
                 
-                resource_manager = get_resource_manager()
-                active_count = resource_manager.get_active_count()
-                
-                if active_count >= Config.MAX_CONCURRENT_ANALYSES:
-                    st.error(f"🚫 System at capacity ({active_count}/{Config.MAX_CONCURRENT_ANALYSES} active analyses). Please try again later.")
-                    return
+                active_count = len(get_session_manager().get_active_sessions())
                 
                 if current_screen == 'input':
                     InputScreen.render()
@@ -5476,7 +4174,7 @@ class ApplicationRunner:
                     AnalysisScreen.render()
                 elif current_screen == 'qa':
                     main_content_area.empty()
-                    QAScreen.render()
+                    VideoSubmissionScreen.render()
                 else:
                     st.error("❌ Invalid screen state. Redirecting to input.")
                     ScreenManager.navigate_to_screen('input')
@@ -5496,7 +4194,11 @@ class ApplicationRunner:
     def _setup_signal_handlers():
         """Setup signal handlers for graceful shutdown."""
         def signal_handler(signum, frame):
-            get_resource_manager().shutdown()
+            try:
+                session_manager = get_session_manager()
+                session_manager.cleanup_old_sessions(max_age_hours=0)
+            except:
+                pass
             sys.exit(0)
         
         try:
@@ -5516,12 +4218,10 @@ class ApplicationRunner:
             </div>
             """, unsafe_allow_html=True)
             
-            # Help section
             ApplicationRunner._render_sidebar_help()
             
             st.divider()
             
-            # Current session information
             ApplicationRunner._render_sidebar_session_info()
     
     @staticmethod
@@ -5532,61 +4232,51 @@ class ApplicationRunner:
             ### 📋 How to Use This Tool
             
             **Step 1: Input Parameters**
-            - Enter a unique **Question ID** for identification
+            - Enter a unique **Question ID** for identification (target language will be automatically inferred)
             - Provide the respective **Alias Email Address** for the Question ID
-            - As a QA, enter your **Invisible Email Address** to assign yourself to the task
-            - **Upload a video file** (supported format: MP4)
-            - Select the **target language** for analysis
-            - Adjust the **frame interval** (time between analyzed frames)
-            
+            - **Upload a video file** (supported format: MP4 up to 1GB, minimum duration 30 seconds, portrait mobile resolution)
+
             **Step 2: Video Analysis**
-            - The system will automatically process your video
-            - **Text detection** will look for specific content ("2.5 Flash", "Eval Mode")
-            - **Audio analysis** will check language fluency and voice audibility
-            - **Screenshots** will be captured at detection points
-            - Progress will be displayed in real-time
-            
-            **Step 3: QA Report**
-            - Review automated **quality assurance checks**
-            - View **detailed detection results** with screenshots
-            - **Export results** to Google Sheets if needed
+            - The system will automatically process your video with progress will be displayed in real-time
+            - **Text detection** will look for specific content ("2.5 Flash", "Roaring Tiger", "Eval Mode: Native Audio Output") using OCR techniques to verify correct model and alias usage
+            - **Audio analysis** will check language fluency and voice audibility to ensure both user and model voices are clearly heard and the spoken language matches the expected language
+            - Review the **detailed analysis results** with screenshots and audio summaries
+            - If any issues are detected, detailed feedback will be provided to help you understand and you will be prompted to re-record and upload a new video
+
+            **Step 3: Submit Video**
+            - Once all quality checks are passed, a **Google Drive link** will be provided for you to submit your video for further processing
             
             ### 🎯 What Gets Analyzed
             
             **Text Detection:**
-            - "2.5 Flash" text recognition
-            - "Eval Mode: Native Audio Output" detection
-            - OCR accuracy validation
+            - "2.5 Flash" text recognition to verify correct model usage and avoid "2.5 Pro" misuse
+            - "Roaring Tiger" alias name recognition to confirm correct alias usage
+            - "Eval Mode: Native Audio Output" detection to ensure proper eval mode
             
             **Audio Analysis:**
-            - Language detection and fluency scoring
-            - Voice audibility (user and model voices)
-            - Speech quality assessment
-            
+            - Language detection and fluency scoring (based on expected language)
+            - Voice audibility checks to confirm both user and model voices are clearly audible
+
             **Quality Assurance:**
-            - Flash text predominance check
-            - Eval mode text validation
+            - Flash text presence check
+            - Alias name presence check
+            - Eval mode presence check
             - Language fluency verification
             - Voice audibility confirmation
             
             ### 📊 Understanding Results
             
-            **Confidence Levels:**
-            - 🟢 High (90%+): Very reliable detection
-            - 🟡 Good (70-89%): Reliable detection
-            - 🟠 Fair (50-69%): Moderate confidence
-            - 🔴 Low (<50%): Uncertain detection
-            
             **QA Status:**
-            - ✅ **PASS**: All quality checks successful
-            - ❌ **FAIL**: Some quality checks failed
+            - ✅ **PASS**: All quality checks successful. You can proceed to submit your video.
+            - ❌ **FAIL**: Some quality checks failed. Review the feedback and re-record if necessary.
             
             ### 💡 Tips for Best Results
             
+            - Follow the **model and alias usage guidelines**
             - Use **high-quality video files** (good resolution, clear audio)
             - Ensure **proper lighting** for text detection
-            - Choose the **correct target language** for analysis
-            - Use **shorter frame intervals** for more accurate analysis
+            - Speak clearly in the **expected language**
+            - Minimize **background noise** for better voice audibility
             - Verify all **input parameters** before starting analysis
             """)
     
@@ -5595,7 +4285,6 @@ class ApplicationRunner:
         """Render current session information in sidebar."""
         current_screen = ScreenManager.get_current_screen()
         
-        # Only show session information if we have actual session data
         has_session_data = (
             hasattr(st.session_state, 'question_id') and 
             st.session_state.question_id and
@@ -5607,38 +4296,30 @@ class ApplicationRunner:
         if has_session_data:
             st.markdown("### 📋 Current Session")
             
-            # Show filled information from step 1
             session_info = ApplicationRunner._get_session_display_info()
             
-            # Build the session info HTML
             session_html = f"""
             <div style="background: linear-gradient(135deg, #e8f5e8 0%, #f0f8f0 100%); padding: 15px; border-radius: 8px; border-left: 4px solid #4CAF50; margin-bottom: 15px;">
                 <h4 style="margin: 0 0 10px 0; color: #2e7d32;">Session ID: <code style="background: #e0e0e0; padding: 2px 4px; border-radius: 3px; font-size: 0.7em;">{session_info['session_id']}</code></h4>
                 <p style="margin: 5px 0; color: #333;"><strong>Question ID:</strong><br>{session_info['question_id']}</p>"""
             
-            if session_info.get('assigned_qa'):
-                session_html += f"""<p style="margin: 5px 0; color: #333;"><strong>Assigned QA:</strong><br>{session_info['assigned_qa']}</p>"""
-            
             session_html += f"""
                 <p style="margin: 5px 0; color: #333;"><strong>Email:</strong><br>{session_info['email']}</p>
                 <p style="margin: 5px 0; color: #333;"><strong>Video File:</strong><br>{session_info['video_file']}</p>
-                <p style="margin: 5px 0; color: #333;"><strong>Language:</strong><br>{session_info['language']}</p>
-                <p style="margin: 5px 0; color: #333;"><strong>Frame Interval:</strong><br>{session_info['frame_interval']}</p>
-            </div>
-            """
+                <p style="margin: 5px 0; color: #333;"><strong>Language:</strong><br>{session_info['language']}</p>"""
+            
+            session_html += "</div>"
             
             st.markdown(session_html, unsafe_allow_html=True)
             
-            # Show analysis status if applicable
             if current_screen in ['analysis', 'qa']:
                 ApplicationRunner._render_sidebar_analysis_status()
     
     @staticmethod
     def _get_session_display_info():
         """Get formatted session information for display."""
-        # Language display
         language_code = st.session_state.get('selected_language', 'en-US')
-        language_display = ApplicationRunner._get_language_display(language_code)
+        language_display = Config.get_language_display_name(language_code)
         
         session_info = {
             'question_id': st.session_state.get('question_id', 'Not specified'),
@@ -5649,49 +4330,131 @@ class ApplicationRunner:
             'session_id': st.session_state.get('session_id', 'Unknown')[:12] + '...' if st.session_state.get('session_id') else 'Unknown'
         }
         
-        # Add assigned QA
-        if st.session_state.get('assigned_qa'):
-            session_info['assigned_qa'] = st.session_state.assigned_qa
+        video_validation = st.session_state.get('video_validation', {})
+        if video_validation and 'duration' in video_validation:
+            session_info['video_properties'] = {
+                'duration': f"{video_validation.get('duration', 0):.1f}s",
+                'resolution': f"{video_validation.get('width', 0)}x{video_validation.get('height', 0)}",
+                'audio_properties': video_validation.get('audio_properties', {})
+            }
         
         return session_info
-    
-    @staticmethod
-    def _get_language_display(language_code: str) -> str:
-        """Get language display name without flags, using locale codes."""
-        return Config.get_language_display_name(language_code)
     
     @staticmethod
     def _render_sidebar_analysis_status():
         """Render analysis status information in sidebar."""
         if st.session_state.get('analysis_results'):
-            # Analysis completed
-            results_count = len(st.session_state.analysis_results)
-            positive_detections = sum(1 for r in st.session_state.analysis_results if r.detected)
+            results = st.session_state.analysis_results
+            results_count = len(results)
+            positive_detections = sum(1 for r in results if r.detected)
             
-            st.markdown(f"""
-            <div style="background: linear-gradient(135deg, #e3f2fd 0%, #f0f8ff 100%); padding: 15px; border-radius: 8px; border-left: 4px solid #2196F3; margin-bottom: 15px;">
-                <h4 style="margin: 0 0 10px 0; color: #1565C0;">📊 Analysis Status</h4>
-                <p style="margin: 5px 0; color: #333;"><strong>Status:</strong> ✅ Completed</p>
-                <p style="margin: 5px 0; color: #333;"><strong>Total Detections:</strong> {results_count}</p>
-                <p style="margin: 5px 0; color: #333;"><strong>Positive Detections:</strong> {positive_detections}</p>
-                <p style="margin: 5px 0; color: #333;"><strong>Detection Rate:</strong> {(positive_detections/results_count*100) if results_count > 0 else 0:.1f}%</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Show QA status
+            qa_color = "#2196F3"
+            qa_status = "✅ Completed"
             if st.session_state.get('qa_checker'):
                 qa_summary = st.session_state.qa_checker.get_qa_summary()
-                qa_status = "✅ PASS" if qa_summary['passed'] else "❌ FAIL"
-                qa_color = "#4CAF50" if qa_summary['passed'] else "#f44336"
+                if qa_summary['passed']:
+                    qa_color = "#4CAF50"
+                    qa_status = "✅ PASS"
+                else:
+                    qa_color = "#f44336"
+                    qa_status = "❌ FAIL"
+            
+            text_results = [r for r in results if 'Text Detection' in r.rule_name]
+            language_results = [r for r in results if 'Language Detection' in r.rule_name]
+            voice_results = [r for r in results if 'Voice Audibility' in r.rule_name]
+            
+            analysis_details = []
+            
+            flash_results = [r for r in text_results if '2.5 Flash' in r.rule_name]
+            alias_results = [r for r in text_results if 'Alias Name' in r.rule_name]
+            eval_results = [r for r in text_results if 'Eval Mode' in r.rule_name]
+            
+            if flash_results:
+                flash_detected = any(r.detected for r in flash_results)
+                flash_qa_info = ApplicationRunner._get_qa_info_for_rule_type('flash_presence')
+                flash_status = "✅" if flash_qa_info and flash_qa_info.get('passed', False) else "❌"
                 
-                st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #fff3e0 0%, #fafafa 100%); padding: 15px; border-radius: 8px; border-left: 4px solid {qa_color}; margin-bottom: 15px;">
-                    <h4 style="margin: 0 0 10px 0; color: {qa_color};">🛡️ Quality Assurance</h4>
-                    <p style="margin: 5px 0; color: #333;"><strong>QA Status:</strong> {qa_status}</p>
-                    <p style="margin: 5px 0; color: #333;"><strong>Score:</strong> {qa_summary['score']:.1%}</p>
-                    <p style="margin: 5px 0; color: #333;"><strong>Checks Passed:</strong> {qa_summary['checks_passed']}/{qa_summary['total_checks']}</p>
-                </div>
-                """, unsafe_allow_html=True)
+                if flash_detected:
+                    status_text = "Detected"
+                elif flash_qa_info and flash_qa_info.get('validation_status') == 'incorrect_model':
+                    status_text = "Incorrect Model"
+                else:
+                    status_text = "Not Found"
+                
+                analysis_details.append(f"<p style=\"margin: 5px 0; color: #333;\"><strong>2.5 Flash:</strong><br>{flash_status} {status_text}</p>")
+            
+            if alias_results:
+                alias_detected = any(r.detected for r in alias_results)
+                alias_qa_info = ApplicationRunner._get_qa_info_for_rule_type('alias_name_presence')
+                alias_status = "✅" if alias_qa_info and alias_qa_info.get('passed', False) else "❌"
+                analysis_details.append(f"<p style=\"margin: 5px 0; color: #333;\"><strong>Alias Name:</strong><br>{alias_status} {'Detected' if alias_detected else 'Not Found'}</p>")
+            
+            if eval_results:
+                eval_detected = any(r.detected for r in eval_results)
+                eval_qa_info = ApplicationRunner._get_qa_info_for_rule_type('eval_mode_presence')
+                eval_status = "✅" if eval_qa_info and eval_qa_info.get('passed', False) else "❌"
+                analysis_details.append(f"<p style=\"margin: 5px 0; color: #333;\"><strong>Eval Mode:</strong><br>{eval_status} {'Detected' if eval_detected else 'Not Found'}</p>")
+            
+            if language_results:
+                language_result = language_results[0]
+                language_qa_info = ApplicationRunner._get_qa_info_for_rule_type('language_fluency')
+                language_status = "✅" if language_qa_info and language_qa_info.get('passed', False) else "❌"
+                
+                if language_result.details and 'analysis_failed_reason' in language_result.details:
+                    analysis_details.append(f"<p style=\"margin: 5px 0; color: #333;\"><strong>Language Fluency:</strong><br>{language_status} No Voices Detected</p>")
+                else:
+                    detected_lang = language_result.details.get('detected_language', 'unknown') if language_result.details else 'unknown'
+                    target_lang = language_result.details.get('target_language', 'unknown') if language_result.details else 'unknown'
+                    if detected_lang != 'unknown':
+                        locale_format = Config.whisper_language_to_locale(detected_lang, target_lang)
+                        display_name = Config.get_language_display_name(locale_format)
+
+                        if display_name is None:
+                            display_name = detected_lang if detected_lang else "Unknown"
+                        analysis_details.append(f"<p style=\"margin: 5px 0; color: #333;\"><strong>Language Fluency:</strong><br>{language_status} {display_name}</p>")
+                    else:
+                        analysis_details.append(f"<p style=\"margin: 5px 0; color: #333;\"><strong>Language Fluency:</strong><br>{language_status} Unknown</p>")
+            
+            if voice_results:
+                voice_result = voice_results[0]
+                voice_qa_info = ApplicationRunner._get_qa_info_for_rule_type('voice_audibility')
+                voice_status = "✅" if voice_qa_info and voice_qa_info.get('passed', False) else "❌"
+                
+                if voice_result.details:
+                    num_voices = voice_result.details.get('num_audible_voices', 0)
+                    analysis_details.append(f"<p style=\"margin: 5px 0; color: #333;\"><strong>Voice Audibility:</strong><br>{voice_status} {num_voices} Voice{'s' if num_voices != 1 else ''}</p>")
+                else:
+                    analysis_details.append(f"<p style=\"margin: 5px 0; color: #333;\"><strong>Voice Audibility:</strong><br>{voice_status} Unknown</p>")
+            
+            details_html = "".join(analysis_details) if analysis_details else "<p style=\"margin: 5px 0; color: #333;\">No detailed analysis available</p>"
+            
+            if qa_status == "✅ PASS":
+                bg_gradient = "linear-gradient(135deg, #e8f5e8 0%, #f0f8f0 100%)"
+                header_color = "#2e7d32"
+            elif qa_status == "❌ FAIL":
+                bg_gradient = "linear-gradient(135deg, #ffebee 0%, #fce4ec 100%)"
+                header_color = "#c62828"
+            else:
+                bg_gradient = "linear-gradient(135deg, #e3f2fd 0%, #f0f8ff 100%)"
+                header_color = "#1565C0"
+            
+            st.markdown("### 📊 Analysis Report")
+            
+            st.markdown(f"""
+            <div style="background: {bg_gradient}; padding: 15px; border-radius: 8px; border-left: 4px solid {qa_color}; margin-bottom: 15px;">
+                <h4 style="margin: 0 0 10px 0; color: {header_color};">Overall Status: {qa_status}</h4>
+                {details_html}
+            </div>
+            """, unsafe_allow_html=True)
+    
+    @staticmethod
+    def _get_qa_info_for_rule_type(rule_type: str):
+        """Get QA information for a specific rule type."""
+        if not st.session_state.get('qa_checker'):
+            return None
+        
+        qa_results = st.session_state.qa_checker.get_detailed_results()
+        return qa_results.get(rule_type)
 
 
 if __name__ == "__main__":
@@ -5704,6 +4467,7 @@ if __name__ == "__main__":
         raise
     finally:
         try:
-            get_resource_manager().shutdown()
+            session_manager = get_session_manager()
+            session_manager.cleanup_old_sessions(max_age_hours=0)
         except:
             pass
