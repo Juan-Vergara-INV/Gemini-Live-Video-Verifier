@@ -29,6 +29,14 @@ import numpy as np
 import pytesseract
 import streamlit as st
 
+# Load environment variables from .env file if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # dotenv not installed, skip loading .env file
+    pass
+
 import librosa
 import speech_recognition as sr
 from pydub import AudioSegment
@@ -1374,6 +1382,7 @@ class GoogleDriveIntegration:
             scopes = ['https://www.googleapis.com/auth/drive']
             credentials = None
             
+            # Option 1: Use credentials from Streamlit secrets (recommended for production)
             try:
                 service_account_info = ConfigurationManager.get_google_service_account_info()
                 if service_account_info:
@@ -1381,6 +1390,20 @@ class GoogleDriveIntegration:
                     logger.info("Using Google service account credentials from Streamlit secrets")
             except Exception as e:
                 logger.warning(f"Could not load credentials from secrets: {e}")
+            
+            # Option 2: Fall back to environment variables
+            if not credentials:
+                credentials_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+                if credentials_json:
+                    credentials_info = json.loads(credentials_json)
+                    credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
+                    logger.info("Using Google service account credentials from environment variable JSON")
+                else:
+                    # Option 3: Use credentials file path from environment variable
+                    credentials_path = os.getenv('GOOGLE_SERVICE_ACCOUNT_PATH')
+                    if credentials_path and os.path.exists(credentials_path):
+                        credentials = Credentials.from_service_account_file(credentials_path, scopes=scopes)
+                        logger.info("Using Google service account credentials from file path")
             
             if not credentials:
                 logger.error("No Google credentials found. Please configure credentials in Streamlit secrets or set environment variables")
@@ -1673,21 +1696,40 @@ class TextMatcher:
     }
     
     OCR_CORRECTIONS: Dict[str, str] = {
+        # Common 2.5 Flash variations
         '2s flash': '2.5 flash', '2.s flash': '2.5 flash', '2,5 flash': '2.5 flash',
-        '25 flash': '2.5 flash',
+        '25 flash': '2.5 flash', '2. 5 flash': '2.5 flash', '2 .5 flash': '2.5 flash',
+        '2 5 flash': '2.5 flash', '2-5 flash': '2.5 flash', 'z.5 flash': '2.5 flash',
+        'z5 flash': '2.5 flash', '2§ flash': '2.5 flash',
+        
+        # Common 2.5 Pro variations  
         '2s pro': '2.5 pro', '2.s pro': '2.5 pro', '2,5 pro': '2.5 pro',
-        '25 pro': '2.5 pro',
-        'fiash': 'flash', 'flasb': 'flash', 'fash': 'flash',
-        'flashy': 'flash', 'flast': 'flash', 'flach': 'flash',
-        'pno': 'pro', 'prn': 'pro', 'pro.': 'pro',
-        'evai mode': 'eval mode', 'eval rode': 'eval mode',
+        '25 pro': '2.5 pro', '2. 5 pro': '2.5 pro', '2 .5 pro': '2.5 pro',
+        '2 5 pro': '2.5 pro', '2-5 pro': '2.5 pro', 'z.5 pro': '2.5 pro',
+        'z5 pro': '2.5 pro', '2§ pro': '2.5 pro',
+        
+        # Flash word variations
+        'fiash': 'flash', 'flasb': 'flash', 'fash': 'flash', 'f1ash': 'flash',
+        'flashy': 'flash', 'flast': 'flash', 'flach': 'flash', 'f|ash': 'flash',
+        
+        # Pro word variations
+        'pno': 'pro', 'prn': 'pro', 'pro.': 'pro', 'p1o': 'pro',
+        'prö': 'pro', 'pr0': 'pro',
+        
+        # Eval mode variations
+        'evai mode': 'eval mode', 'eval rode': 'eval mode', 'eva1 mode': 'eval mode',
+        'eval mod3': 'eval mode', 'eval m0de': 'eval mode',
         'native audio output': 'native audio output',
+        
+        # Alias name variations
         'roannng tiger': 'roaring tiger', 'roaring tiqer': 'roaring tiger', 'roaring tigee': 'roaring tiger',
         'roaring tger': 'roaring tiger', 'roaring ticer': 'roaring tiger', 'roanng tiger': 'roaring tiger',
         'roarmg tiger': 'roaring tiger', 'roarrng tiger': 'roaring tiger', 'roarirg tiger': 'roaring tiger',
         'roaring.tiger': 'roaring tiger', 'roaring . tiger': 'roaring tiger', 'roaring. tiger': 'roaring tiger',
         'roaring .tiger': 'roaring tiger', 'roaring..tiger': 'roaring tiger',
-        'rn': 'm', 'vv': 'w', '1': 'l'
+        
+        # Common OCR character substitutions
+        'rn': 'm', 'vv': 'w', '1': 'l', '0': 'o'
     }
 
     @staticmethod
@@ -1748,6 +1790,25 @@ class TextMatcher:
         if expected_lower == "roaring tiger":
             if cls._match_roaring_tiger_variants(detected_lower):
                 return True, 'roaring_tiger_variant_match'
+        
+        # Enhanced patterns for 2.5 Flash and 2.5 Pro to handle OCR variations
+        if expected_lower in ["2.5 flash", "2.5 pro"]:
+            import re
+            # Look for variations of "2.5" followed by "flash" or "pro"
+            if expected_lower == "2.5 flash":
+                patterns = [
+                    r'\b(?:2\.?5|25|z\.?5)\s*f[il1\|]?a?s?h?\b',
+                    r'\b(?:2\.?5|25|z\.?5)\s*flash\b'
+                ]
+            else:  # 2.5 pro
+                patterns = [
+                    r'\b(?:2\.?5|25|z\.?5)\s*p[r1]?[o0]?\b',
+                    r'\b(?:2\.?5|25|z\.?5)\s*pro\b'
+                ]
+                
+            for pattern in patterns:
+                if re.search(pattern, detected_lower):
+                    return True, 'enhanced_ocr_pattern_match'
         
         # Strategy 1: Exact phrase match (word boundaries respected)
         if cls._exact_phrase_match(detected_lower, expected_lower):
@@ -3409,18 +3470,61 @@ class VideoContentAnalyzer:
         return roi if roi.size > 0 else None, (x1, y1)
     
     def _process_ocr_pipeline(self, roi: np.ndarray, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """Process OCR pipeline: preprocessing + OCR."""
+        """Process OCR pipeline with enhanced preprocessing for production stability."""
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        preprocess_config = params.get('preprocess', {})
-        if preprocess_config.get('denoise', Config.OCR_DENOISING_ENABLED):
-            gray = cv2.fastNlMeansDenoising(gray)
-        if preprocess_config.get('threshold', Config.OCR_THRESHOLD_ENABLED):
-            gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        # Multi-pass OCR approach for better accuracy across different CPU architectures
+        best_text = ""
+        best_boxes = None
         
-        text = pytesseract.image_to_string(gray, config=Config.OCR_CONFIG).strip()
-        boxes = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=Config.OCR_CONFIG)
-        return text, boxes
+        preprocess_config = params.get('preprocess', {})
+        
+        # Pass 1: Standard preprocessing 
+        processed_gray = gray.copy()
+        if preprocess_config.get('denoise', Config.OCR_DENOISING_ENABLED):
+            processed_gray = cv2.fastNlMeansDenoising(processed_gray)
+        if preprocess_config.get('threshold', Config.OCR_THRESHOLD_ENABLED):
+            processed_gray = cv2.threshold(processed_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        
+        text1 = pytesseract.image_to_string(processed_gray, config=Config.OCR_CONFIG).strip()
+        boxes1 = pytesseract.image_to_data(processed_gray, output_type=pytesseract.Output.DICT, config=Config.OCR_CONFIG)
+        
+        # Pass 2: Enhanced preprocessing for production environments
+        enhanced_gray = gray.copy()
+        # Apply contrast enhancement for better text recognition
+        enhanced_gray = cv2.convertScaleAbs(enhanced_gray, alpha=1.2, beta=10)
+        # Apply morphological operations to clean up text
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+        enhanced_gray = cv2.morphologyEx(enhanced_gray, cv2.MORPH_CLOSE, kernel)
+        # Apply bilateral filter for noise reduction while preserving edges
+        enhanced_gray = cv2.bilateralFilter(enhanced_gray, 9, 75, 75)
+        # Apply threshold
+        _, enhanced_gray = cv2.threshold(enhanced_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        text2 = pytesseract.image_to_string(enhanced_gray, config=Config.OCR_CONFIG).strip()
+        boxes2 = pytesseract.image_to_data(enhanced_gray, output_type=pytesseract.Output.DICT, config=Config.OCR_CONFIG)
+        
+        # Choose best result based on text length and expected patterns
+        expected_text = params.get('expected_text', '')
+        if expected_text:
+            # Check which result has better match for expected text
+            match1, _ = TextMatcher.match_text(text1, expected_text, enable_fuzzy=False)
+            match2, _ = TextMatcher.match_text(text2, expected_text, enable_fuzzy=False)
+            
+            if match2 and not match1:
+                best_text, best_boxes = text2, boxes2
+            elif match1 and not match2:
+                best_text, best_boxes = text1, boxes1
+            elif len(text2) > len(text1):
+                best_text, best_boxes = text2, boxes2
+            else:
+                best_text, best_boxes = text1, boxes1
+        else:
+            # Use result with more text content
+            best_text = text2 if len(text2) > len(text1) else text1
+            best_boxes = boxes2 if len(text2) > len(text1) else boxes1
+        
+        return best_text, best_boxes
     
     def _analyze_ocr_results(self, text: str, boxes: Dict[str, Any], params: Dict[str, Any], 
                             roi_offset: Tuple[int, int]) -> Tuple[bool, Optional[List[int]], str]:
@@ -3449,11 +3553,38 @@ class VideoContentAnalyzer:
     
     def _analyze_flash_pro_detection(self, text: str, boxes: Dict[str, Any], 
                                    roi_offset: Tuple[int, int]) -> Tuple[bool, Optional[List[int]], str]:
-        """Special analysis for Flash/Pro detection."""
+        """Special analysis for Flash/Pro detection with enhanced matching for production stability."""
+        # Primary detection with exact matching
         flash_detected, flash_method = TextMatcher.match_text(text, TargetTexts.FLASH_TEXT)
-        
         pro_detected, pro_method = TextMatcher.match_text(text, TargetTexts.PRO_TEXT)
         
+        # Enhanced detection for production environments with weaker OCR
+        if not flash_detected and not pro_detected:
+            # Check for partial matches that might indicate presence but poor OCR quality
+            text_lower = text.lower()
+            
+            # Look for "2.5" + any word that could be "flash" or "pro"
+            import re
+            pattern_25_flash = r'\b(?:2\.?5|25|z\.?5)\s*(?:f[il1\|]?a?s?h?|flash)\b'
+            pattern_25_pro = r'\b(?:2\.?5|25|z\.?5)\s*(?:p[r1]?[o0]?|pro)\b'
+            
+            if re.search(pattern_25_flash, text_lower):
+                # Found potential 2.5 Flash with OCR errors
+                text_bounding_box = self._find_text_bounding_box("2.5", boxes) or self._find_text_bounding_box("25", boxes)
+                if text_bounding_box and roi_offset != (0, 0):
+                    text_bounding_box[0] += roi_offset[0]
+                    text_bounding_box[1] += roi_offset[1]
+                return True, text_bounding_box, f'flash_corrected_ocr_pattern'
+                
+            elif re.search(pattern_25_pro, text_lower):
+                # Found potential 2.5 Pro with OCR errors
+                text_bounding_box = self._find_text_bounding_box("2.5", boxes) or self._find_text_bounding_box("25", boxes)
+                if text_bounding_box and roi_offset != (0, 0):
+                    text_bounding_box[0] += roi_offset[0]
+                    text_bounding_box[1] += roi_offset[1]
+                return False, text_bounding_box, f'pro_corrected_ocr_pattern'
+        
+        # Original detection logic
         if flash_detected:
             text_bounding_box = self._find_text_bounding_box(TargetTexts.FLASH_TEXT, boxes)
             if text_bounding_box and roi_offset != (0, 0):
