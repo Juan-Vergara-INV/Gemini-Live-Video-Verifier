@@ -1,8 +1,8 @@
 """
-Gemini Live Video Analysis System for Multi-Modal Content Detection.
+Gemini Live Video Verifier Tool for Multi-Modal Content Detection.
 
-A video analysis system that provides text recognition, language fluency analysis, and speaker diarization.
-The system includes quality assurance validation and a multi-screen Streamlit interface.
+A video analysis tool that provides text recognition, language fluency analysis, and speaker diarization.
+The tool includes quality assurance validation and a multi-screen Streamlit interface.
 """
 
 import gc
@@ -35,6 +35,9 @@ from pydub import AudioSegment
 import whisper
 from scipy.ndimage import median_filter
 
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+
 
 class Config:
     """Centralized application configuration constants."""
@@ -43,7 +46,7 @@ class Config:
     DEFAULT_FRAME_INTERVAL: float = 10.0
     
     # OCR configuration
-    OCR_CONFIG: str = '--psm 6'
+    OCR_CONFIG: str = '--psm 3 --oem 1'
     OCR_DENOISING_ENABLED: bool = True
     OCR_THRESHOLD_ENABLED: bool = True
     
@@ -58,7 +61,7 @@ class Config:
     # Resource limits
     MAX_FILE_SIZE: int = 1024 * 1024 * 1024 # 1GB
     MAX_VIDEO_DURATION: int = 600  # 10 minutes
-    MIN_VIDEO_DURATION: int = 30   # 30 seconds minimum
+    MIN_VIDEO_DURATION: int = 30   # 30 seconds
     
     # Color definitions for UI annotations and bounding boxes
     ANNOTATION_COLORS: Dict[str, Tuple[int, int, int]] = {
@@ -121,7 +124,7 @@ class Config:
     
     @classmethod
     def validate_video_properties(cls, video_path: str) -> Dict[str, Any]:
-        """Validate and extract video properties including duration, resolution,and audio properties."""
+        """Validate and extract basic video properties including duration and resolution."""
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
@@ -135,25 +138,6 @@ class Config:
             
             cap.release()
             
-            audio_properties = {}
-            try:
-                from pydub import AudioSegment
-                audio = AudioSegment.from_file(video_path)
-                audio_properties = {
-                    'sample_rate': audio.frame_rate,
-                    'channels': audio.channels,
-                    'bit_depth': audio.sample_width * 8,
-                    'bit_rate': int(audio.frame_rate * audio.channels * audio.sample_width * 8)
-                }
-            except Exception as e:
-                logger.warning(f"Could not extract audio properties: {e}")
-                audio_properties = {
-                    'sample_rate': 'Unknown',
-                    'channels': 'Unknown', 
-                    'bit_depth': 'Unknown',
-                    'bit_rate': 'Unknown'
-                }
-            
             validation_results = {
                 'duration_valid': duration >= cls.MIN_VIDEO_DURATION,
                 'resolution_valid': cls.is_portrait_mobile_resolution(width, height),
@@ -162,7 +146,6 @@ class Config:
                 'height': height,
                 'fps': fps,
                 'total_frames': total_frames,
-                'audio_properties': audio_properties,
                 'min_duration_required': cls.MIN_VIDEO_DURATION
             }
             
@@ -468,35 +451,28 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Session cleanup error for {session_id}: {e}")
     
-    def cleanup_old_sessions(self, max_age_hours: int = 24) -> None:
-        """Clean up sessions older than specified age."""
+    def cleanup_old_sessions(self) -> None:
+        """Clean up sessions older than 20 minutes."""
         current_time = time.time()
-        max_age_seconds = max_age_hours * 3600
-        
+        max_age_seconds = 20 * 60  # 20 minutes
         try:
             for session_dir in self._session_base_dir.iterdir():
                 if not session_dir.is_dir():
                     continue
-                
                 try:
                     dir_mtime = session_dir.stat().st_mtime
                     if current_time - dir_mtime > max_age_seconds:
                         session_id = session_dir.name
-                        
                         try:
-                            import streamlit as st
                             if (hasattr(st, 'session_state') and 
                                 hasattr(st.session_state, 'session_id') and
                                 st.session_state.session_id == session_id):
                                 continue
                         except:
                             pass
-                        
                         self.cleanup_session(session_id)
-                        
                 except Exception as e:
                     logger.error(f"Error checking session {session_dir.name}: {e}")
-                    
         except Exception as e:
             logger.error(f"Old sessions cleanup error: {e}")
     
@@ -784,7 +760,6 @@ class InputScreen:
                     st.session_state.analysis_started = False
                     st.session_state.validation_error_shown = True
                     st.error(f"❌ **Authorization Failed**: {auth_message}")
-                    import time
                     time.sleep(3)
                     st.rerun()
                     return
@@ -870,35 +845,31 @@ class InputScreen:
     def _render_video_validation_and_properties(video_file):
         """Render video validation results and properties display."""
         try:
-            if (hasattr(st.session_state, 'cached_video_file_name') and 
-                st.session_state.cached_video_file_name == video_file.name and
-                hasattr(st.session_state, 'cached_temp_path') and
-                hasattr(st.session_state, 'video_validation') and
-                os.path.exists(st.session_state.cached_temp_path)):
-                
-                validation_results = st.session_state.video_validation
-            else:
-                session_id = st.session_state.get('session_id', 'temp')
-                temp_path, _ = StreamlitInterface.create_temp_video(video_file, session_id)
-                
-                if not temp_path:
-                    return
-                    
-                validation_results = Config.validate_video_properties(temp_path)
-                
-                if 'error' in validation_results:
-                    try:
-                        if os.path.exists(temp_path):
-                            os.unlink(temp_path)
-                    except:
-                        pass
-                    st.error(f"❌ Video validation failed: {validation_results['error']}")
-                    return
-                
-                st.session_state.cached_temp_path = temp_path
-                st.session_state.cached_video_file_name = video_file.name
-                st.session_state.video_validation = validation_results
+            # Extract video duration and resolution on upload
+            session_id = st.session_state.get('session_id', 'temp')
+            temp_path, _ = StreamlitInterface.create_temp_video(video_file, session_id)
             
+            if not temp_path:
+                st.error("❌ Could not process video file")
+                return
+            
+            validation_results = Config.validate_video_properties(temp_path)
+            
+            if 'error' in validation_results:
+                try:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                except:
+                    pass
+                st.error(f"❌ Video validation failed: {validation_results['error']}")
+                return
+            
+            # Store validation results in session state
+            st.session_state.cached_temp_path = temp_path
+            st.session_state.cached_video_file_name = video_file.name
+            st.session_state.video_validation = validation_results
+            
+            # Display validation results
             col1, col2 = st.columns(2)
             
             with col1:
@@ -949,6 +920,8 @@ class AnalysisScreen:
         overall_progress = st.progress(0, text="Initializing analysis...")
         try:
             session_id = st.session_state.session_id
+            
+            # Use the already created temp video from validation step
             if (hasattr(st.session_state, 'cached_temp_path') and
                 hasattr(st.session_state, 'cached_video_file_name') and
                 st.session_state.cached_video_file_name == st.session_state.video_file.name and
@@ -956,8 +929,9 @@ class AnalysisScreen:
                 
                 video_path = st.session_state.cached_temp_path
                 temp_files = [video_path]
-                overall_progress.progress(10, text="Using cached video, initializing analyzer...")
+                overall_progress.progress(10, text="Using validated video file, initializing analyzer...")
             else:
+                # Fallback: create temp video if not already cached
                 video_path, temp_files = StreamlitInterface.create_temp_video(
                     st.session_state.video_file, session_id
                 )
@@ -1034,6 +1008,11 @@ class AnalysisScreen:
         """Render completed analysis results."""
         st.subheader("📊 Analysis Reports")
         results = st.session_state.analysis_results
+        
+        # Display total analysis time
+        total_analysis_time = AnalysisScreen._get_total_analysis_time()
+        if total_analysis_time > 0:
+            st.info(f"⏱️ **Total Analysis Time:** {total_analysis_time:.2f} seconds")
         
         if st.session_state.qa_checker:
             overall = st.session_state.qa_checker.get_qa_summary()
@@ -1190,7 +1169,7 @@ class AnalysisScreen:
         
         try:
             session_manager = get_session_manager()
-            session_manager.cleanup_old_sessions(max_age_hours=1)
+            session_manager.cleanup_old_sessions()
         except Exception as e:
             logger.debug(f"Error cleaning old sessions: {e}")
         
@@ -1201,6 +1180,18 @@ class AnalysisScreen:
         except:
             pass
         ScreenManager.reset_session_for_new_analysis()
+
+    @staticmethod
+    def _get_total_analysis_time() -> float:
+        """Get the total analysis time from the analyzer instance."""
+        try:
+            analyzer = st.session_state.get('analyzer_instance')
+            if analyzer and hasattr(analyzer, 'performance_metrics'):
+                return analyzer.performance_metrics.get('total_analysis_time', 0.0)
+            return 0.0
+        except Exception as e:
+            logger.debug(f"Could not retrieve total analysis time: {e}")
+            return 0.0
 
     @staticmethod
     def _get_qa_info_for_result(result):
@@ -1366,11 +1357,6 @@ class GoogleDriveIntegration:
     def _initialize_service(self):
         """Initialize Google Drive service using service account."""
         try:
-            import os
-            import json
-            from googleapiclient.discovery import build
-            from google.oauth2.service_account import Credentials
-            
             scopes = ['https://www.googleapis.com/auth/drive']
             credentials = None
             
@@ -1601,7 +1587,7 @@ class VideoSubmissionScreen:
         
         try:
             session_manager = get_session_manager()
-            session_manager.cleanup_old_sessions(max_age_hours=1)
+            session_manager.cleanup_old_sessions()
         except Exception as e:
             logger.debug(f"Error cleaning old sessions: {e}")
         
@@ -4239,7 +4225,7 @@ class ApplicationRunner:
         def signal_handler(signum, frame):
             try:
                 session_manager = get_session_manager()
-                session_manager.cleanup_old_sessions(max_age_hours=0)
+                session_manager.cleanup_old_sessions()
             except:
                 pass
             sys.exit(0)
@@ -4471,6 +4457,11 @@ class ApplicationRunner:
             
             details_html = "".join(analysis_details) if analysis_details else "<p style=\"margin: 5px 0; color: #333;\">No detailed analysis available</p>"
             
+            # Add total analysis time
+            total_analysis_time = ApplicationRunner._get_total_analysis_time_for_sidebar()
+            if total_analysis_time > 0:
+                details_html += f"<p style=\"margin: 5px 0; color: #333;\"><strong>Analysis Time:</strong><br>⏱️ {total_analysis_time:.2f} seconds</p>"
+            
             if qa_status == "✅ PASS":
                 bg_gradient = "linear-gradient(135deg, #e8f5e8 0%, #f0f8f0 100%)"
                 header_color = "#2e7d32"
@@ -4499,6 +4490,18 @@ class ApplicationRunner:
         qa_results = st.session_state.qa_checker.get_detailed_results()
         return qa_results.get(rule_type)
 
+    @staticmethod
+    def _get_total_analysis_time_for_sidebar() -> float:
+        """Get the total analysis time from the analyzer instance for sidebar display."""
+        try:
+            analyzer = st.session_state.get('analyzer_instance')
+            if analyzer and hasattr(analyzer, 'performance_metrics'):
+                return analyzer.performance_metrics.get('total_analysis_time', 0.0)
+            return 0.0
+        except Exception as e:
+            logger.debug(f"Could not retrieve total analysis time for sidebar: {e}")
+            return 0.0
+
 
 if __name__ == "__main__":
     try:
@@ -4511,6 +4514,6 @@ if __name__ == "__main__":
     finally:
         try:
             session_manager = get_session_manager()
-            session_manager.cleanup_old_sessions(max_age_hours=0)
+            session_manager.cleanup_old_sessions()
         except:
             pass
