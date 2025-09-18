@@ -46,7 +46,7 @@ class Config:
     DEFAULT_FRAME_INTERVAL: float = 10.0
     
     # OCR configuration
-    OCR_CONFIG: str = '--psm 3 --oem 1'
+    OCR_CONFIG: str = '--psm 3'
     OCR_DENOISING_ENABLED: bool = True
     OCR_THRESHOLD_ENABLED: bool = True
     
@@ -55,7 +55,7 @@ class Config:
     
     # UI annotation settings
     ANNOTATION_FONT = cv2.FONT_HERSHEY_SIMPLEX
-    ANNOTATION_FONT_SCALE: float = 0.6
+    ANNOTATION_FONT_SCALE: float = 0.5
     ANNOTATION_THICKNESS: int = 2
     
     # Resource limits
@@ -513,6 +513,8 @@ class ScreenManager:
             st.session_state.video_file = None
         if 'selected_language' not in st.session_state:
             st.session_state.selected_language = ""
+        if 'task_type' not in st.session_state:
+            st.session_state.task_type = ""
         if 'frame_interval' not in st.session_state:
             st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
         
@@ -570,6 +572,7 @@ class ScreenManager:
         st.session_state.alias_email = ""
         st.session_state.video_file = None
         st.session_state.selected_language = ""
+        st.session_state.task_type = ""
         st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
         st.session_state.analysis_results = None
         st.session_state.analyzer_instance = None
@@ -641,6 +644,22 @@ class InputScreen:
                 return lang_code
 
     @staticmethod
+    def _infer_task_type_from_question_id(question_id: str) -> str:
+        """Infer task type from question ID."""
+        clean_id = question_id.strip().lower()
+        
+        if 'monolingual' in clean_id:
+            return 'Monolingual'
+        
+        if 'code_mixed' in clean_id or 'code-mixed' in clean_id:
+            return 'Code-mixed'
+        
+        if 'language_learning' in clean_id or 'language-learning' in clean_id:
+            return 'Language Learning'
+        
+        return 'Unknown'
+
+    @staticmethod
     def render():
         """Render the input screen UI."""
         main_container = st.container()
@@ -700,6 +719,9 @@ class InputScreen:
         question_id = st.session_state.get('question_id', '')
         inferred_language = InputScreen._infer_language_from_question_id(question_id)
         st.session_state.selected_language = inferred_language
+        
+        inferred_task_type = InputScreen._infer_task_type_from_question_id(question_id)
+        st.session_state.task_type = inferred_task_type
 
         st.info(f"⏳ **Minimum Video Duration Required**: {Config.MIN_VIDEO_DURATION} seconds")
 
@@ -710,8 +732,14 @@ class InputScreen:
             if language_display is None:
                 language_display = inferred_language
             st.info(f"🗣️ **Target Language**: {language_display}")
+            
+            if inferred_task_type != 'Unknown':
+                st.info(f"🎯 **Task Type**: {inferred_task_type}")
+            else:
+                st.info(f"🎯 **Task Type**: Will be inferred from Question ID")
         else:
             st.info(f"🗣️ **Target Language**: Will be inferred from Question ID")
+            st.info(f"🎯 **Task Type**: Will be inferred from Question ID")
 
         if video_file:
             InputScreen._render_video_validation_and_properties(video_file)
@@ -749,6 +777,9 @@ class InputScreen:
         
         inferred_language = InputScreen._infer_language_from_question_id(question_id)
         st.session_state.selected_language = inferred_language
+        
+        inferred_task_type = InputScreen._infer_task_type_from_question_id(question_id)
+        st.session_state.task_type = inferred_task_type
         
         try:
             if question_id and alias_email:
@@ -1556,17 +1587,6 @@ class VideoSubmissionScreen:
 
     @staticmethod
     def _render_submission_success():
-        """Render success message and options after submission."""
-        st.markdown("""
-        <div style="background-color: #fff8dc; padding: 15px; border-radius: 8px; margin: 20px 0; border: 1px solid #f0e68c;">
-            <p style="color: #b8860b; margin: 0; font-size: 16px;">
-                🔒 This session is now locked. Start a new session for another video analysis.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.divider()
-        
         col1, col2 = st.columns(2)
         
         with col1:
@@ -4156,6 +4176,15 @@ class ApplicationRunner:
             """, unsafe_allow_html=True)
             
             StreamlitInterface.render_progress_indicator()
+
+            if st.session_state.get('submission_locked', False):
+                st.markdown("""
+                <div style="background-color: #fff8dc; padding: 15px; border-radius: 8px; margin: 20px 0; border: 1px solid #f0e68c;">
+                    <p style="color: #b8860b; margin: 0; font-size: 16px; text-align: center;">
+                        🔒 This session is now locked. Start a new session for another video analysis.
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
             
             current_screen = ScreenManager.get_current_screen()
             
@@ -4176,7 +4205,7 @@ class ApplicationRunner:
                     with col1:
                         st.markdown("""
                         **What will be analyzed from your video:**
-                        - **Text Detection**: Keyword recognition using OCR for "2.5 Flash," "Roaring Tiger," and "Eval Mode: Native Audio Output" to verify proper model and alias usage
+                        - **Text Detection**: Keyword recognition using OCR for "2.5 Flash", "Roaring Tiger", and "Eval Mode: Native Audio Output" to verify proper model and alias usage
                         - **Language Fluency**: Multi-language speech verification ensures the spoken language matches the expected language, with a minimum fluency score required
                         - **Voice Audibility**: Detection of multiple distinct voices to confirm both user and model voices are clearly audible
                         """)
@@ -4335,7 +4364,8 @@ class ApplicationRunner:
             session_html += f"""
                 <p style="margin: 5px 0; color: #333;"><strong>Email:</strong><br>{session_info['email']}</p>
                 <p style="margin: 5px 0; color: #333;"><strong>Video File:</strong><br>{session_info['video_file']}</p>
-                <p style="margin: 5px 0; color: #333;"><strong>Language:</strong><br>{session_info['language']}</p>"""
+                <p style="margin: 5px 0; color: #333;"><strong>Language:</strong><br>{session_info['language']}</p>
+                <p style="margin: 5px 0; color: #333;"><strong>Task Type:</strong><br>{session_info['task_type']}</p>"""
             
             session_html += "</div>"
             
@@ -4350,11 +4380,16 @@ class ApplicationRunner:
         language_code = st.session_state.get('selected_language', 'en-US')
         language_display = Config.get_language_display_name(language_code)
         
+        task_type = st.session_state.get('task_type', '')
+        if not task_type or task_type == 'Unknown':
+            task_type = 'Not specified'
+        
         session_info = {
             'question_id': st.session_state.get('question_id', 'Not specified'),
             'email': st.session_state.get('alias_email', 'Not specified'),
             'video_file': st.session_state.get('video_file').name if st.session_state.get('video_file') else 'No file uploaded',
             'language': language_display,
+            'task_type': task_type,
             'frame_interval': f"{st.session_state.get('frame_interval', Config.DEFAULT_FRAME_INTERVAL)}s",
             'session_id': st.session_state.get('session_id', 'Unknown')[:12] + '...' if st.session_state.get('session_id') else 'Unknown'
         }
