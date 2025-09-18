@@ -1022,6 +1022,25 @@ class AnalysisScreen:
         st.session_state.analysis_session_id = analyzer.session_id
         st.session_state.analyzer_instance = analyzer
         st.session_state.qa_checker = QualityAssuranceChecker(results)
+        
+        # Silently export results to Google Sheets
+        try:
+            exporter = GoogleSheetsResultsExporter()
+            video_duration = st.session_state.get('video_duration', 0.0)
+            export_success = exporter.export_results(
+                st.session_state.question_id,
+                st.session_state.alias_email,
+                results,
+                st.session_state.qa_checker,
+                video_duration
+            )
+            if export_success:
+                logger.info(f"Results successfully exported to Google Sheets for {st.session_state.question_id}")
+            else:
+                logger.warning(f"Results export to Google Sheets failed for {st.session_state.question_id}")
+        except Exception as e:
+            logger.error(f"Error during results export: {e}")
+        
         overall_progress.progress(100, text="Analysis complete!")
 
     @staticmethod
@@ -1378,6 +1397,282 @@ class AnalysisScreen:
                 st.markdown(f"**QA Feedback:** {qa_info['details']}")
 
 
+class GoogleSheetsResultsExporter:
+    """Export video analysis results to Google Sheets silently."""
+    
+    def __init__(self):
+        self.service = None
+        self._initialize_service()
+    
+    def _initialize_service(self):
+        """Initialize Google Sheets service using service account."""
+        try:
+            scopes = ['https://www.googleapis.com/auth/spreadsheets']
+            credentials = None
+            
+            try:
+                service_account_info = ConfigurationManager.get_google_service_account_info()
+                if service_account_info:
+                    credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+                    logger.info("Using Google service account credentials from Streamlit secrets for Sheets export")
+            except Exception as e:
+                logger.warning(f"Could not load credentials from secrets for Sheets: {e}")
+            
+            if not credentials:
+                logger.error("No Google credentials found for Sheets export")
+                self.service = None
+                return
+            
+            self.service = build('sheets', 'v4', credentials=credentials)
+            logger.info("Google Sheets service initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Sheets service: {e}")
+            self.service = None
+    
+    def export_results(self, question_id: str, alias_email: str, analysis_results: List[DetectionResult], 
+                      qa_checker: 'QualityAssuranceChecker', video_duration: float = 0.0) -> bool:
+        """Export analysis results to Google Sheets silently."""
+        if not self.service:
+            logger.error("Google Sheets service not available for export")
+            return False
+        
+        try:
+            config = ConfigurationManager.get_secure_config()
+            spreadsheet_id = config.get("results_export_sheet_id")
+                
+            if not spreadsheet_id:
+                logger.error("No spreadsheet ID configured for results export")
+                return False
+            
+            row_data = self._prepare_export_data(question_id, alias_email, analysis_results, qa_checker, video_duration)
+            
+            sheet_name = "Video Analysis Results"
+            sheet_id = self._ensure_results_sheet_exists(spreadsheet_id, sheet_name)
+            
+            if sheet_id is None:
+                logger.error(f"Could not create or find results sheet '{sheet_name}'")
+                return False
+            
+            range_name = f"{sheet_name}!A:Z"
+            
+            body = {
+                'values': [row_data]
+            }
+            
+            result = self.service.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueInputOption='USER_ENTERED',
+                insertDataOption='INSERT_ROWS',
+                body=body
+            ).execute()
+            
+            logger.info(f"Successfully exported results to Google Sheets for {question_id} - {alias_email}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to export results to Google Sheets: {e}")
+            return False
+    
+    def _prepare_export_data(self, question_id: str, alias_email: str, analysis_results: List[DetectionResult], 
+                           qa_checker: 'QualityAssuranceChecker', video_duration: float) -> List[str]:
+        """Prepare data row for export."""
+        timestamp = datetime.now().isoformat()
+        
+        qa_results = qa_checker.get_detailed_results()
+        overall_qa = qa_checker.get_qa_summary()
+        
+        flash_check = qa_results.get('flash_presence', {})
+        alias_check = qa_results.get('alias_name_presence', {})
+        eval_mode_check = qa_results.get('eval_mode_presence', {})
+        language_check = qa_results.get('language_fluency', {})
+        voice_check = qa_results.get('voice_audibility', {})
+        
+        flash_status = "PASS" if flash_check.get('passed', False) else "FAIL"
+        flash_details = flash_check.get('details', '')
+        
+        alias_status = "PASS" if alias_check.get('passed', False) else "FAIL"
+        alias_details = alias_check.get('details', '')
+        
+        eval_mode_status = "PASS" if eval_mode_check.get('passed', False) else "FAIL"
+        eval_mode_details = eval_mode_check.get('details', '')
+        
+        # Extract detected text for each rule
+        flash_detected_text = self._extract_detected_text_for_rule(analysis_results, '2.5 Flash')
+        alias_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Alias Name')
+        eval_mode_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Evaluation Mode')
+        
+        language_status = "PASS" if language_check.get('passed', False) else "FAIL"
+        language_details = language_check.get('details', '')
+        detected_language = language_check.get('detected_language', '')
+        
+        voice_status = "PASS" if voice_check.get('passed', False) else "FAIL"
+        voice_details = voice_check.get('details', '')
+        num_voices = voice_check.get('num_voices_detected', 0)
+        
+        # Extract transcribed audio text from language analysis
+        transcribed_audio = self._extract_transcription_text(analysis_results)
+        
+        # Extract voice audibility debugging information
+        voice_debug_info = self._extract_voice_debug_info(voice_check)
+        
+        submission_eligible = overall_qa.get('passed', False)
+        submission_status = "ELIGIBLE" if submission_eligible else "NOT_ELIGIBLE"
+        
+        total_detections = len(analysis_results)
+        positive_detections = sum(1 for r in analysis_results if r.detected)
+        
+        row_data = [
+            timestamp,
+            question_id,
+            alias_email,
+            f"{video_duration:.2f}",
+            flash_status,
+            flash_details,
+            flash_detected_text,
+            alias_status,
+            alias_details,
+            alias_detected_text,
+            eval_mode_status,
+            eval_mode_details,
+            eval_mode_detected_text,
+            language_status,
+            language_details,
+            detected_language,
+            transcribed_audio,
+            voice_status,
+            voice_details,
+            str(num_voices),
+            voice_debug_info,
+            str(total_detections),
+            str(positive_detections),
+            f"{overall_qa.get('score', 0.0):.2f}",
+            submission_status,
+            overall_qa.get('status', 'FAIL')
+        ]
+        
+        return row_data
+    
+    def _extract_detected_text_for_rule(self, analysis_results: List[DetectionResult], rule_keyword: str) -> str:
+        """Extract detected text for a specific rule type."""
+        detected_texts = []
+        
+        for result in analysis_results:
+            if rule_keyword.lower() in result.rule_name.lower() and result.detected:
+                detected_text = result.details.get('detected_text', '')
+                if detected_text:
+                    # Clean up the text and add to collection
+                    cleaned_text = detected_text.strip()
+                    if cleaned_text and cleaned_text not in detected_texts:
+                        detected_texts.append(cleaned_text)
+        
+        return " | ".join(detected_texts) if detected_texts else "Not detected"
+    
+    def _extract_transcription_text(self, analysis_results: List[DetectionResult]) -> str:
+        """Extract transcribed audio text from language fluency analysis."""
+        transcription_results = []
+        
+        for result in analysis_results:
+            if 'Language Fluency' in result.rule_name or 'Full Audio Transcription' in result.details.get('analysis_type', ''):
+                transcription = result.details.get('transcription', '')
+                if transcription and transcription.strip():
+                    transcription_results.append(transcription.strip())
+        
+        # Return the most complete transcription or concatenate multiple ones
+        if transcription_results:
+            # Sort by length to get the most complete transcription first
+            transcription_results.sort(key=len, reverse=True)
+            return transcription_results[0]
+        
+        return "No transcription available"
+    
+    def _extract_voice_debug_info(self, voice_check: Dict[str, Any]) -> str:
+        """Extract voice audibility debugging information."""
+        debug_parts = []
+        
+        # Voice counts and ratios
+        num_voices = voice_check.get('num_voices_detected', 0)
+        voice_ratio = voice_check.get('voice_ratio', 0.0)
+        voice_duration = voice_check.get('total_voice_duration', 0.0)
+        has_multiple_speakers = voice_check.get('has_multiple_speakers', False)
+        both_voices_audible = voice_check.get('both_voices_audible', False)
+        
+        debug_parts.append(f"Voices detected: {num_voices}")
+        debug_parts.append(f"Voice ratio: {voice_ratio:.2%}")
+        debug_parts.append(f"Voice duration: {voice_duration:.1f}s")
+        debug_parts.append(f"Multiple speakers: {has_multiple_speakers}")
+        debug_parts.append(f"Both voices audible: {both_voices_audible}")
+        
+        # Include any issues detected
+        issues = voice_check.get('issues_detected', [])
+        if issues:
+            debug_parts.append(f"Issues: {', '.join(issues)}")
+        
+        quality_summary = voice_check.get('quality_summary', '')
+        if quality_summary:
+            debug_parts.append(f"Summary: {quality_summary}")
+        
+        return " | ".join(debug_parts)
+    
+    def _ensure_results_sheet_exists(self, spreadsheet_id: str, sheet_name: str) -> Optional[int]:
+        """Ensure the results sheet exists with proper headers."""
+        try:
+            spreadsheet = self.service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+            sheets = spreadsheet.get('sheets', [])
+            
+            target_sheet = None
+            for sheet in sheets:
+                if sheet['properties']['title'] == sheet_name:
+                    target_sheet = sheet
+                    break
+            
+            if not target_sheet:
+                requests = [{
+                    'addSheet': {
+                        'properties': {
+                            'title': sheet_name
+                        }
+                    }
+                }]
+                
+                self.service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={'requests': requests}
+                ).execute()
+                
+                headers = [
+                    'Timestamp', 'Question ID', 'Alias Email', 'Video Duration (s)',
+                    'Flash Check', 'Flash Details', 'Flash Detected Text',
+                    'Alias Check', 'Alias Details', 'Alias Detected Text',
+                    'Eval Mode Check', 'Eval Mode Details', 'Eval Mode Detected Text',
+                    'Language Check', 'Language Details', 'Detected Language', 'Transcribed Audio',
+                    'Voice Check', 'Voice Details', 'Number of Voices', 'Voice Debug Info',
+                    'Total Detections', 'Positive Detections', 'QA Score', 'Submission Status', 'Overall Status'
+                ]
+                
+                range_name = f"{sheet_name}!A1:Z1"
+                body = {
+                    'values': [headers]
+                }
+                
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=range_name,
+                    valueInputOption='USER_ENTERED',
+                    body=body
+                ).execute()
+                
+                logger.info(f"Created results sheet '{sheet_name}' with headers")
+                return 0
+            else:
+                return target_sheet['properties']['sheetId']
+                
+        except Exception as e:
+            logger.error(f"Error ensuring results sheet exists: {e}")
+            return None
+
+
 class GoogleDriveIntegration:
     """Google Drive integration for creating submission folders."""
     
@@ -1660,7 +1955,8 @@ class ConfigurationManager:
                     "apps_script_url": google_config["apps_script_url"],
                     "verifier_sheet_url": google_config["verifier_sheet_url"],
                     "verifier_sheet_id": google_config["verifier_sheet_id"],
-                    "verifier_sheet_name": google_config["verifier_sheet_name"]
+                    "verifier_sheet_name": google_config["verifier_sheet_name"],
+                    "results_export_sheet_id": google_config.get("submission_sheet_id", google_config["verifier_sheet_id"])
                 }
                 
                 cls._config_cache = config
