@@ -952,7 +952,6 @@ class AnalysisScreen:
         try:
             session_id = st.session_state.session_id
             
-            # Use the already created temp video from validation step
             if (hasattr(st.session_state, 'cached_temp_path') and
                 hasattr(st.session_state, 'cached_video_file_name') and
                 st.session_state.cached_video_file_name == st.session_state.video_file.name and
@@ -962,7 +961,6 @@ class AnalysisScreen:
                 temp_files = [video_path]
                 overall_progress.progress(10, text="Using validated video file, initializing analyzer...")
             else:
-                # Fallback: create temp video if not already cached
                 video_path, temp_files = StreamlitInterface.create_temp_video(
                     st.session_state.video_file, session_id
                 )
@@ -1000,7 +998,7 @@ class AnalysisScreen:
             frame_interval=st.session_state.frame_interval,
             progress_callback=progress_callback
         )
-        overall_progress.progress(90, text="Analysis complete, generating report...")
+        overall_progress.progress(90, text="Analysis complete, wrapping up...")
         analyzer.export_results("results.json")
         
         analyzer.cleanup_temp_files()
@@ -1023,7 +1021,6 @@ class AnalysisScreen:
         st.session_state.analyzer_instance = analyzer
         st.session_state.qa_checker = QualityAssuranceChecker(results)
         
-        # Silently export results to Google Sheets
         try:
             exporter = GoogleSheetsResultsExporter()
             video_duration = st.session_state.get('video_duration', 0.0)
@@ -1059,7 +1056,6 @@ class AnalysisScreen:
         st.subheader("📊 Analysis Reports")
         results = st.session_state.analysis_results
         
-        # Display total analysis time
         total_analysis_time = AnalysisScreen._get_total_analysis_time()
         if total_analysis_time > 0:
             st.info(f"⏱️ **Total Analysis Time:** {total_analysis_time:.2f} seconds")
@@ -1498,7 +1494,6 @@ class GoogleSheetsResultsExporter:
         eval_mode_status = "PASS" if eval_mode_check.get('passed', False) else "FAIL"
         eval_mode_details = eval_mode_check.get('details', '')
         
-        # Extract detected text for each rule
         flash_detected_text = self._extract_detected_text_for_rule(analysis_results, '2.5 Flash')
         alias_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Alias Name')
         eval_mode_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Evaluation Mode')
@@ -1511,10 +1506,8 @@ class GoogleSheetsResultsExporter:
         voice_details = voice_check.get('details', '')
         num_voices = voice_check.get('num_voices_detected', 0)
         
-        # Extract transcribed audio text from language analysis
         transcribed_audio = self._extract_transcription_text(analysis_results)
         
-        # Extract voice audibility debugging information
         voice_debug_info = self._extract_voice_debug_info(voice_check)
         
         submission_eligible = overall_qa.get('passed', False)
@@ -1562,7 +1555,6 @@ class GoogleSheetsResultsExporter:
             if rule_keyword.lower() in result.rule_name.lower() and result.detected:
                 detected_text = result.details.get('detected_text', '')
                 if detected_text:
-                    # Clean up the text and add to collection
                     cleaned_text = detected_text.strip()
                     if cleaned_text and cleaned_text not in detected_texts:
                         detected_texts.append(cleaned_text)
@@ -1579,9 +1571,7 @@ class GoogleSheetsResultsExporter:
                 if transcription and transcription.strip():
                     transcription_results.append(transcription.strip())
         
-        # Return the most complete transcription or concatenate multiple ones
         if transcription_results:
-            # Sort by length to get the most complete transcription first
             transcription_results.sort(key=len, reverse=True)
             return transcription_results[0]
         
@@ -1591,7 +1581,6 @@ class GoogleSheetsResultsExporter:
         """Extract voice audibility debugging information."""
         debug_parts = []
         
-        # Voice counts and ratios
         num_voices = voice_check.get('num_voices_detected', 0)
         voice_ratio = voice_check.get('voice_ratio', 0.0)
         voice_duration = voice_check.get('total_voice_duration', 0.0)
@@ -1604,7 +1593,6 @@ class GoogleSheetsResultsExporter:
         debug_parts.append(f"Multiple speakers: {has_multiple_speakers}")
         debug_parts.append(f"Both voices audible: {both_voices_audible}")
         
-        # Include any issues detected
         issues = voice_check.get('issues_detected', [])
         if issues:
             debug_parts.append(f"Issues: {', '.join(issues)}")
@@ -1686,7 +1674,6 @@ class GoogleDriveIntegration:
             scopes = ['https://www.googleapis.com/auth/drive']
             credentials = None
             
-            # Option 1: Use credentials from Streamlit secrets (recommended for production)
             try:
                 service_account_info = ConfigurationManager.get_google_service_account_info()
                 if service_account_info:
@@ -1694,20 +1681,6 @@ class GoogleDriveIntegration:
                     logger.info("Using Google service account credentials from Streamlit secrets")
             except Exception as e:
                 logger.warning(f"Could not load credentials from secrets: {e}")
-            
-            # Option 2: Fall back to environment variables
-            if not credentials:
-                credentials_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
-                if credentials_json:
-                    credentials_info = json.loads(credentials_json)
-                    credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
-                    logger.info("Using Google service account credentials from environment variable JSON")
-                else:
-                    # Option 3: Use credentials file path from environment variable
-                    credentials_path = os.getenv('GOOGLE_SERVICE_ACCOUNT_PATH')
-                    if credentials_path and os.path.exists(credentials_path):
-                        credentials = Credentials.from_service_account_file(credentials_path, scopes=scopes)
-                        logger.info("Using Google service account credentials from file path")
             
             if not credentials:
                 logger.error("No Google credentials found. Please configure credentials in Streamlit secrets or set environment variables")
@@ -4052,12 +4025,12 @@ class StreamlitInterface:
             safe_filename = re.sub(r'[^\w.-]', '_', video_file.name)[:100]
             
             file_size = getattr(video_file, 'size', 0)
-            if file_size > 100 * 1024 * 1024:  # Files > 100MB
-                chunk_size = 4 * 1024 * 1024  # 4MB chunks
-            elif file_size > 50 * 1024 * 1024:  # Files > 50MB
-                chunk_size = 2 * 1024 * 1024  # 2MB chunks
+            if file_size > 100 * 1024 * 1024:  # > 100MB
+                chunk_size = 4 * 1024 * 1024  # 4MB
+            elif file_size > 50 * 1024 * 1024:  # > 50MB
+                chunk_size = 2 * 1024 * 1024  # 2MB
             else:
-                chunk_size = 1024 * 1024  # 1MB chunks for smaller files
+                chunk_size = 1024 * 1024  # 1MB
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=video_suffix, prefix=f"video_{session_id}_") as tmp:
                 total_written = 0
