@@ -454,24 +454,42 @@ class SessionManager:
         return filepath
     
     def cleanup_session(self, session_id: str) -> None:
-        """Clean up a session and all its files."""
+        """Clean up a session and all its files with enhanced memory management."""
         try:
             with self._lock:
                 session_dir = self.get_session_directory(session_id)
                 if not session_dir or not os.path.exists(session_dir):
                     return
                 
+                # Calculate total size of files being deleted for logging
+                total_size = 0
+                try:
+                    for root, dirs, files in os.walk(session_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            if os.path.exists(file_path):
+                                total_size += os.path.getsize(file_path)
+                except Exception as size_calc_error:
+                    logger.debug(f"Could not calculate session size: {size_calc_error}")
+                
                 try:
                     shutil.rmtree(session_dir)
-                    logger.info(f"Removed session directory: {session_dir}")
+                    logger.info(f"Removed session directory: {session_dir} ({total_size / 1024 / 1024:.1f}MB freed)")
                 except Exception as e:
                     logger.error(f"Failed to remove session directory {session_dir}: {e}")
                 
                 if session_id in self._active_sessions:
                     del self._active_sessions[session_id]
                 
+                # Force garbage collection after large cleanup
+                if total_size > 50 * 1024 * 1024:  # If more than 50MB was freed
+                    gc.collect()
+                
         except Exception as e:
             logger.error(f"Session cleanup error for {session_id}: {e}")
+        finally:
+            # Ensure garbage collection runs
+            gc.collect()
     
     def cleanup_old_sessions(self) -> None:
         """Clean up sessions older than 20 minutes."""
@@ -2763,15 +2781,45 @@ class VideoContentAnalyzer:
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
+        """Context manager exit with enhanced cleanup."""
         try:
             with self._lock:
                 self._is_processing = False
+            
+            # Explicit memory cleanup
+            self._cleanup_memory_resources()
+            
         finally:
-            pass
+            # Force garbage collection
+            gc.collect()
     
+    def _cleanup_memory_resources(self):
+        """Clean up memory-intensive resources."""
+        try:
+            # Clear large data structures
+            if hasattr(self, 'results') and self.results:
+                # Keep results but clear any large embedded data
+                for result in self.results:
+                    if hasattr(result, 'details') and isinstance(result.details, dict):
+                        # Remove large binary data if any
+                        if 'frame_data' in result.details:
+                            del result.details['frame_data']
+                        if 'raw_image' in result.details:
+                            del result.details['raw_image']
+            
+            # Clear audio analyzer resources
+            if hasattr(self, 'audio_analyzer') and self.audio_analyzer:
+                if hasattr(self.audio_analyzer, 'voice_features_cache'):
+                    self.audio_analyzer.voice_features_cache.clear()
+            
+            # Force garbage collection
+            gc.collect()
+            
+        except Exception as e:
+            logger.warning(f"Memory cleanup warning: {e}")
+
     def cleanup_temp_files(self):
-        """Clean up temporary files."""
+        """Clean up temporary files with enhanced memory management."""
         with self._lock:
             try:
                 self._is_processing = False
@@ -2780,16 +2828,24 @@ class VideoContentAnalyzer:
                     for temp_file in self.temp_files:
                         try:
                             if os.path.exists(temp_file):
+                                # Get file size for logging
+                                file_size = os.path.getsize(temp_file)
                                 os.unlink(temp_file)
-                                logger.debug(f"Removed temp file: {temp_file}")
+                                logger.debug(f"Removed temp file: {temp_file} ({file_size / 1024 / 1024:.1f}MB)")
                         except Exception as e:
                             logger.debug(f"Could not remove temp file {temp_file}: {e}")
                     self.temp_files.clear()
-                    
+                
+                # Clean up memory resources
+                self._cleanup_memory_resources()
+                
                 logger.debug(f"Session {self.session_id} analysis completed, directory preserved")
                 
             except Exception as e:
                 logger.error(f"Temp cleanup error for session {self.session_id}: {e}")
+            finally:
+                # Ensure garbage collection runs
+                gc.collect()
     
     def analyze_video(self, video_path: str, 
                      frame_interval: float = Config.DEFAULT_FRAME_INTERVAL,
@@ -4026,61 +4082,300 @@ class StreamlitInterface:
 
     @staticmethod
     def create_temp_video(video_file, session_id: str = None):
-        """Create temporary video file with optimized chunking for production. Returns (path, [path]) or (None, [])."""
+        """Create temporary video file with enhanced memory management and chunking. Returns (path, [path]) or (None, [])."""
         if not video_file:
             return None, []
+        
         try:
+            # Validate file size before processing
             if hasattr(video_file, 'size') and video_file.size > Config.MAX_FILE_SIZE:
                 st.error(f"File too large: {video_file.size / 1024 / 1024:.1f}MB (max: {Config.MAX_FILE_SIZE / 1024 / 1024:.1f}MB)")
                 return None, []
+            
+            # Validate file format
             video_suffix = Path(video_file.name).suffix.lower()
             if video_suffix not in Config.SUPPORTED_VIDEO_FORMATS:
                 st.error(f"Unsupported file format: {video_suffix}")
                 return None, []
-            session_id = session_id or get_session_manager().generate_session_id()
             
+            session_id = session_id or get_session_manager().generate_session_id()
             safe_filename = re.sub(r'[^\w.-]', '_', video_file.name)[:100]
             
+            # Get available memory and file size for adaptive chunking
             file_size = getattr(video_file, 'size', 0)
-            if file_size > 100 * 1024 * 1024:  # > 100MB
-                chunk_size = 4 * 1024 * 1024  # 4MB
-            elif file_size > 50 * 1024 * 1024:  # > 50MB
-                chunk_size = 2 * 1024 * 1024  # 2MB
-            else:
-                chunk_size = 1024 * 1024  # 1MB
+            available_memory = StreamlitInterface._get_available_memory()
+            optimal_chunk_size = StreamlitInterface._calculate_optimal_chunk_size(file_size, available_memory)
             
-            with tempfile.NamedTemporaryFile(delete=False, suffix=video_suffix, prefix=f"video_{session_id}_") as tmp:
-                total_written = 0
-                video_file.seek(0)
-                
-                if file_size > 50 * 1024 * 1024:
-                    progress_bar = st.progress(0, text="Uploading video...")
+            logger.info(f"Processing video upload: {file_size / 1024 / 1024:.1f}MB, chunk size: {optimal_chunk_size / 1024:.0f}KB")
+            
+            # Attempt upload with retry mechanism
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    temp_path = StreamlitInterface._attempt_upload_with_recovery(
+                        video_file, session_id, video_suffix, file_size, optimal_chunk_size, attempt
+                    )
                     
-                while True:
-                    chunk = video_file.read(chunk_size)
-                    if not chunk:
-                        break
-                    total_written += len(chunk)
-                    if total_written > Config.MAX_FILE_SIZE:
-                        os.unlink(tmp.name)
-                        st.error("File size exceeded during upload")
-                        return None, []
-                    tmp.write(chunk)
+                    if temp_path:
+                        logger.info(f"Successfully uploaded video to: {temp_path}")
+                        return temp_path, [temp_path]
                     
-                    if file_size > 50 * 1024 * 1024:
-                        progress = min(1.0, total_written / file_size)
-                        progress_bar.progress(progress, text=f"Uploading video... {progress*100:.1f}%")
-                
-                if file_size > 50 * 1024 * 1024:
-                    progress_bar.empty()
-                
-                tmp.flush()
-                os.fsync(tmp.fileno())
-                return tmp.name, [tmp.name]
+                except Exception as upload_error:
+                    logger.warning(f"Upload attempt {attempt + 1} failed: {upload_error}")
+                    if attempt == max_retries - 1:  # Last attempt
+                        raise upload_error
+                    
+                    # Wait before retry and adjust chunk size
+                    time.sleep(0.5 * (attempt + 1))  # Progressive backoff
+                    optimal_chunk_size = max(optimal_chunk_size // 2, 32 * 1024)  # Reduce chunk size
+                    gc.collect()  # Clean memory before retry
+            
+            st.error("❌ Upload failed after multiple attempts. Please try with a smaller file.")
+            return None, []
+                    
+        except MemoryError:
+            st.error("❌ Insufficient memory to process this video file. Please try with a smaller file.")
+            logger.error(f"Memory error during video upload: {file_size / 1024 / 1024:.1f}MB")
+            return None, []
         except Exception as e:
-            logger.error(f"Temp video creation failed: {e}")
+            logger.error(f"Video upload failed: {e}")
             st.error(f"Failed to process uploaded video: {str(e)}")
             return None, []
+        finally:
+            # Force garbage collection to free memory
+            gc.collect()
+
+    @staticmethod
+    def _attempt_upload_with_recovery(video_file, session_id: str, video_suffix: str, 
+                                     file_size: int, chunk_size: int, attempt: int) -> Optional[str]:
+        """Attempt to upload file with recovery capabilities."""
+        temp_path = None
+        
+        try:
+            # Create temporary file with session-based naming
+            with tempfile.NamedTemporaryFile(delete=False, suffix=video_suffix, prefix=f"video_{session_id}_") as tmp:
+                temp_path = tmp.name
+                
+                # Use streaming upload with memory monitoring
+                success = StreamlitInterface._stream_upload_with_monitoring(
+                    video_file, tmp, file_size, chunk_size
+                )
+                
+                if not success:
+                    raise RuntimeError("Streaming upload failed")
+                
+                # Ensure data is written to disk
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            
+            # Verify file integrity after upload
+            if not StreamlitInterface._verify_uploaded_file(temp_path, file_size):
+                raise RuntimeError("File integrity check failed after upload")
+            
+            return temp_path
+            
+        except Exception as e:
+            # Cleanup on failure
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup temp file {temp_path}: {cleanup_error}")
+            
+            raise e
+
+    @staticmethod
+    def _get_available_memory():
+        """Get available memory in bytes. Returns conservative estimate if unable to determine."""
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            # Use available memory minus a safety buffer (200MB)
+            available = memory.available - (200 * 1024 * 1024)
+            return max(50 * 1024 * 1024, available)  # Minimum 50MB
+        except ImportError:
+            # Conservative default if psutil not available
+            return 256 * 1024 * 1024  # 256MB default
+        except Exception as e:
+            logger.warning(f"Could not determine available memory: {e}")
+            return 256 * 1024 * 1024  # 256MB fallback
+
+    @staticmethod
+    def _calculate_optimal_chunk_size(file_size: int, available_memory: int) -> int:
+        """Calculate optimal chunk size based on file size and available memory."""
+        # Base chunk size on available memory, but cap it for efficiency
+        max_chunk_from_memory = min(available_memory // 10, 8 * 1024 * 1024)  # Max 8MB or 10% of memory
+        
+        # Adjust chunk size based on file size for optimal performance
+        if file_size < 10 * 1024 * 1024:  # < 10MB
+            optimal_chunk = min(512 * 1024, max_chunk_from_memory)  # 512KB
+        elif file_size < 50 * 1024 * 1024:  # < 50MB
+            optimal_chunk = min(1024 * 1024, max_chunk_from_memory)  # 1MB
+        elif file_size < 200 * 1024 * 1024:  # < 200MB
+            optimal_chunk = min(2 * 1024 * 1024, max_chunk_from_memory)  # 2MB
+        else:  # >= 200MB
+            optimal_chunk = min(4 * 1024 * 1024, max_chunk_from_memory)  # 4MB
+        
+        # Ensure minimum chunk size for very constrained memory
+        return max(64 * 1024, optimal_chunk)  # Minimum 64KB
+
+    @staticmethod
+    def _stream_upload_with_monitoring(video_file, tmp_file, file_size: int, chunk_size: int) -> bool:
+        """Stream upload with memory monitoring and progress tracking."""
+        total_written = 0
+        chunks_processed = 0
+        video_file.seek(0)
+        
+        # Show progress bar for larger files
+        show_progress = file_size > 20 * 1024 * 1024  # Show for files > 20MB
+        progress_bar = None
+        progress_container = None
+        
+        if show_progress:
+            progress_container = st.empty()
+            with progress_container:
+                progress_bar = st.progress(0, text="Uploading video...")
+        
+        # Memory management variables
+        memory_check_interval = 10  # Check memory every N chunks
+        gc_interval = 50  # Run garbage collection every N chunks
+        
+        try:
+            while total_written < file_size:
+                # Monitor memory before reading next chunk
+                if chunks_processed % memory_check_interval == 0:
+                    current_memory = StreamlitInterface._get_current_memory_usage()
+                    if current_memory > 0.8:  # If using more than 80% of available memory
+                        # Force garbage collection
+                        gc.collect()
+                        
+                        # Reduce chunk size dynamically
+                        chunk_size = max(chunk_size // 2, 32 * 1024)
+                        logger.warning(f"High memory usage ({current_memory:.1%}), reducing chunk size to {chunk_size // 1024}KB")
+                        
+                        # Update check interval to be more frequent
+                        memory_check_interval = max(5, memory_check_interval // 2)
+                
+                # Calculate remaining bytes to avoid over-reading
+                remaining_bytes = file_size - total_written
+                current_chunk_size = min(chunk_size, remaining_bytes)
+                
+                # Read chunk with error handling
+                chunk = None
+                try:
+                    chunk = video_file.read(current_chunk_size)
+                except Exception as read_error:
+                    logger.error(f"Error reading chunk at position {total_written}: {read_error}")
+                    return False
+                
+                if not chunk:
+                    # End of file reached unexpectedly
+                    if total_written < file_size:
+                        logger.warning(f"Unexpected end of file: {total_written}/{file_size} bytes read")
+                    break
+                
+                # Write chunk to temporary file
+                bytes_written = len(chunk)
+                total_written += bytes_written
+                
+                # Validate we don't exceed file size limits
+                if total_written > Config.MAX_FILE_SIZE:
+                    logger.error(f"File size exceeded during upload: {total_written} > {Config.MAX_FILE_SIZE}")
+                    return False
+                
+                try:
+                    tmp_file.write(chunk)
+                    # Force OS to flush buffers periodically for large files
+                    if chunks_processed % 25 == 0 and file_size > 100 * 1024 * 1024:
+                        tmp_file.flush()
+                except Exception as write_error:
+                    logger.error(f"Error writing chunk: {write_error}")
+                    return False
+                finally:
+                    # Clear chunk reference immediately to free memory
+                    chunk = None
+                
+                chunks_processed += 1
+                
+                # Update progress
+                if show_progress and progress_bar:
+                    progress = min(1.0, total_written / file_size)
+                    progress_text = f"Uploading video... {progress*100:.1f}% ({total_written // 1024 // 1024}MB/{file_size // 1024 // 1024}MB)"
+                    progress_bar.progress(progress, text=progress_text)
+                
+                # Periodic memory cleanup
+                if chunks_processed % gc_interval == 0:
+                    gc.collect()
+            
+            # Final flush to ensure all data is written
+            tmp_file.flush()
+            
+            # Clear progress bar
+            if progress_container:
+                progress_container.empty()
+            
+            logger.info(f"Upload completed: {total_written} bytes in {chunks_processed} chunks")
+            return total_written > 0
+            
+        except MemoryError as mem_error:
+            logger.error(f"Memory error during streaming upload: {mem_error}")
+            if progress_container:
+                progress_container.empty()
+            st.error("❌ Out of memory while processing video. Please try a smaller file.")
+            return False
+        except Exception as stream_error:
+            logger.error(f"Streaming upload error: {stream_error}")
+            if progress_container:
+                progress_container.empty()
+            return False
+        finally:
+            # Final cleanup
+            if progress_container:
+                progress_container.empty()
+            gc.collect()
+
+    @staticmethod
+    def _get_current_memory_usage() -> float:
+        """Get current memory usage as a ratio (0.0 to 1.0). Returns 0.5 if unable to determine."""
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            return memory.percent / 100.0
+        except ImportError:
+            return 0.5  # Conservative assumption
+        except Exception as e:
+            logger.debug(f"Could not get memory usage: {e}")
+            return 0.5
+
+    @staticmethod 
+    def _verify_uploaded_file(file_path: str, expected_size: int) -> bool:
+        """Verify the uploaded file integrity."""
+        try:
+            if not os.path.exists(file_path):
+                logger.error(f"Uploaded file not found: {file_path}")
+                return False
+            
+            actual_size = os.path.getsize(file_path)
+            if actual_size != expected_size:
+                logger.error(f"File size mismatch: expected {expected_size}, got {actual_size}")
+                return False
+            
+            # Basic file header validation for MP4
+            with open(file_path, 'rb') as f:
+                header = f.read(12)
+                if len(header) >= 8:
+                    # Check for common video file signatures
+                    if header[4:8] in [b'ftyp', b'mdat', b'moov']:
+                        return True
+                    elif header[:4] == b'\x00\x00\x00\x18' or header[:4] == b'\x00\x00\x00\x20':
+                        return True
+            
+            logger.warning(f"File header validation failed for: {file_path}")
+            return True  # Allow file even if header check fails (might be valid)
+            
+        except Exception as e:
+            logger.error(f"File verification error: {e}")
+            return False
 
 
 class QualityAssuranceChecker:
