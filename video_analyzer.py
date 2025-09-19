@@ -39,14 +39,6 @@ from scipy.ndimage import median_filter
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 
-# Optional import for memory monitoring
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-    psutil = None
-
 
 class Config:
     """Centralized application configuration constants."""
@@ -71,16 +63,6 @@ class Config:
     MAX_FILE_SIZE: int = 1024 * 1024 * 1024 # 1GB
     MAX_VIDEO_DURATION: int = 600  # 10 minutes
     MIN_VIDEO_DURATION: int = 30   # 30 seconds
-    
-    # File chunking configuration for memory optimization
-    CHUNK_SIZE_SMALL: int = 512 * 1024      # 512KB for files < 10MB
-    CHUNK_SIZE_MEDIUM: int = 1024 * 1024    # 1MB for files 10-50MB  
-    CHUNK_SIZE_LARGE: int = 2 * 1024 * 1024 # 2MB for files 50-200MB
-    CHUNK_SIZE_XLARGE: int = 4 * 1024 * 1024 # 4MB for files > 200MB
-    
-    # Memory management thresholds
-    MEMORY_CHECK_INTERVAL: int = 10 * 1024 * 1024  # Check memory every 10MB processed
-    MAX_MEMORY_USAGE_PCT: float = 0.8  # Maximum memory usage percentage before cleanup
     
     # Color definitions for UI annotations and bounding boxes
     ANNOTATION_COLORS: Dict[str, Tuple[int, int, int]] = {
@@ -173,18 +155,6 @@ class Config:
         except Exception as e:
             logger.error(f"Video validation failed: {e}")
             return {'error': str(e)}
-
-    @classmethod
-    def get_optimal_chunk_size(cls, file_size: int) -> int:
-        """Determine optimal chunk size based on file size for memory-efficient processing."""
-        if file_size < 10 * 1024 * 1024:  # < 10MB
-            return cls.CHUNK_SIZE_SMALL
-        elif file_size < 50 * 1024 * 1024:  # < 50MB
-            return cls.CHUNK_SIZE_MEDIUM
-        elif file_size < 200 * 1024 * 1024:  # < 200MB
-            return cls.CHUNK_SIZE_LARGE
-        else:  # >= 200MB
-            return cls.CHUNK_SIZE_XLARGE
 
 
 class TargetTexts:
@@ -540,133 +510,6 @@ _session_manager = SessionManager()
 def get_session_manager() -> SessionManager:
     """Get the global session manager instance."""
     return _session_manager
-
-
-class ChunkedFileProcessor:
-    """Handles large file uploads with optimized chunking and memory management."""
-    
-    def __init__(self, max_memory_usage_pct: float = 0.8):
-        self.max_memory_usage = max_memory_usage_pct
-        self.processed_bytes = 0
-        self.total_bytes = 0
-        
-    def get_memory_usage(self) -> float:
-        """Get current memory usage as a percentage."""
-        if PSUTIL_AVAILABLE:
-            try:
-                return psutil.virtual_memory().percent / 100.0
-            except Exception as e:
-                logger.debug(f"Error getting memory usage: {e}")
-                return 0.5
-        else:
-            # Fallback when psutil is not available
-            # Use a conservative estimate
-            return 0.5
-    
-    def should_cleanup_memory(self) -> bool:
-        """Check if memory cleanup is needed."""
-        memory_usage = self.get_memory_usage()
-        return memory_usage > self.max_memory_usage
-    
-    def cleanup_memory(self):
-        """Force garbage collection to free up memory."""
-        gc.collect()
-        logger.debug(f"Memory cleanup performed. Current usage: {self.get_memory_usage():.1%}")
-    
-    def process_file_in_chunks(self, uploaded_file, output_path: str, 
-                              progress_callback=None) -> bool:
-        """
-        Process uploaded file in chunks with memory optimization.
-        
-        Args:
-            uploaded_file: Streamlit uploaded file object
-            output_path: Path where to save the processed file
-            progress_callback: Optional callback for progress updates
-            
-        Returns:
-            bool: True if processing successful, False otherwise
-        """
-        try:
-            # Get file size
-            file_size = getattr(uploaded_file, 'size', 0)
-            if file_size == 0:
-                logger.warning("Could not determine file size")
-                return False
-            
-            if file_size > Config.MAX_FILE_SIZE:
-                logger.error(f"File too large: {file_size / 1024 / 1024:.1f}MB (max: {Config.MAX_FILE_SIZE / 1024 / 1024:.1f}MB)")
-                return False
-            
-            # Determine optimal chunk size
-            chunk_size = Config.get_optimal_chunk_size(file_size)
-            self.total_bytes = file_size
-            self.processed_bytes = 0
-            
-            logger.info(f"Processing file of {file_size / 1024 / 1024:.1f}MB with {chunk_size / 1024:.0f}KB chunks")
-            
-            # Reset file position
-            uploaded_file.seek(0)
-            
-            # Process file in chunks
-            with open(output_path, 'wb') as output_file:
-                while True:
-                    # Check memory usage before processing chunk
-                    if self.processed_bytes % Config.MEMORY_CHECK_INTERVAL == 0:
-                        if self.should_cleanup_memory():
-                            self.cleanup_memory()
-                    
-                    # Read chunk
-                    chunk = uploaded_file.read(chunk_size)
-                    if not chunk:
-                        break
-                    
-                    # Write chunk to output file
-                    output_file.write(chunk)
-                    self.processed_bytes += len(chunk)
-                    
-                    # Update progress if callback provided
-                    if progress_callback and self.total_bytes > 0:
-                        progress = min(1.0, self.processed_bytes / self.total_bytes)
-                        progress_callback(progress, f"Processing: {progress*100:.1f}%")
-                    
-                    # Check for size limit violations
-                    if self.processed_bytes > Config.MAX_FILE_SIZE:
-                        logger.error("File size exceeded during processing")
-                        try:
-                            os.unlink(output_path)
-                        except:
-                            pass
-                        return False
-                
-                # Ensure data is written to disk
-                output_file.flush()
-                os.fsync(output_file.fileno())
-            
-            # Verify file was written correctly
-            if os.path.exists(output_path):
-                actual_size = os.path.getsize(output_path)
-                if actual_size == self.total_bytes:
-                    logger.info(f"File processed successfully: {actual_size / 1024 / 1024:.1f}MB")
-                    return True
-                else:
-                    logger.error(f"File size mismatch: expected {self.total_bytes}, got {actual_size}")
-                    return False
-            else:
-                logger.error("Output file was not created")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Chunked file processing failed: {e}")
-            # Clean up partial file on error
-            try:
-                if os.path.exists(output_path):
-                    os.unlink(output_path)
-            except:
-                pass
-            return False
-        finally:
-            # Always cleanup memory after processing
-            self.cleanup_memory()
 
 
 class ScreenManager:
@@ -4186,71 +4029,54 @@ class StreamlitInterface:
         """Create temporary video file with optimized chunking for production. Returns (path, [path]) or (None, [])."""
         if not video_file:
             return None, []
-        
         try:
-            # Validate file size
-            file_size = getattr(video_file, 'size', 0)
-            if file_size > Config.MAX_FILE_SIZE:
-                st.error(f"File too large: {file_size / 1024 / 1024:.1f}MB (max: {Config.MAX_FILE_SIZE / 1024 / 1024:.1f}MB)")
+            if hasattr(video_file, 'size') and video_file.size > Config.MAX_FILE_SIZE:
+                st.error(f"File too large: {video_file.size / 1024 / 1024:.1f}MB (max: {Config.MAX_FILE_SIZE / 1024 / 1024:.1f}MB)")
                 return None, []
-            
-            # Validate file format
             video_suffix = Path(video_file.name).suffix.lower()
             if video_suffix not in Config.SUPPORTED_VIDEO_FORMATS:
                 st.error(f"Unsupported file format: {video_suffix}")
                 return None, []
-            
-            # Generate session ID if not provided
             session_id = session_id or get_session_manager().generate_session_id()
             
-            # Create safe filename
             safe_filename = re.sub(r'[^\w.-]', '_', video_file.name)[:100]
             
-            # Create temporary file path
-            with tempfile.NamedTemporaryFile(
-                delete=False, 
-                suffix=video_suffix, 
-                prefix=f"video_{session_id}_"
-            ) as tmp_file:
-                temp_path = tmp_file.name
-            
-            # Initialize chunked file processor
-            processor = ChunkedFileProcessor()
-            
-            # Show progress bar for larger files
-            progress_bar = None
-            if file_size > 10 * 1024 * 1024:  # > 10MB
-                progress_bar = st.progress(0, text="Uploading video...")
-            
-            def progress_callback(progress: float, message: str):
-                if progress_bar:
-                    progress_bar.progress(progress, text=message)
-            
-            # Process file in chunks
-            success = processor.process_file_in_chunks(
-                video_file, 
-                temp_path, 
-                progress_callback=progress_callback
-            )
-            
-            # Clean up progress bar
-            if progress_bar:
-                progress_bar.empty()
-            
-            if success:
-                logger.info(f"Video file processed successfully: {temp_path}")
-                return temp_path, [temp_path]
+            file_size = getattr(video_file, 'size', 0)
+            if file_size > 100 * 1024 * 1024:  # > 100MB
+                chunk_size = 4 * 1024 * 1024  # 4MB
+            elif file_size > 50 * 1024 * 1024:  # > 50MB
+                chunk_size = 2 * 1024 * 1024  # 2MB
             else:
-                logger.error("Failed to process video file")
-                # Clean up temp file on failure
-                try:
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                except:
-                    pass
-                st.error("Failed to process uploaded video file")
-                return None, []
+                chunk_size = 1024 * 1024  # 1MB
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=video_suffix, prefix=f"video_{session_id}_") as tmp:
+                total_written = 0
+                video_file.seek(0)
                 
+                if file_size > 50 * 1024 * 1024:
+                    progress_bar = st.progress(0, text="Uploading video...")
+                    
+                while True:
+                    chunk = video_file.read(chunk_size)
+                    if not chunk:
+                        break
+                    total_written += len(chunk)
+                    if total_written > Config.MAX_FILE_SIZE:
+                        os.unlink(tmp.name)
+                        st.error("File size exceeded during upload")
+                        return None, []
+                    tmp.write(chunk)
+                    
+                    if file_size > 50 * 1024 * 1024:
+                        progress = min(1.0, total_written / file_size)
+                        progress_bar.progress(progress, text=f"Uploading video... {progress*100:.1f}%")
+                
+                if file_size > 50 * 1024 * 1024:
+                    progress_bar.empty()
+                
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                return tmp.name, [tmp.name]
         except Exception as e:
             logger.error(f"Temp video creation failed: {e}")
             st.error(f"Failed to process uploaded video: {str(e)}")
