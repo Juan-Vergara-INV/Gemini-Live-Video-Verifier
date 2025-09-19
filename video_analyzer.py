@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 import pytesseract
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 
 import librosa
 import speech_recognition as sr
@@ -225,8 +226,15 @@ class TaskVerifier:
         config = ConfigurationManager.get_secure_config()
         self.SHEET_URL = config["verifier_sheet_url"]
         self.SHEET_ID = config["verifier_sheet_id"]
-        self.QUESTION_IDS_SHEET = "Question IDs"
-        self.ALIAS_EMAILS_SHEET = "Alias Emails"
+        self.QUESTION_IDS_SHEET = "Question_ID"
+        self.ALIAS_EMAILS_SHEET = "Alias_Email"
+        self._conn = None
+    
+    def _get_connection(self) -> GSheetsConnection:
+        """Get or create the GSheetsConnection instance."""
+        if self._conn is None:
+            self._conn = st.connection("gsheets", type=GSheetsConnection)
+        return self._conn
     
     def verify_inputs(self, question_id: str, alias_email: str) -> Tuple[bool, str]:
         """Verify if question_id and alias_email are both authorized."""
@@ -247,87 +255,101 @@ class TaskVerifier:
         """Check if both question_id and alias_email are authorized."""
         try:
             question_ids = self._fetch_sheet_data(self.QUESTION_IDS_SHEET)
+            
             alias_emails = self._fetch_sheet_data(self.ALIAS_EMAILS_SHEET)
             
             question_found = False
-            for entry in question_ids:
-                if str(entry).strip() == question_id:
+            for i, entry in enumerate(question_ids):
+                entry_str = str(entry).strip()
+                if entry_str == question_id:
                     question_found = True
                     break
             
             if not question_found:
+                logger.error(f"❌ Question ID '{question_id}' not found in {len(question_ids)} entries")
+                logger.error(f"Available question IDs (first 10): {question_ids[:10]}")
                 return False, f"Question ID '{question_id}' not found in authorized list"
             
             email_found = False
-            for entry in alias_emails:
-                if str(entry).strip().lower() == alias_email.lower():
+            for i, entry in enumerate(alias_emails):
+                entry_str = str(entry).strip().lower()
+                if entry_str == alias_email.lower():
                     email_found = True
                     break
             
             if not email_found:
+                logger.error(f"❌ Alias email '{alias_email}' not found in {len(alias_emails)} entries")
+                logger.error(f"Available alias emails (first 10): {alias_emails[:10]}")
                 return False, f"Alias email '{alias_email}' not found in authorized list"
             
             return True, f"Both Question ID '{question_id}' and email '{alias_email}' are authorized"
             
         except Exception as e:
             logger.error(f"Input check error: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False, f"Failed to verify inputs: {str(e)}"
 
     def _fetch_sheet_data(self, sheet_name: str) -> List[str]:
-        """Fetch data from a specific sheet."""
+        """Fetch data from a specific sheet using Streamlit GSheetsConnection."""
+        
         try:
-            config = ConfigurationManager.get_secure_config()
-            gas_url = config["apps_script_url"]
+            conn = self._get_connection()
             
-            payload = {
-                "action": "getAuthorizedEntries",
-                "sheetName": sheet_name,
-                "data": {}
-            }
-            
-            response = requests.post(
-                gas_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
+            df = conn.read(
+                spreadsheet=self.SHEET_URL,
+                worksheet=sheet_name,
+                ttl="20m",
+                usecols=None,
+                nrows=None
             )
             
-            response.raise_for_status()
-            result = response.json()
-
-            if result.get("success"):
-                raw_data = result.get("data", [])
-                values = []
+            values = []
+            
+            if not df.empty:
+                if sheet_name == "Question_ID":
+                    if 'Question_ID' in df.columns:
+                        column_data = df['Question_ID'].dropna()
+                    elif 'question_id' in df.columns:
+                        column_data = df['question_id'].dropna()
+                    elif 'id' in df.columns:
+                        column_data = df['id'].dropna()
+                    else:
+                        column_data = df.iloc[:, 0].dropna()
+                    
+                    for value in column_data:
+                        if value and str(value).strip():
+                            values.append(str(value).strip())
                 
-                for item in raw_data:
-                    if isinstance(item, dict):
-                        if sheet_name == "Question IDs":
-                            question_id = item.get('question_id', item.get('id', ''))
-                            if question_id and str(question_id).strip():
-                                values.append(str(question_id).strip())
-                        elif sheet_name == "Alias Emails":
-                            alias_email = item.get('alias_email', item.get('email', ''))
-                            if alias_email and str(alias_email).strip():
-                                values.append(str(alias_email).strip())
-                        else:
-                            for value in item.values():
-                                if value and str(value).strip():
-                                    values.append(str(value).strip())
-                                    break
-                    elif item and str(item).strip():
-                        values.append(str(item).strip())
+                elif sheet_name == "Alias_Email":
+                    if 'Alias_Email' in df.columns:
+                        column_data = df['Alias_Email'].dropna()
+                    elif 'alias_email' in df.columns:
+                        column_data = df['alias_email'].dropna()
+                    elif 'email' in df.columns:
+                        column_data = df['email'].dropna()
+                    else:
+                        column_data = df.iloc[:, 0].dropna()
+                    
+                    for value in column_data:
+                        if value and str(value).strip():
+                            values.append(str(value).strip())
                 
-                return values
+                else:
+                    column_data = df.iloc[:, 0].dropna()
+                    for value in column_data:
+                        if value and str(value).strip():
+                            values.append(str(value).strip())
+                    
             else:
-                error_msg = result.get('message', result.get('error', 'Unknown error'))
-                logger.error(f"Google Sheets API error for {sheet_name}: {error_msg}")
-                return []
+                logger.warning(f"DataFrame is empty for sheet: '{sheet_name}'")
+            return values
                 
-        except requests.RequestException as e:
-            logger.error(f"Network error fetching {sheet_name} sheet: {e}")
-            return []
         except Exception as e:
-            logger.error(f"Unexpected error fetching {sheet_name} sheet: {e}")
+            logger.error(f"Error fetching {sheet_name} sheet via Streamlit connection: {e}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return []
 
 
@@ -998,7 +1020,7 @@ class AnalysisScreen:
             frame_interval=st.session_state.frame_interval,
             progress_callback=progress_callback
         )
-        overall_progress.progress(90, text="Analysis complete, wrapping up...")
+        overall_progress.progress(90, text="Wrapping up...")
         analyzer.export_results("results.json")
         
         analyzer.cleanup_temp_files()
@@ -1394,7 +1416,7 @@ class AnalysisScreen:
 
 
 class GoogleSheetsResultsExporter:
-    """Export video analysis results to Google Sheets silently."""
+    """Export video analysis results to Google Sheets."""
     
     def __init__(self):
         self.service = None
@@ -1410,7 +1432,6 @@ class GoogleSheetsResultsExporter:
                 service_account_info = ConfigurationManager.get_google_service_account_info()
                 if service_account_info:
                     credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-                    logger.info("Using Google service account credentials from Streamlit secrets for Sheets export")
             except Exception as e:
                 logger.warning(f"Could not load credentials from secrets for Sheets: {e}")
             
@@ -1419,8 +1440,7 @@ class GoogleSheetsResultsExporter:
                 self.service = None
                 return
             
-            self.service = build('sheets', 'v4', credentials=credentials)
-            logger.info("Google Sheets service initialized successfully")
+            self.service = build('sheets', 'v4', credentials=credentials, cache_discovery=False)
             
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets service: {e}")
@@ -1464,7 +1484,6 @@ class GoogleSheetsResultsExporter:
                 body=body
             ).execute()
             
-            logger.info(f"Successfully exported results to Google Sheets for {question_id} - {alias_email}")
             return True
             
         except Exception as e:
@@ -1651,7 +1670,6 @@ class GoogleSheetsResultsExporter:
                     body=body
                 ).execute()
                 
-                logger.info(f"Created results sheet '{sheet_name}' with headers")
                 return 0
             else:
                 return target_sheet['properties']['sheetId']
@@ -1687,8 +1705,7 @@ class GoogleDriveIntegration:
                 self.service = None
                 return
             
-            self.service = build('drive', 'v3', credentials=credentials)
-            logger.info("Google Drive service initialized successfully")
+            self.service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
             
         except ImportError:
             logger.error("Google API client libraries not installed")
