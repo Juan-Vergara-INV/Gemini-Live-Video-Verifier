@@ -228,13 +228,11 @@ class TaskVerifier:
         self.SHEET_ID = config["verifier_sheet_id"]
         self.QUESTION_IDS_SHEET = "Question_ID"
         self.ALIAS_EMAILS_SHEET = "Alias_Email"
-        self._conn = None
     
-    def _get_connection(self) -> GSheetsConnection:
+    @st.cache_resource
+    def _get_connection(_self) -> GSheetsConnection:
         """Get or create the GSheetsConnection instance."""
-        if self._conn is None:
-            self._conn = st.connection("gsheets", type=GSheetsConnection)
-        return self._conn
+        return st.connection("gsheets", type=GSheetsConnection)
     
     def verify_inputs(self, question_id: str, alias_email: str) -> Tuple[bool, str]:
         """Verify if question_id and alias_email are both authorized."""
@@ -281,7 +279,6 @@ class TaskVerifier:
                 logger.error(f"❌ Alias email '{alias_email}' not found in {len(alias_emails)} entries")
                 logger.error(f"Available alias emails (first 10): {alias_emails[:10]}")
                 return False, f"Alias email '{alias_email}' not found in authorized list"
-            
             return True, f"Both Question ID '{question_id}' and email '{alias_email}' are authorized"
             
         except Exception as e:
@@ -290,14 +287,15 @@ class TaskVerifier:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return False, f"Failed to verify inputs: {str(e)}"
 
-    def _fetch_sheet_data(self, sheet_name: str) -> List[str]:
+    @st.cache_data(ttl=600, show_spinner="Fetching authorization data...")
+    def _fetch_sheet_data(_self, sheet_name: str) -> List[str]:
         """Fetch data from a specific sheet using Streamlit GSheetsConnection."""
         
         try:
-            conn = self._get_connection()
+            conn = _self._get_connection()
             
             df = conn.read(
-                spreadsheet=self.SHEET_URL,
+                spreadsheet=_self.SHEET_URL,
                 worksheet=sheet_name,
                 ttl="20m",
                 usecols=None,
@@ -617,18 +615,6 @@ class ScreenManager:
         st.session_state.analysis_in_progress = False
         st.session_state.analysis_started = False
         st.session_state.validation_error_shown = False
-        
-        try:
-            if hasattr(st, 'cache_data') and hasattr(st.cache_data, 'clear'):
-                st.cache_data.clear()
-        except:
-            pass
-        
-        try:
-            if hasattr(st, 'cache_resource') and hasattr(st.cache_resource, 'clear'):
-                st.cache_resource.clear()
-        except:
-            pass
         
         logger.info(f"Reset session for new analysis with new session ID: {st.session_state.session_id}")
         st.rerun()
@@ -1426,10 +1412,10 @@ class GoogleSheetsResultsExporter:
     """Export video analysis results to Google Sheets."""
     
     def __init__(self):
-        self.service = None
-        self._initialize_service()
+        self.service = self._get_sheets_service()
     
-    def _initialize_service(self):
+    @st.cache_resource(show_spinner=False)
+    def _get_sheets_service(_):
         """Initialize Google Sheets service using service account."""
         try:
             scopes = ['https://www.googleapis.com/auth/spreadsheets']
@@ -1444,14 +1430,17 @@ class GoogleSheetsResultsExporter:
             
             if not credentials:
                 logger.error("No Google credentials found for Sheets export")
-                self.service = None
-                return
+                return None
             
-            self.service = build('sheets', 'v4', credentials=credentials, cache_discovery=False)
+            return build('sheets', 'v4', credentials=credentials, cache_discovery=False)
             
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets service: {e}")
-            self.service = None
+            return None
+    
+    def _initialize_service(self):
+        """Initialize Google Sheets service using service account."""
+        self.service = self._get_sheets_service()
     
     def export_results(self, question_id: str, alias_email: str, analysis_results: List[DetectionResult], 
                       qa_checker: 'QualityAssuranceChecker', video_duration: float = 0.0) -> bool:
@@ -1684,10 +1673,10 @@ class GoogleDriveIntegration:
     """Google Drive integration for creating submission folders."""
     
     def __init__(self):
-        self.service = None
-        self._initialize_service()
+        self.service = self._get_drive_service()
     
-    def _initialize_service(self):
+    @st.cache_resource(show_spinner=False)
+    def _get_drive_service(_):
         """Initialize Google Drive service using service account."""
         try:
             scopes = ['https://www.googleapis.com/auth/drive']
@@ -1703,20 +1692,23 @@ class GoogleDriveIntegration:
             
             if not credentials:
                 logger.error("No Google credentials found. Please configure credentials in Streamlit secrets or set environment variables")
-                self.service = None
-                return
+                return None
             
-            self.service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
+            return build('drive', 'v3', credentials=credentials, cache_discovery=False)
             
         except ImportError:
             logger.error("Google API client libraries not installed")
-            self.service = None
+            return None
         except json.JSONDecodeError:
             logger.error("Invalid JSON format in GOOGLE_SERVICE_ACCOUNT_JSON environment variable")
-            self.service = None
+            return None
         except Exception as e:
             logger.error(f"Failed to initialize Google Drive service: {e}")
-            self.service = None
+            return None
+    
+    def _initialize_service(self):
+        """Initialize Google Drive service using service account."""
+        self.service = self._get_drive_service()
     
     def create_submission_folder(self, question_id: str, alias_email: str) -> Optional[str]:
         """Create a Google Drive folder for video submission."""
@@ -1960,6 +1952,7 @@ class ConfigurationManager:
                 raise RuntimeError(f"Cannot load secure configuration: {e}") from e
     
     @classmethod
+    @st.cache_data(ttl=300, show_spinner=False)
     def get_google_service_account_info(cls) -> Optional[Dict[str, Any]]:
         """Get Google service account credentials from secrets."""
         try:
@@ -2000,6 +1993,7 @@ class TextMatcher:
     }
 
     @staticmethod
+    @st.cache_data(show_spinner=False)
     def calculate_similarity(text1: str, text2: str) -> float:
         """Calculate text similarity using normalized Levenshtein distance."""
         if not text1 or not text2:
@@ -2013,6 +2007,7 @@ class TextMatcher:
         return TextMatcher._compute_levenshtein_similarity(text1, text2, len1, len2)
 
     @staticmethod
+    @st.cache_data(show_spinner=False)
     def _compute_levenshtein_similarity(text1: str, text2: str, len1: int, len2: int) -> float:
         """Compute Levenshtein similarity using space-optimized algorithm."""
         if len(text1) > len(text2):
@@ -2036,6 +2031,7 @@ class TextMatcher:
         return max(0.0, 1.0 - (edit_distance / len2))
 
     @classmethod
+    @st.cache_data(show_spinner=False)
     def apply_ocr_corrections(cls, text: str) -> str:
         """Apply common OCR error corrections to improve recognition accuracy."""
         if not text:
@@ -2046,6 +2042,7 @@ class TextMatcher:
         return corrected
 
     @classmethod
+    @st.cache_data(show_spinner=False)
     def match_text(cls, detected: str, expected: str, enable_fuzzy: bool = True) -> Tuple[bool, str]:
         """Precise text matching that requires more exact matches to avoid false positives."""
         if not detected or not expected:
@@ -2082,12 +2079,14 @@ class TextMatcher:
         return False, f'no_match_similarity_{overall_similarity:.2f}'
 
     @classmethod
+    @st.cache_data(show_spinner=False)
     def _match_roaring_tiger_variants(cls, detected_text: str) -> bool:
         """Matching for roaring tiger with various separators."""
         pattern = r'\broaring\s*[.\s_-]*\s*tiger\b'
         return bool(re.search(pattern, detected_text))
 
     @classmethod
+    @st.cache_data(show_spinner=False)
     def _exact_phrase_match(cls, detected: str, expected: str) -> bool:
         expected_words = expected.split()
         if len(expected_words) == 1:
@@ -2102,48 +2101,27 @@ class TextMatcher:
 class AudioAnalyzer:
     """Audio processing for voice and language detection with voice separation capabilities."""
     
-    _shared_whisper_model = None
-    _whisper_model_lock = threading.RLock()
-    _model_loading_condition = threading.Condition(_whisper_model_lock)
-    _model_loading = False
-    
     def __init__(self):
         self.whisper_model = None
         self.supported_languages = Config.get_supported_languages()
         self.voice_features_cache = {}
     
+    @staticmethod
+    @st.cache_resource(show_spinner=False)
+    def _load_whisper_model_cached(model_size: str = "base") -> 'whisper.Whisper':
+        """Load Whisper transcription model with Streamlit caching."""
+        import whisper
+        return whisper.load_model(model_size)
+    
     def load_whisper_model(self, model_size: str = "base") -> bool:
-        """Load Whisper transcription model with thread-safe shared loading."""
+        """Load Whisper transcription model using Streamlit caching."""
         try:
-            model_size = "base"
-            
-            with AudioAnalyzer._model_loading_condition:
-                if AudioAnalyzer._shared_whisper_model is not None:
-                    self.whisper_model = AudioAnalyzer._shared_whisper_model
-                    return True
-                
-                while AudioAnalyzer._model_loading:
-                    AudioAnalyzer._model_loading_condition.wait()
-                    
-                    if AudioAnalyzer._shared_whisper_model is not None:
-                        self.whisper_model = AudioAnalyzer._shared_whisper_model
-                        return True
-                
-                AudioAnalyzer._model_loading = True
-                try:
-                    AudioAnalyzer._shared_whisper_model = whisper.load_model(model_size)
-                    self.whisper_model = AudioAnalyzer._shared_whisper_model
-                    logger.info(f"Whisper model '{model_size}' loaded successfully")
-                    return True
-                finally:
-                    AudioAnalyzer._model_loading = False
-                    AudioAnalyzer._model_loading_condition.notify_all()
-                    
+            model_size = "base"  # Force base model
+            self.whisper_model = AudioAnalyzer._load_whisper_model_cached(model_size)
+            logger.info(f"Whisper model '{model_size}' loaded successfully")
+            return True
         except Exception as e:
             logger.error(f"Whisper model load failed: {e}")
-            with AudioAnalyzer._model_loading_condition:
-                AudioAnalyzer._model_loading = False
-                AudioAnalyzer._model_loading_condition.notify_all()
             return False
     
     def extract_audio(self, video_path: str, output_path: str) -> bool:
@@ -2156,15 +2134,16 @@ class AudioAnalyzer:
             logger.error(f"Audio extraction failed: {e}")
             return False
     
-    def analyze_full_audio_fluency(self, audio_path: str, target_language: str) -> Optional[Dict[str, Any]]:
+    @st.cache_data(show_spinner=False)
+    def analyze_full_audio_fluency(_self, audio_path: str, target_language: str) -> Optional[Dict[str, Any]]:
         """Analyze language fluency for entire audio file."""
-        if self.whisper_model is None:
+        if _self.whisper_model is None:
             return {'detected_language': 'unknown', 'is_fluent': False, 'confidence': 0.0}
         
         try:
             whisper_language = Config.locale_to_whisper_language(target_language)
             
-            result = self.whisper_model.transcribe(
+            result = _self.whisper_model.transcribe(
                 audio_path, 
                 task="transcribe", 
                 fp16=False,
@@ -2218,7 +2197,8 @@ class AudioAnalyzer:
                 'error': str(e)
             }
     
-    def detect_voice_activity(self, audio_path: str, frame_length: int = 2048, 
+    @st.cache_data(show_spinner=False)
+    def detect_voice_activity(_self, audio_path: str, frame_length: int = 2048, 
                              hop_length: int = 512) -> Dict[str, Any]:
         """Detect voice activity in audio using multi-feature approach."""
         try:
@@ -2268,7 +2248,7 @@ class AudioAnalyzer:
             voice_activity = median_filter(voice_activity.astype(float), size=7) > 0.5
             
             # Post-processing: remove very short segments
-            voice_activity = self._remove_short_segments(voice_activity, min_length=5)
+            voice_activity = _self._remove_short_segments(voice_activity, min_length=5)
             
             # Calculate percentage of frames with voice
             voice_ratio = np.sum(voice_activity) / len(voice_activity) if len(voice_activity) > 0 else 0
@@ -2323,7 +2303,8 @@ class AudioAnalyzer:
                 'audio_duration': 0.0
             }
     
-    def _remove_short_segments(self, activity: np.ndarray, min_length: int) -> np.ndarray:
+    @st.cache_data(show_spinner=False)
+    def _remove_short_segments(_self, activity: np.ndarray, min_length: int) -> np.ndarray:
         """Remove segments shorter than min_length frames."""
         result = activity.copy()
         
@@ -2337,7 +2318,8 @@ class AudioAnalyzer:
                 
         return result
     
-    def _find_histogram_peaks(self, hist: np.ndarray, min_distance: int = 3) -> List[int]:
+    @st.cache_data(show_spinner=False)
+    def _find_histogram_peaks(_self, hist: np.ndarray, min_distance: int = 3) -> List[int]:
         """Find peaks in histogram for bimodal distribution detection."""
         peaks = []
         
@@ -2348,7 +2330,8 @@ class AudioAnalyzer:
         
         return peaks
     
-    def analyze_speaker_count(self, audio_path: str, vad_info: Dict[str, Any] = None) -> Dict[str, Any]:
+    @st.cache_data(show_spinner=False)
+    def analyze_speaker_count(_self, audio_path: str, vad_info: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Analyze audio to estimate the number of distinct speakers.
         Uses improved approach based on spectral features, pitch, and temporal analysis.
@@ -2488,7 +2471,7 @@ class AudioAnalyzer:
                 if len(pitch_values) > 500:
                     pitch_hist, pitch_bins = np.histogram(pitch_values, bins=20)
                     pitch_hist_norm = pitch_hist / np.sum(pitch_hist)
-                    peaks = self._find_histogram_peaks(pitch_hist_norm)
+                    peaks = _self._find_histogram_peaks(pitch_hist_norm)
                     if len(peaks) >= 2:
                         # Check if peaks are far apart (different speakers)
                         peak_distance = abs(peaks[1] - peaks[0])
@@ -2499,7 +2482,7 @@ class AudioAnalyzer:
             
             # 4. Audio duration and voice ratio analysis
             if vad_info is None:
-                vad_info = self.voice_features_cache.get('vad_results', {})
+                vad_info = _self.voice_features_cache.get('vad_results', {})
             voice_ratio = vad_info.get('voice_ratio', 0)
             total_duration = vad_info.get('audio_duration', 0)
             
@@ -2553,7 +2536,7 @@ class AudioAnalyzer:
             
             # Store VAD results for use in analysis if not passed directly
             if vad_info and 'voice_ratio' in vad_info:
-                self.voice_features_cache['vad_results'] = vad_info
+                _self.voice_features_cache['vad_results'] = vad_info
             
             return {
                 'estimated_speakers': speaker_count,
@@ -2583,13 +2566,14 @@ class AudioAnalyzer:
                 'audio_features': {}
             }
     
-    def analyze_voice_audibility(self, audio_path: str) -> Dict[str, Any]:
+    @st.cache_data(show_spinner=False)
+    def analyze_voice_audibility(_self, audio_path: str) -> Dict[str, Any]:
         """
         Comprehensive voice audibility analysis combining VAD and speaker detection.
         Returns whether there are 0, 1, or 2 audible voices.
         """
         try:
-            vad_results = self.detect_voice_activity(audio_path)
+            vad_results = _self.detect_voice_activity(audio_path)
             
             if not vad_results['has_voice'] or (vad_results['voice_ratio'] < 0.02 and vad_results['num_segments'] == 0):
                 return {
@@ -2604,7 +2588,7 @@ class AudioAnalyzer:
                     'has_multiple_speakers': False
                 }
             
-            speaker_results = self.analyze_speaker_count(audio_path, vad_info=vad_results)
+            speaker_results = _self.analyze_speaker_count(audio_path, vad_info=vad_results)
             
             # Get initial speaker count
             num_voices = speaker_results['estimated_speakers']
@@ -3933,6 +3917,7 @@ class VideoContentAnalyzer:
         return self.video_duration
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def create_detection_rules(target_language: str) -> List[DetectionRule]:
     """Create the standard detection rules for video analysis."""
     target_language = target_language.strip()
@@ -4014,6 +3999,7 @@ class StreamlitInterface:
         st.markdown(css, unsafe_allow_html=True)
 
     @staticmethod
+    @st.cache_data(show_spinner=False)
     def _get_custom_css() -> str:
         """Return custom CSS for the app UI."""
         return """
@@ -4802,10 +4788,10 @@ class ApplicationRunner:
             ApplicationRunner._render_sidebar_session_info()
     
     @staticmethod
-    def _render_sidebar_help():
-        """Render help dropdown with program usage instructions."""
-        with st.expander("❓ Help - How to Use", expanded=False):
-            st.markdown("""
+    @st.cache_data(show_spinner=False)
+    def _get_help_content():
+        """Get static help content for sidebar."""
+        return """
             ### 📋 How to Use This Tool
             
             **Step 1: Input Parameters**
@@ -4855,7 +4841,13 @@ class ApplicationRunner:
             - Speak clearly in the **expected language**
             - Minimize **background noise** for better voice audibility
             - Verify all **input parameters** before starting analysis
-            """)
+            """
+
+    @staticmethod
+    def _render_sidebar_help():
+        """Render help dropdown with program usage instructions."""
+        with st.expander("❓ Help - How to Use", expanded=False):
+            st.markdown(ApplicationRunner._get_help_content())
     
     @staticmethod
     def _render_sidebar_session_info():
