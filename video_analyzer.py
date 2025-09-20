@@ -3917,7 +3917,6 @@ class VideoContentAnalyzer:
         return self.video_duration
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def create_detection_rules(target_language: str) -> List[DetectionRule]:
     """Create the standard detection rules for video analysis."""
     target_language = target_language.strip()
