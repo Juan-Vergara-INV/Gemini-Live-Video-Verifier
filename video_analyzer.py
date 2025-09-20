@@ -618,6 +618,18 @@ class ScreenManager:
         st.session_state.analysis_started = False
         st.session_state.validation_error_shown = False
         
+        try:
+            if hasattr(st, 'cache_data') and hasattr(st.cache_data, 'clear'):
+                st.cache_data.clear()
+        except:
+            pass
+        
+        try:
+            if hasattr(st, 'cache_resource') and hasattr(st.cache_resource, 'clear'):
+                st.cache_resource.clear()
+        except:
+            pass
+        
         logger.info(f"Reset session for new analysis with new session ID: {st.session_state.session_id}")
         st.rerun()
     
@@ -748,9 +760,11 @@ class InputScreen:
         inferred_task_type = InputScreen._infer_task_type_from_question_id(question_id)
         st.session_state.task_type = inferred_task_type
 
-        st.info(f"⏳ **Minimum Video Duration Required**: {Config.MIN_VIDEO_DURATION} seconds")
-
-        st.info("📱 **Video Resolution**: Video must have standard mobile phone resolution")
+        if video_file:
+            InputScreen._render_video_validation_and_properties(video_file)
+        else:
+            st.info(f"⏳ **Minimum Video Duration Required**: {Config.MIN_VIDEO_DURATION} seconds")
+            st.info("📱 **Video Resolution**: Video must have standard mobile phone resolution")
 
         if question_id:
             language_display = Config.get_language_display_name(inferred_language)
@@ -765,9 +779,6 @@ class InputScreen:
         else:
             st.info(f"🗣️ **Target Language**: Will be inferred from Question ID")
             st.info(f"🎯 **Task Type**: Will be inferred from Question ID")
-
-        if video_file:
-            InputScreen._render_video_validation_and_properties(video_file)
 
     @staticmethod
     def _render_validation_and_navigation():
@@ -923,30 +934,26 @@ class InputScreen:
             st.session_state.cached_video_file_name = video_file.name
             st.session_state.video_validation = validation_results
             
-            col1, col2 = st.columns(2)
+            duration = validation_results.get('duration', 0)
+            duration_valid = validation_results.get('duration_valid', False)
+            min_duration = validation_results.get('min_duration_required', Config.MIN_VIDEO_DURATION)
             
-            with col1:
-                duration = validation_results.get('duration', 0)
-                duration_valid = validation_results.get('duration_valid', False)
-                min_duration = validation_results.get('min_duration_required', Config.MIN_VIDEO_DURATION)
-                
-                if duration_valid:
-                    st.success(f"✅ **Duration**: {duration:.1f}s (≥ {min_duration}s required)")
+            if duration_valid:
+                st.success(f"✅ **Duration**: {duration:.1f}s (≥ {min_duration}s required)")
+            else:
+                st.error(f"❌ **Duration**: {duration:.1f}s (minimum {min_duration}s required)")
+            
+            width = validation_results.get('width', 0)
+            height = validation_results.get('height', 0)
+            resolution_valid = validation_results.get('resolution_valid', False)
+            
+            if resolution_valid:
+                st.success(f"✅ **Resolution**: {width}x{height} (Portrait mobile format)")
+            else:
+                if width >= height:
+                    st.error(f"❌ **Resolution**: {width}x{height} (Must be portrait orientation)")
                 else:
-                    st.error(f"❌ **Duration**: {duration:.1f}s (minimum {min_duration}s required)")
-                    
-            with col2:
-                width = validation_results.get('width', 0)
-                height = validation_results.get('height', 0)
-                resolution_valid = validation_results.get('resolution_valid', False)
-                
-                if resolution_valid:
-                    st.success(f"✅ **Resolution**: {width}x{height} (Portrait mobile format)")
-                else:
-                    if width >= height:
-                        st.error(f"❌ **Resolution**: {width}x{height} (Must be portrait orientation)")
-                    else:
-                        st.error(f"❌ **Resolution**: {width}x{height} (Not standard mobile portrait format)")
+                    st.error(f"❌ **Resolution**: {width}x{height} (Not standard mobile portrait format)")
                 
         except Exception as e:
             st.error(f"❌ Could not validate video: {str(e)}")
@@ -1515,7 +1522,7 @@ class GoogleSheetsResultsExporter:
         
         flash_detected_text = self._extract_detected_text_for_rule(analysis_results, '2.5 Flash')
         alias_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Alias Name')
-        eval_mode_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Evaluation Mode')
+        eval_mode_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Eval Mode')
         
         language_status = "PASS" if language_check.get('passed', False) else "FAIL"
         language_details = language_check.get('details', '')
@@ -1531,9 +1538,6 @@ class GoogleSheetsResultsExporter:
         
         submission_eligible = overall_qa.get('passed', False)
         submission_status = "ELIGIBLE" if submission_eligible else "NOT_ELIGIBLE"
-        
-        total_detections = len(analysis_results)
-        positive_detections = sum(1 for r in analysis_results if r.detected)
         
         row_data = [
             timestamp,
@@ -1557,9 +1561,6 @@ class GoogleSheetsResultsExporter:
             voice_details,
             str(num_voices),
             voice_debug_info,
-            str(total_detections),
-            str(positive_detections),
-            f"{overall_qa.get('score', 0.0):.2f}",
             submission_status,
             overall_qa.get('status', 'FAIL')
         ]
@@ -1574,11 +1575,11 @@ class GoogleSheetsResultsExporter:
             if rule_keyword.lower() in result.rule_name.lower() and result.detected:
                 detected_text = result.details.get('detected_text', '')
                 if detected_text:
-                    cleaned_text = detected_text.strip()
+                    cleaned_text = ' '.join(detected_text.split())
                     if cleaned_text and cleaned_text not in detected_texts:
                         detected_texts.append(cleaned_text)
         
-        return " | ".join(detected_texts) if detected_texts else "Not detected"
+        return " ".join(detected_texts) if detected_texts else "Not detected"
     
     def _extract_transcription_text(self, analysis_results: List[DetectionResult]) -> str:
         """Extract transcribed audio text from language fluency analysis."""
