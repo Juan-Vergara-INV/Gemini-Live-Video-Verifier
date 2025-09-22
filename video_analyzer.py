@@ -43,34 +43,18 @@ from google.oauth2.service_account import Credentials
 class Config:
     """Centralized application configuration constants."""
     
-    # Frame processing parameters
+    # Core processing parameters
     DEFAULT_FRAME_INTERVAL: float = 10.0
     
-    # OCR configuration
-    OCR_CONFIG: str = '--psm 3'
-    OCR_DENOISING_ENABLED: bool = True
-    OCR_THRESHOLD_ENABLED: bool = True
-    
-    # Video format support
-    SUPPORTED_VIDEO_FORMATS: List[str] = ['.mp4']
-    
-    # UI annotation settings
-    ANNOTATION_FONT = cv2.FONT_HERSHEY_SIMPLEX
-    ANNOTATION_FONT_SCALE: float = 0.5
-    ANNOTATION_THICKNESS: int = 2
-    
     # Resource limits
-    MAX_FILE_SIZE: int = 1024 * 1024 * 1024 # 1GB
+    MAX_FILE_SIZE: int = 1024 * 1024 * 1024  # 1GB
     MAX_VIDEO_DURATION: int = 600  # 10 minutes
     MIN_VIDEO_DURATION: int = 30   # 30 seconds
     
-    # Color definitions for UI annotations and bounding boxes
-    ANNOTATION_COLORS: Dict[str, Tuple[int, int, int]] = {
-        'GREEN': (0, 255, 0),
-        'RED': (0, 0, 255),
-        'YELLOW': (0, 255, 255),
-        'WHITE': (255, 255, 255),
-    }
+    # Detection rule default parameters
+    DEFAULT_MIN_FLUENCY_SCORE: float = 0.6
+    DEFAULT_MIN_CONFIDENCE: float = 0.3
+    DEFAULT_MIN_DURATION: float = 3.0
     
     # Language configuration for display and Whisper mapping
     LANGUAGE_CONFIG: Dict[str, Tuple[str, str]] = {
@@ -84,23 +68,16 @@ class Config:
     }
 
     @classmethod
-    def get_supported_languages(cls) -> Dict[str, str]:
-        """Get dict of supported language codes to display names."""
-        return {locale: display_name for locale, (display_name, _) in cls.LANGUAGE_CONFIG.items()}
-
-    @classmethod
     def get_language_display_name(cls, language_code: str) -> str:
         """Get display name for a language code."""
-        if language_code in cls.LANGUAGE_CONFIG:
+        if language_code and language_code in cls.LANGUAGE_CONFIG:
             return cls.LANGUAGE_CONFIG[language_code][0]
         return language_code if language_code else "No language inferred, please review Question ID"
     
     @classmethod
     def locale_to_whisper_language(cls, locale_code: str) -> str:
         """Convert locale code to Whisper language code."""
-        if locale_code in cls.LANGUAGE_CONFIG:
-            return cls.LANGUAGE_CONFIG[locale_code][1]
-        return locale_code
+        return cls.LANGUAGE_CONFIG.get(locale_code, (None, locale_code))[1]
 
     @classmethod
     def whisper_language_to_locale(cls, whisper_language: str, target_locale: str = None) -> str:
@@ -108,22 +85,17 @@ class Config:
         if target_locale and cls.locale_to_whisper_language(target_locale) == whisper_language:
             return target_locale
         return whisper_language if whisper_language else "unknown"
-    
+
     @classmethod
     def is_portrait_mobile_resolution(cls, width: int, height: int) -> bool:
         """Check if video resolution is portrait mobile phone format."""
         if width >= height:
             return False
-        
         aspect_ratio = height / width
-        
-        if 1.6 <= aspect_ratio <= 2.5:
-            if 360 <= width <= 1600:
-                return True
-        
-        return False
+        return 1.6 <= aspect_ratio <= 2.5 and 360 <= width <= 1600
     
     @classmethod
+    @st.cache_data(ttl=3600, show_spinner=False)
     def validate_video_properties(cls, video_path: str) -> Dict[str, Any]:
         """Validate and extract basic video properties including duration and resolution."""
         try:
@@ -139,31 +111,62 @@ class Config:
             
             cap.release()
             
-            validation_results = {
+            return {
                 'duration_valid': duration >= cls.MIN_VIDEO_DURATION,
                 'resolution_valid': cls.is_portrait_mobile_resolution(width, height),
                 'duration': duration,
                 'width': width,
                 'height': height,
-                'fps': fps,
-                'total_frames': total_frames,
                 'min_duration_required': cls.MIN_VIDEO_DURATION
             }
-            
-            return validation_results
             
         except Exception as e:
             logger.error(f"Video validation failed: {e}")
             return {'error': str(e)}
 
 
+class ConfigurationManager:
+    """Centralized configuration management."""
+    
+    @classmethod
+    @st.cache_data(ttl=600, show_spinner=False)
+    def get_secure_config(cls) -> Dict[str, str]:
+        """Get secure configuration from Streamlit secrets."""
+        try:
+            google_config = st.secrets["google"]
+            
+            return {
+                "apps_script_url": google_config["apps_script_url"],
+                "verifier_sheet_url": google_config["verifier_sheet_url"],
+                "verifier_sheet_id": google_config["verifier_sheet_id"],
+                "verifier_sheet_name": google_config["verifier_sheet_name"],
+                "results_export_sheet_id": google_config.get("submission_sheet_id", google_config["verifier_sheet_id"])
+            }
+            
+        except KeyError as e:
+            raise RuntimeError(f"Required configuration missing: {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"Cannot load secure configuration: {e}") from e
+    
+    @classmethod
+    @st.cache_data(ttl=600, show_spinner=False)
+    def get_google_service_account_info(cls) -> Optional[Dict[str, Any]]:
+        """Get Google service account credentials from secrets."""
+        try:
+            return dict(st.secrets["connections"]["gsheets"])
+        except KeyError:
+            return None
+        except Exception as e:
+            logger.error(f"Failed to load Google service account info: {e}")
+            return None
+
+
 class TargetTexts:
     """Target text definitions for detection."""
-    
-    FLASH_TEXT: str = "2.5 Flash"
-    PRO_TEXT: str = "2.5 Pro"
-    ALIAS_NAME_TEXT: str = "Roaring tiger"
-    EVAL_MODE_TEXT: str = "Eval Mode: Native Audio Output"
+    FLASH_TEXT = "2.5 Flash"
+    PRO_TEXT = "2.5 Pro"
+    ALIAS_NAME_TEXT = "Roaring tiger"
+    EVAL_MODE_TEXT = "Eval Mode: Native Audio Output"
 
 
 logging.basicConfig(
@@ -176,7 +179,7 @@ logger = logging.getLogger(__name__)
 
 
 class DetectionType(Enum):
-    """Content detection types enumeration."""
+    """Detection types for video content analysis."""
     TEXT = auto()
     LANGUAGE_FLUENCY = auto()
     VOICE_AUDIBILITY = auto()
@@ -184,7 +187,7 @@ class DetectionType(Enum):
 
 @dataclass
 class DetectionRule:
-    """Detection rule configuration."""
+    """Configuration for a video content detection rule."""
     name: str
     detection_type: DetectionType
     parameters: Dict[str, Any]
@@ -192,7 +195,7 @@ class DetectionRule:
 
 @dataclass
 class DetectionResult:
-    """Provides detailed information about detection operations including performance metrics and debugging information."""
+    """Detection operation result with performance metrics and debugging information."""
     rule_name: str
     timestamp: float
     frame_number: int
@@ -253,47 +256,27 @@ class TaskVerifier:
         """Check if both question_id and alias_email are authorized."""
         try:
             question_ids = self._fetch_sheet_data(self.QUESTION_IDS_SHEET)
-            
             alias_emails = self._fetch_sheet_data(self.ALIAS_EMAILS_SHEET)
             
-            question_found = False
-            for i, entry in enumerate(question_ids):
-                entry_str = str(entry).strip()
-                if entry_str == question_id:
-                    question_found = True
-                    break
-            
-            if not question_found:
+            if question_id not in [str(entry).strip() for entry in question_ids]:
                 logger.error(f"❌ Question ID '{question_id}' not found in {len(question_ids)} entries")
-                logger.error(f"Available question IDs (first 10): {question_ids[:10]}")
                 return False, f"Question ID '{question_id}' not found in authorized list"
             
-            email_found = False
-            for i, entry in enumerate(alias_emails):
-                entry_str = str(entry).strip().lower()
-                if entry_str == alias_email.lower():
-                    email_found = True
-                    break
-            
-            if not email_found:
+            if alias_email not in [str(entry).strip().lower() for entry in alias_emails]:
                 logger.error(f"❌ Alias email '{alias_email}' not found in {len(alias_emails)} entries")
-                logger.error(f"Available alias emails (first 10): {alias_emails[:10]}")
                 return False, f"Alias email '{alias_email}' not found in authorized list"
+                
             return True, f"Both Question ID '{question_id}' and email '{alias_email}' are authorized"
             
         except Exception as e:
-            logger.error(f"Input check error: {e}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(f"Input verification failed: {e}")
             return False, f"Failed to verify inputs: {str(e)}"
 
-    @st.cache_data(ttl=600, show_spinner="Fetching authorization data...")
+    @st.cache_data(ttl=600, show_spinner=False)
     def _fetch_sheet_data(_self, sheet_name: str) -> List[str]:
-        """Fetch data from a specific sheet using Streamlit GSheetsConnection."""
-        
+        """Fetch data from sheet using GSheetsConnection."""
         try:
             conn = _self._get_connection()
-            
             df = conn.read(
                 spreadsheet=_self.SHEET_URL,
                 worksheet=sheet_name,
@@ -302,52 +285,30 @@ class TaskVerifier:
                 nrows=None
             )
             
-            values = []
-            
-            if not df.empty:
-                if sheet_name == "Question_ID":
-                    if 'Question_ID' in df.columns:
-                        column_data = df['Question_ID'].dropna()
-                    elif 'question_id' in df.columns:
-                        column_data = df['question_id'].dropna()
-                    elif 'id' in df.columns:
-                        column_data = df['id'].dropna()
-                    else:
-                        column_data = df.iloc[:, 0].dropna()
-                    
-                    for value in column_data:
-                        if value and str(value).strip():
-                            values.append(str(value).strip())
-                
-                elif sheet_name == "Alias_Email":
-                    if 'Alias_Email' in df.columns:
-                        column_data = df['Alias_Email'].dropna()
-                    elif 'alias_email' in df.columns:
-                        column_data = df['alias_email'].dropna()
-                    elif 'email' in df.columns:
-                        column_data = df['email'].dropna()
-                    else:
-                        column_data = df.iloc[:, 0].dropna()
-                    
-                    for value in column_data:
-                        if value and str(value).strip():
-                            values.append(str(value).strip())
-                
-                else:
-                    column_data = df.iloc[:, 0].dropna()
-                    for value in column_data:
-                        if value and str(value).strip():
-                            values.append(str(value).strip())
-                    
-            else:
+            if df.empty:
                 logger.warning(f"DataFrame is empty for sheet: '{sheet_name}'")
-            return values
+                return []
+            
+            column_variants = {
+                "Question_ID": ['Question_ID', 'question_id', 'id'],
+                "Alias_Email": ['Alias_Email', 'alias_email', 'email']
+            }
+            
+            possible_columns = column_variants.get(sheet_name, [])
+            column_data = None
+            
+            for col_name in possible_columns:
+                if col_name in df.columns:
+                    column_data = df[col_name].dropna()
+                    break
+            
+            if column_data is None:
+                column_data = df.iloc[:, 0].dropna()
+            
+            return [str(value).strip() for value in column_data if value and str(value).strip()]
                 
         except Exception as e:
-            logger.error(f"Error fetching {sheet_name} sheet via Streamlit connection: {e}")
-            logger.error(f"Exception type: {type(e).__name__}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(f"Error fetching {sheet_name} sheet: {e}")
             return []
 
 
@@ -414,22 +375,17 @@ class SessionManager:
         try:
             session_dir = self.get_session_directory(session_id)
             if not session_dir:
-                logger.error(f"Session directory not found for {session_id}")
+                return None
+            
+            if frame is None or frame.size == 0:
                 return None
             
             filepath = os.path.join(session_dir, filename)
             
-            if frame is None or frame.size == 0:
-                logger.error(f"Invalid frame data for {filepath}")
-                return None
-            
-            success = cv2.imwrite(filepath, frame)
-            if success and os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+            if cv2.imwrite(filepath, frame) and os.path.exists(filepath) and os.path.getsize(filepath) > 0:
                 self.add_file_to_session(session_id, filepath)
                 return filepath
-            else:
-                logger.error(f"Failed to save frame: {filepath}")
-                return None
+            return None
                 
         except Exception as e:
             logger.error(f"Frame save error: {e}")
@@ -442,48 +398,30 @@ class SessionManager:
             raise ValueError(f"Session {session_id} not found")
         
         safe_prefix = re.sub(r'[^\w-]', '_', prefix)[:50]
-        timestamp = int(datetime.now().timestamp())
-        random_part = str(uuid.uuid4())[:8]
-        
-        filename = f"{safe_prefix}_{timestamp}_{random_part}{suffix}"
+        filename = f"{safe_prefix}_{int(datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}{suffix}"
         filepath = os.path.join(session_dir, filename)
         
         self.add_file_to_session(session_id, filepath)
         return filepath
     
     def cleanup_session(self, session_id: str) -> None:
-        """Clean up a session and all its files with enhanced memory management."""
+        """Clean up a session and all its files."""
         try:
             with self._lock:
                 session_dir = self.get_session_directory(session_id)
                 if not session_dir or not os.path.exists(session_dir):
                     return
                 
-                total_size = 0
-                try:
-                    for root, dirs, files in os.walk(session_dir):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            if os.path.exists(file_path):
-                                total_size += os.path.getsize(file_path)
-                except Exception as size_calc_error:
-                    logger.debug(f"Could not calculate session size: {size_calc_error}")
-                
-                try:
-                    shutil.rmtree(session_dir)
-                    logger.info(f"Removed session directory: {session_dir} ({total_size / 1024 / 1024:.1f}MB freed)")
-                except Exception as e:
-                    logger.error(f"Failed to remove session directory {session_dir}: {e}")
+                shutil.rmtree(session_dir)
+                logger.info(f"Removed session directory: {session_dir}")
                 
                 if session_id in self._active_sessions:
                     del self._active_sessions[session_id]
                 
-                if total_size > 50 * 1024 * 1024:  # > 50MB
-                    gc.collect()
+                gc.collect()
                 
         except Exception as e:
             logger.error(f"Session cleanup error for {session_id}: {e}")
-        finally:
             gc.collect()
     
     def cleanup_old_sessions(self) -> None:
@@ -531,41 +469,30 @@ class ScreenManager:
     @staticmethod
     def initialize_session_state():
         """Initialize session state variables for screen management."""
-        if 'current_screen' not in st.session_state:
-            st.session_state.current_screen = 'input'
+        defaults = {
+            'current_screen': 'input',
+            'question_id': "",
+            'alias_email': "",
+            'is_authorized': False,
+            'video_file': None,
+            'selected_language': "",
+            'task_type': "",
+            'frame_interval': Config.DEFAULT_FRAME_INTERVAL,
+            'analysis_results': None,
+            'analyzer_instance': None,
+            'qa_checker': None,
+            'analysis_in_progress': False,
+            'analysis_started': False,
+            'validation_error_shown': False
+        }
+        
+        for key, default_value in defaults.items():
+            if key not in st.session_state:
+                st.session_state[key] = default_value
         
         if 'session_id' not in st.session_state:
             session_manager = get_session_manager()
             st.session_state.session_id = session_manager.generate_session_id()
-        
-        if 'question_id' not in st.session_state:
-            st.session_state.question_id = ""
-        if 'alias_email' not in st.session_state:
-            st.session_state.alias_email = ""
-        if 'is_authorized' not in st.session_state:
-            st.session_state.is_authorized = False
-        if 'video_file' not in st.session_state:
-            st.session_state.video_file = None
-        if 'selected_language' not in st.session_state:
-            st.session_state.selected_language = ""
-        if 'task_type' not in st.session_state:
-            st.session_state.task_type = ""
-        if 'frame_interval' not in st.session_state:
-            st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
-        
-        if 'analysis_results' not in st.session_state:
-            st.session_state.analysis_results = None
-        if 'analyzer_instance' not in st.session_state:
-            st.session_state.analyzer_instance = None
-        if 'qa_checker' not in st.session_state:
-            st.session_state.qa_checker = None
-
-        if 'analysis_in_progress' not in st.session_state:
-            st.session_state.analysis_in_progress = False
-        if 'analysis_started' not in st.session_state:
-            st.session_state.analysis_started = False
-        if 'validation_error_shown' not in st.session_state:
-            st.session_state.validation_error_shown = False
     
     @staticmethod
     def navigate_to_screen(screen: str):
@@ -583,40 +510,19 @@ class ScreenManager:
     
     @staticmethod
     def reset_session_for_new_analysis():
-        """Completely reset session state for a new analysis."""
-        target_screen = 'input'
-        
+        """Reset session state for a new analysis."""
         current_session_id = st.session_state.get('session_id')
         if current_session_id:
             session_manager = get_session_manager()
             session_manager.cleanup_session(current_session_id)
-            logger.info(f"Cleaned up session {current_session_id}")
         
-        keys_to_clear = list(st.session_state.keys())
-        
-        for key in keys_to_clear:
+        for key in list(st.session_state.keys()):
             try:
                 del st.session_state[key]
             except:
-                logger.warning(f"Failed to clear session state key: {key}")
+                pass
         
-        session_manager = get_session_manager()
-        st.session_state.current_screen = target_screen
-        st.session_state.session_id = session_manager.generate_session_id()
-        st.session_state.question_id = ""
-        st.session_state.alias_email = ""
-        st.session_state.video_file = None
-        st.session_state.selected_language = ""
-        st.session_state.task_type = ""
-        st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
-        st.session_state.analysis_results = None
-        st.session_state.analyzer_instance = None
-        st.session_state.qa_checker = None
-        st.session_state.analysis_in_progress = False
-        st.session_state.analysis_started = False
-        st.session_state.validation_error_shown = False
-        
-        logger.info(f"Reset session for new analysis with new session ID: {st.session_state.session_id}")
+        ScreenManager.initialize_session_state()
         st.rerun()
     
     @staticmethod
@@ -632,10 +538,6 @@ class ScreenManager:
             if current_session_id:
                 session_manager = get_session_manager()
                 session_manager.cleanup_session(current_session_id)
-                logger.debug(f"Cleanup session {current_session_id}")
-            else:
-                logger.debug("No current session ID to clean up")
-                        
         except Exception as e:
             logger.error(f"Session cleanup error: {e}")
 
@@ -729,20 +631,19 @@ class InputScreen:
                 disabled=st.session_state.get('analysis_in_progress', False)
             )
             st.session_state.alias_email = alias_email
+        
         st.divider()
         st.subheader("📁 Video File")
         video_file = st.file_uploader(
             "Upload Video File *",
-            type=Config.SUPPORTED_VIDEO_FORMATS,
-            help=f"Supported formats: {', '.join(Config.SUPPORTED_VIDEO_FORMATS)} (Max: {Config.MAX_FILE_SIZE // 1024 // 1024}MB)",
+            type=['.mp4'],
+            help="Supported formats: MP4 (Max: 1024MB)",
             disabled=st.session_state.get('analysis_in_progress', False)
         )
         st.session_state.video_file = video_file
 
-        question_id = st.session_state.get('question_id', '')
         inferred_language = InputScreen._infer_language_from_question_id(question_id)
         st.session_state.selected_language = inferred_language
-        
         inferred_task_type = InputScreen._infer_task_type_from_question_id(question_id)
         st.session_state.task_type = inferred_task_type
 
@@ -753,24 +654,17 @@ class InputScreen:
             st.info("📱 **Video Resolution**: Video must have standard mobile phone resolution")
 
         if question_id:
-            language_display = Config.get_language_display_name(inferred_language)
-            if language_display is None:
-                language_display = inferred_language
+            language_display = Config.get_language_display_name(inferred_language) or inferred_language
             st.info(f"🗣️ **Target Language**: {language_display}")
-            
-            if inferred_task_type != 'Unknown':
-                st.info(f"🎯 **Task Type**: {inferred_task_type}")
-            else:
-                st.info(f"🎯 **Task Type**: Will be inferred from Question ID")
+            task_display = inferred_task_type if inferred_task_type != 'Unknown' else "Will be inferred from Question ID"
+            st.info(f"🎯 **Task Type**: {task_display}")
         else:
-            st.info(f"🗣️ **Target Language**: Will be inferred from Question ID")
-            st.info(f"🎯 **Task Type**: Will be inferred from Question ID")
+            st.info("🗣️ **Target Language**: Will be inferred from Question ID")
+            st.info("🎯 **Task Type**: Will be inferred from Question ID")
 
     @staticmethod
     def _render_validation_and_navigation():
         """Render validation messages and navigation buttons."""
-        if ScreenManager.get_current_screen() != 'input':
-            return
         errors = InputScreen._validate_inputs()
         display_errors = [error for error in errors if error != "validation_error"]
         if errors:
@@ -797,11 +691,8 @@ class InputScreen:
         question_id = st.session_state.question_id.strip()
         alias_email = st.session_state.alias_email.strip()
         
-        inferred_language = InputScreen._infer_language_from_question_id(question_id)
-        st.session_state.selected_language = inferred_language
-        
-        inferred_task_type = InputScreen._infer_task_type_from_question_id(question_id)
-        st.session_state.task_type = inferred_task_type
+        st.session_state.selected_language = InputScreen._infer_language_from_question_id(question_id)
+        st.session_state.task_type = InputScreen._infer_task_type_from_question_id(question_id)
         
         try:
             if question_id and alias_email:
@@ -835,31 +726,18 @@ class InputScreen:
             logger.error(f"Authorization check error: {e}")
             st.error(f"❌ **Authorization Check Failed**: Unable to verify inputs - {str(e)}")
             st.rerun()
-            return
 
     @staticmethod
     def _cleanup_previous_analysis_state():
         """Clean up previous analysis state from session."""
-        if hasattr(st.session_state, 'cached_temp_path'):
-            try:
-                if os.path.exists(st.session_state.cached_temp_path):
-                    os.unlink(st.session_state.cached_temp_path)
-            except Exception as e:
-                logger.warning(f"Failed to clean up cached temp file: {e}")
-            finally:
-                del st.session_state.cached_temp_path
-        
-        if hasattr(st.session_state, 'cached_video_file_name'):
-            del st.session_state.cached_video_file_name
-            
-        st.session_state.analysis_results = None
-        st.session_state.analyzer_instance = None
-        st.session_state.qa_checker = None
-        st.session_state.analysis_in_progress = False
-        st.session_state.analysis_started = False
-        st.session_state.validation_error_shown = False
-        if hasattr(st.session_state, 'analysis_session_id'):
-            del st.session_state.analysis_session_id
+        st.session_state.update({
+            'analysis_results': None,
+            'analyzer_instance': None,
+            'qa_checker': None,
+            'analysis_in_progress': False,
+            'analysis_started': False,
+            'validation_error_shown': False
+        })
 
     @staticmethod
     def _validate_inputs() -> List[str]:
@@ -875,16 +753,8 @@ class InputScreen:
             errors.append("validation_error")
         else:
             video_validation = st.session_state.get('video_validation', {})
-            if video_validation:
-                duration_valid = video_validation.get('duration_valid', False)
-                resolution_valid = video_validation.get('resolution_valid', False)
-                
-                if not duration_valid:
-                    logger.debug(f"Video duration invalid: {video_validation.get('duration', 0)}s. Video must be at least {video_validation.get('min_duration_required', Config.MIN_VIDEO_DURATION)}s.")
-                    errors.append("validation_error")
-                if not resolution_valid:
-                    logger.debug(f"Video resolution invalid: {video_validation.get('width', 0)}x{video_validation.get('height', 0)}. Video must be in portrait mobile format.")
-                    errors.append("validation_error")
+            if video_validation and not (video_validation.get('duration_valid', False) and video_validation.get('resolution_valid', False)):
+                errors.append("validation_error")
 
         return errors
 
@@ -908,16 +778,10 @@ class InputScreen:
             validation_results = Config.validate_video_properties(temp_path)
             
             if 'error' in validation_results:
-                try:
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                except:
-                    pass
                 st.error(f"❌ Video validation failed: {validation_results['error']}")
                 return
             
-            st.session_state.cached_temp_path = temp_path
-            st.session_state.cached_video_file_name = video_file.name
+            st.session_state.video_temp_path = temp_path
             st.session_state.video_validation = validation_results
             
             duration = validation_results.get('duration', 0)
@@ -967,16 +831,11 @@ class AnalysisScreen:
         try:
             session_id = st.session_state.session_id
             
-            if (hasattr(st.session_state, 'cached_temp_path') and
-                hasattr(st.session_state, 'cached_video_file_name') and
-                st.session_state.cached_video_file_name == st.session_state.video_file.name and
-                os.path.exists(st.session_state.cached_temp_path)):
-                
-                video_path = st.session_state.cached_temp_path
-                temp_files = [video_path]
+            if hasattr(st.session_state, 'video_temp_path') and os.path.exists(st.session_state.video_temp_path):
+                video_path = st.session_state.video_temp_path
                 overall_progress.progress(10, text="Using validated video file, initializing analyzer...")
             else:
-                video_path, temp_files = StreamlitInterface.create_temp_video(
+                video_path, _ = StreamlitInterface.create_temp_video(
                     st.session_state.video_file, session_id
                 )
                 overall_progress.progress(10, text="Video processed, initializing analyzer...")
@@ -984,6 +843,7 @@ class AnalysisScreen:
             if not video_path:
                 st.error("❌ Failed to prepare video file for analysis")
                 return
+                
             with VideoContentAnalyzer(session_id=session_id) as analyzer:
                 AnalysisScreen._setup_and_run_analysis(analyzer, video_path, overall_progress)
             st.rerun()
@@ -996,10 +856,6 @@ class AnalysisScreen:
     def _setup_and_run_analysis(analyzer, video_path, overall_progress):
         default_rules = create_detection_rules(target_language=st.session_state.selected_language)
         analyzer.rules = default_rules
-        rule_types = {}
-        for rule in analyzer.rules:
-            rule_type = rule.detection_type.value
-            rule_types[rule_type] = rule_types.get(rule_type, 0) + 1
         overall_progress.progress(20, text=f"Added analysis rules...")
         
         def progress_callback(percentage, message):
@@ -1015,10 +871,9 @@ class AnalysisScreen:
         )
         overall_progress.progress(90, text="Wrapping up...")
         analyzer.export_results("results.json")
-        
         analyzer.cleanup_temp_files()
         
-        video_duration = analyzer._get_video_duration() if hasattr(analyzer, '_get_video_duration') else 0.0
+        video_duration = (analyzer._get_video_duration() if hasattr(analyzer, '_get_video_duration') else 0.0)
         if video_duration == 0.0:
             try:
                 cap = cv2.VideoCapture(video_path)
@@ -1030,6 +885,7 @@ class AnalysisScreen:
             except Exception as e:
                 logger.warning(f"Failed to calculate video duration: {e}")
                 video_duration = 0.0
+        
         st.session_state.video_duration = video_duration
         st.session_state.analysis_results = results
         st.session_state.analysis_session_id = analyzer.session_id
@@ -1038,7 +894,6 @@ class AnalysisScreen:
         
         try:
             exporter = GoogleSheetsResultsExporter()
-            video_duration = st.session_state.get('video_duration', 0.0)
             export_success = exporter.export_results(
                 st.session_state.question_id,
                 st.session_state.alias_email,
@@ -1046,10 +901,7 @@ class AnalysisScreen:
                 st.session_state.qa_checker,
                 video_duration
             )
-            if export_success:
-                logger.info(f"Results successfully exported to Google Sheets for {st.session_state.question_id}")
-            else:
-                logger.warning(f"Results export to Google Sheets failed for {st.session_state.question_id}")
+            logger.info(f"Results export {'successful' if export_success else 'failed'} for {st.session_state.question_id}")
         except Exception as e:
             logger.error(f"Error during results export: {e}")
         
@@ -1099,23 +951,19 @@ class AnalysisScreen:
         if text_results:
             AnalysisScreen._render_text_detections(text_results)
             
-        if language_results:
-            language_qa_info = AnalysisScreen._get_qa_info_for_result(language_results[0]) if language_results else None
-            language_qa_status = ""
-            if language_qa_info:
-                language_qa_status = " - ✅ PASS" if language_qa_info['passed'] else " - ❌ FAIL"
+        def get_qa_status(results_list):
+            if not results_list:
+                return ""
+            qa_info = AnalysisScreen._get_qa_info_for_result(results_list[0])
+            return f" - {'✅ PASS' if qa_info and qa_info['passed'] else '❌ FAIL'}" if qa_info else ""
             
-            with st.expander(f"🗣️ Language Fluency Analysis{language_qa_status}", expanded=False):
+        if language_results:
+            with st.expander(f"🗣️ Language Fluency Analysis{get_qa_status(language_results)}", expanded=False):
                 for result in language_results[:15]:
                     AnalysisScreen._render_audio_detection_result(result)
                     
         if voice_results:
-            voice_qa_info = AnalysisScreen._get_qa_info_for_result(voice_results[0]) if voice_results else None
-            voice_qa_status = ""
-            if voice_qa_info:
-                voice_qa_status = " - ✅ PASS" if voice_qa_info['passed'] else " - ❌ FAIL"
-            
-            with st.expander(f"👥 Voice Audibility Analysis{voice_qa_status}", expanded=False):
+            with st.expander(f"👥 Voice Audibility Analysis{get_qa_status(voice_results)}", expanded=False):
                 for result in voice_results[:15]:
                     AnalysisScreen._render_audio_detection_result(result)
 
@@ -1126,76 +974,43 @@ class AnalysisScreen:
         alias_results = [r for r in text_results if 'Alias Name' in r.rule_name]
         eval_results = [r for r in text_results if 'Eval Mode' in r.rule_name]
         
-        if flash_results:
-            flash_positive = [r for r in flash_results if r.detected]
+        def render_detection_section(results, title, not_found_text, special_handler=None):
+            if not results:
+                return
+                
+            positive = [r for r in results if r.detected]
+            qa_info = AnalysisScreen._get_qa_info_for_result(results[0])
+            qa_status = f" - {'✅ PASS' if qa_info and qa_info['passed'] else '❌ FAIL'}" if qa_info else ""
             
-            flash_qa_info = AnalysisScreen._get_qa_info_for_result(flash_results[0]) if flash_results else None
-            flash_qa_status = ""
-            if flash_qa_info:
-                flash_qa_status = " - ✅ PASS" if flash_qa_info['passed'] else " - ❌ FAIL"
-            
-            if flash_positive:
-                with st.expander(f"📝 2.5 Flash Text Detection{flash_qa_status}", expanded=False):
-                    AnalysisScreen._render_text_detection_result(flash_positive[0])
-                    
+            if positive:
+                with st.expander(f"📝 {title}{qa_status}", expanded=False):
+                    AnalysisScreen._render_text_detection_result(positive[0])
             else:
-                with st.expander(f"📝 2.5 Flash Text Detection{flash_qa_status}", expanded=False):
-                    validation_status = flash_qa_info.get('validation_status', 'not_found') if flash_qa_info else 'not_found'
-                    
-                    if validation_status == 'incorrect_model':
-                        st.error("**Incorrect Model Detected:** 2.5 Pro was found instead of 2.5 Flash")
-                        
-                        pro_detection_result = None
-                        for result in flash_results:
-                            if (result.details and 
-                                result.details.get('model_validation', {}).get('status') == 'incorrect_model'):
-                                pro_detection_result = result
-                                break
-                        
-                        if pro_detection_result:
-                            AnalysisScreen._render_incorrect_model_result(pro_detection_result)
+                with st.expander(f"📝 {title}{qa_status}", expanded=False):
+                    if special_handler:
+                        special_handler(results, qa_info)
                     else:
-                        st.error("**2.5 Flash** was not detected in any frame of the video")
+                        st.error(f"**{not_found_text}** was not detected in any frame of the video")
                     
-                    if flash_qa_info:
-                        st.markdown(f"**QA Feedback:** {flash_qa_info['details']}")
+                    if qa_info:
+                        st.markdown(f"**QA Feedback:** {qa_info['details']}")
         
-        if alias_results:
-            alias_positive = [r for r in alias_results if r.detected]
+        def handle_flash_not_found(results, qa_info):
+            validation_status = qa_info.get('validation_status', 'not_found') if qa_info else 'not_found'
             
-            alias_qa_info = AnalysisScreen._get_qa_info_for_result(alias_results[0]) if alias_results else None
-            alias_qa_status = ""
-            if alias_qa_info:
-                alias_qa_status = " - ✅ PASS" if alias_qa_info['passed'] else " - ❌ FAIL"
-            
-            if alias_positive:
-                with st.expander(f"📝 Alias Name Text Detection{alias_qa_status}", expanded=False):
-                    AnalysisScreen._render_text_detection_result(alias_positive[0])
-                    
+            if validation_status == 'incorrect_model':
+                st.error("**Incorrect Model Detected:** 2.5 Pro was found instead of 2.5 Flash")
+                
+                pro_result = next((r for r in results if r.details and 
+                                 r.details.get('model_validation', {}).get('status') == 'incorrect_model'), None)
+                if pro_result:
+                    AnalysisScreen._render_incorrect_model_result(pro_result)
             else:
-                with st.expander(f"📝 Alias Name Text Detection{alias_qa_status}", expanded=False):
-                    st.error("**Roaring tiger** was not detected in any frame of the video")
-                    
-                    if alias_qa_info:
-                        st.markdown(f"**QA Feedback:** {alias_qa_info['details']}")
+                st.error("**2.5 Flash** was not detected in any frame of the video")
         
-        if eval_results:
-            eval_positive = [r for r in eval_results if r.detected]
-            
-            eval_qa_info = AnalysisScreen._get_qa_info_for_result(eval_results[0]) if eval_results else None
-            eval_qa_status = ""
-            if eval_qa_info:
-                eval_qa_status = " - ✅ PASS" if eval_qa_info['passed'] else " - ❌ FAIL"
-            
-            if eval_positive:
-                with st.expander(f"📝 Eval Mode Text Detection{eval_qa_status}", expanded=False):
-                    AnalysisScreen._render_text_detection_result(eval_positive[0])
-            
-            else:
-                with st.expander(f"📝 Eval Mode Text Detection{eval_qa_status}", expanded=False):
-                    st.error("**Eval Mode: Native Audio Output** was not detected in any frame of the video")
-                    if eval_qa_info:
-                        st.markdown(f"**QA Feedback:** {eval_qa_info['details']}")
+        render_detection_section(flash_results, "2.5 Flash Text Detection", "2.5 Flash", handle_flash_not_found)
+        render_detection_section(alias_results, "Alias Name Text Detection", "Roaring tiger")
+        render_detection_section(eval_results, "Eval Mode Text Detection", "Eval Mode: Native Audio Output")
 
     @staticmethod
     def _render_navigation_buttons():
@@ -1343,21 +1158,18 @@ class AnalysisScreen:
 
         try:
             file_size = os.path.getsize(screenshot_path)
-            is_readable = os.access(screenshot_path, os.R_OK)
-            if not is_readable or file_size == 0:
-                msg = f"Screenshot exists but not readable (size: {file_size})" if result.detected else "Screenshot not readable"
+            if not os.access(screenshot_path, os.R_OK) or file_size == 0:
+                error_msg = f"Screenshot exists but not readable (size: {file_size})"
                 if result.detected:
-                    st.error(msg)
+                    st.error(error_msg)
                 else:
                     with st.expander("🖼️ Frame Screenshot", expanded=False):
-                        st.error(msg)
+                        st.error("Screenshot not readable")
                 return
 
-            is_pro_detection = (
-                hasattr(result, 'details') and result.details and
-                isinstance(result.details, dict) and
-                result.details.get('model_validation', {}).get('status') == 'incorrect_model'
-            )
+            is_pro_detection = (hasattr(result, 'details') and result.details and
+                              isinstance(result.details, dict) and
+                              result.details.get('model_validation', {}).get('status') == 'incorrect_model')
             
             if result.detected or is_pro_detection:
                 st.markdown("**Detection Screenshot:**")
@@ -1372,37 +1184,37 @@ class AnalysisScreen:
     def _render_audio_detection_result(result):
         qa_info = AnalysisScreen._get_qa_info_for_result(result)
         
-        header_text = f"### {result.rule_name}"
-        
         with st.container():
-            st.markdown(header_text)
+            st.markdown(f"### {result.rule_name}")
             
-            if hasattr(result, 'details') and result.details:
-                if isinstance(result.details, dict):
-                    if 'Language Detection' in result.rule_name:
-                        if 'analysis_failed_reason' in result.details:
-                            st.markdown(f"**Analysis Status:** {result.details['analysis_failed_reason']}")
-                            st.markdown("**Explanation:** The fluency could not be analyzed because there were no audible voices in the video.")
-                        else:
-                            if 'detected_language' in result.details:
-                                whisper_detected = result.details['detected_language']
-                                target_locale = result.details.get('target_language')
-                                locale_format = Config.whisper_language_to_locale(whisper_detected, target_locale)
-                                display_name = Config.get_language_display_name(locale_format)
-                                if display_name is None:
-                                    display_name = whisper_detected if whisper_detected else "Unknown"
-                                st.markdown(f"**Detected Language:** {display_name}")
-                            if 'transcription' in result.details and result.details['transcription']:
-                                transcription = result.details['transcription']
-                                st.markdown("**Full Audio Transcription:**")
-                                st.text_area("Full Audio Transcription", transcription, height=200, disabled=True, key=f"transcript_{result.timestamp}", label_visibility="hidden")
-                    elif 'Voice Audibility' in result.rule_name:
-                        if 'voice_detected' in result.details:
-                            st.markdown(f"**Voice Activity:** {'Yes' if result.details['voice_detected'] else 'No'}")
-                        if 'num_audible_voices' in result.details:
-                            st.markdown(f"**Number of audible voices:** {result.details['num_audible_voices']}")
-                        if 'both_voices_audible' in result.details:
-                            st.markdown(f"**Both voices audible:** {result.details['both_voices_audible']}")
+            if hasattr(result, 'details') and result.details and isinstance(result.details, dict):
+                if 'Language Detection' in result.rule_name:
+                    if 'analysis_failed_reason' in result.details:
+                        st.markdown(f"**Analysis Status:** {result.details['analysis_failed_reason']}")
+                        st.markdown("**Explanation:** The fluency could not be analyzed because there were no audible voices in the video.")
+                    else:
+                        if 'detected_language' in result.details:
+                            whisper_detected = result.details['detected_language']
+                            target_locale = result.details.get('target_language')
+                            locale_format = Config.whisper_language_to_locale(whisper_detected, target_locale)
+                            display_name = Config.get_language_display_name(locale_format) or whisper_detected or "Unknown"
+                            st.markdown(f"**Detected Language:** {display_name}")
+                        
+                        if 'transcription' in result.details and result.details['transcription']:
+                            st.markdown("**Full Audio Transcription:**")
+                            st.text_area("Full Audio Transcription", result.details['transcription'], 
+                                       height=200, disabled=True, key=f"transcript_{result.timestamp}", label_visibility="hidden")
+                            
+                elif 'Voice Audibility' in result.rule_name:
+                    voice_details = [
+                        ('Voice Activity', 'Yes' if result.details.get('voice_detected') else 'No'),
+                        ('Number of audible voices', result.details.get('num_audible_voices')),
+                        ('Both voices audible', result.details.get('both_voices_audible'))
+                    ]
+                    
+                    for label, value in voice_details:
+                        if value is not None:
+                            st.markdown(f"**{label}:** {value}")
             
             if qa_info:
                 st.markdown(f"**QA Feedback:** {qa_info['details']}")
@@ -1437,10 +1249,6 @@ class GoogleSheetsResultsExporter:
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets service: {e}")
             return None
-    
-    def _initialize_service(self):
-        """Initialize Google Sheets service using service account."""
-        self.service = self._get_sheets_service()
     
     def export_results(self, question_id: str, alias_email: str, analysis_results: List[DetectionResult], 
                       qa_checker: 'QualityAssuranceChecker', video_duration: float = 0.0) -> bool:
@@ -1494,67 +1302,38 @@ class GoogleSheetsResultsExporter:
         qa_results = qa_checker.get_detailed_results()
         overall_qa = qa_checker.get_qa_summary()
         
-        flash_check = qa_results.get('flash_presence', {})
-        alias_check = qa_results.get('alias_name_presence', {})
-        eval_mode_check = qa_results.get('eval_mode_presence', {})
-        language_check = qa_results.get('language_fluency', {})
-        voice_check = qa_results.get('voice_audibility', {})
+        def extract_qa_data(check_name: str) -> tuple[str, str]:
+            check = qa_results.get(check_name, {})
+            status = "PASS" if check.get('passed', False) else "FAIL"
+            details = check.get('details', '')
+            return status, details
         
-        flash_status = "PASS" if flash_check.get('passed', False) else "FAIL"
-        flash_details = flash_check.get('details', '')
+        flash_status, flash_details = extract_qa_data('flash_presence')
+        alias_status, alias_details = extract_qa_data('alias_name_presence')
+        eval_mode_status, eval_mode_details = extract_qa_data('eval_mode_presence')
+        language_status, language_details = extract_qa_data('language_fluency')
+        voice_status, voice_details = extract_qa_data('voice_audibility')
         
-        alias_status = "PASS" if alias_check.get('passed', False) else "FAIL"
-        alias_details = alias_check.get('details', '')
+        detected_texts = {
+            rule: self._extract_detected_text_for_rule(analysis_results, rule)
+            for rule in ['2.5 Flash', 'Alias Name', 'Eval Mode']
+        }
         
-        eval_mode_status = "PASS" if eval_mode_check.get('passed', False) else "FAIL"
-        eval_mode_details = eval_mode_check.get('details', '')
-        
-        flash_detected_text = self._extract_detected_text_for_rule(analysis_results, '2.5 Flash')
-        alias_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Alias Name')
-        eval_mode_detected_text = self._extract_detected_text_for_rule(analysis_results, 'Eval Mode')
-        
-        language_status = "PASS" if language_check.get('passed', False) else "FAIL"
-        language_details = language_check.get('details', '')
-        detected_language = language_check.get('detected_language', '')
-        
-        voice_status = "PASS" if voice_check.get('passed', False) else "FAIL"
-        voice_details = voice_check.get('details', '')
-        num_voices = voice_check.get('num_voices_detected', 0)
-        
+        detected_language = qa_results.get('language_fluency', {}).get('detected_language', '')
+        num_voices = qa_results.get('voice_audibility', {}).get('num_voices_detected', 0)
         transcribed_audio = self._extract_transcription_text(analysis_results)
+        voice_debug_info = self._extract_voice_debug_info(qa_results.get('voice_audibility', {}))
+        submission_status = "ELIGIBLE" if overall_qa.get('passed', False) else "NOT_ELIGIBLE"
         
-        voice_debug_info = self._extract_voice_debug_info(voice_check)
-        
-        submission_eligible = overall_qa.get('passed', False)
-        submission_status = "ELIGIBLE" if submission_eligible else "NOT_ELIGIBLE"
-        
-        row_data = [
-            timestamp,
-            question_id,
-            alias_email,
-            f"{video_duration:.2f}",
-            flash_status,
-            flash_details,
-            flash_detected_text,
-            alias_status,
-            alias_details,
-            alias_detected_text,
-            eval_mode_status,
-            eval_mode_details,
-            eval_mode_detected_text,
-            language_status,
-            language_details,
-            detected_language,
-            transcribed_audio,
-            voice_status,
-            voice_details,
-            str(num_voices),
-            voice_debug_info,
-            submission_status,
-            overall_qa.get('status', 'FAIL')
+        return [
+            timestamp, question_id, alias_email, f"{video_duration:.2f}",
+            flash_status, flash_details, detected_texts['2.5 Flash'],
+            alias_status, alias_details, detected_texts['Alias Name'],
+            eval_mode_status, eval_mode_details, detected_texts['Eval Mode'],
+            language_status, language_details, detected_language, transcribed_audio,
+            voice_status, voice_details, str(num_voices), voice_debug_info,
+            submission_status, overall_qa.get('status', 'FAIL')
         ]
-        
-        return row_data
     
     def _extract_detected_text_for_rule(self, analysis_results: List[DetectionResult], rule_keyword: str) -> str:
         """Extract detected text for a specific rule type."""
@@ -1588,26 +1367,20 @@ class GoogleSheetsResultsExporter:
     
     def _extract_voice_debug_info(self, voice_check: Dict[str, Any]) -> str:
         """Extract voice audibility debugging information."""
-        debug_parts = []
+        debug_data = [
+            ("Voices detected", voice_check.get('num_voices_detected', 0)),
+            ("Voice ratio", f"{voice_check.get('voice_ratio', 0.0):.2%}"),
+            ("Voice duration", f"{voice_check.get('total_voice_duration', 0.0):.1f}s"),
+            ("Multiple speakers", voice_check.get('has_multiple_speakers', False)),
+            ("Both voices audible", voice_check.get('both_voices_audible', False))
+        ]
         
-        num_voices = voice_check.get('num_voices_detected', 0)
-        voice_ratio = voice_check.get('voice_ratio', 0.0)
-        voice_duration = voice_check.get('total_voice_duration', 0.0)
-        has_multiple_speakers = voice_check.get('has_multiple_speakers', False)
-        both_voices_audible = voice_check.get('both_voices_audible', False)
+        debug_parts = [f"{label}: {value}" for label, value in debug_data]
         
-        debug_parts.append(f"Voices detected: {num_voices}")
-        debug_parts.append(f"Voice ratio: {voice_ratio:.2%}")
-        debug_parts.append(f"Voice duration: {voice_duration:.1f}s")
-        debug_parts.append(f"Multiple speakers: {has_multiple_speakers}")
-        debug_parts.append(f"Both voices audible: {both_voices_audible}")
-        
-        issues = voice_check.get('issues_detected', [])
-        if issues:
+        if issues := voice_check.get('issues_detected', []):
             debug_parts.append(f"Issues: {', '.join(issues)}")
         
-        quality_summary = voice_check.get('quality_summary', '')
-        if quality_summary:
+        if quality_summary := voice_check.get('quality_summary', ''):
             debug_parts.append(f"Summary: {quality_summary}")
         
         return " | ".join(debug_parts)
@@ -1618,51 +1391,34 @@ class GoogleSheetsResultsExporter:
             spreadsheet = self.service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
             sheets = spreadsheet.get('sheets', [])
             
-            target_sheet = None
-            for sheet in sheets:
-                if sheet['properties']['title'] == sheet_name:
-                    target_sheet = sheet
-                    break
+            target_sheet = next((sheet for sheet in sheets if sheet['properties']['title'] == sheet_name), None)
             
-            if not target_sheet:
-                requests = [{
-                    'addSheet': {
-                        'properties': {
-                            'title': sheet_name
-                        }
-                    }
-                }]
-                
-                self.service.spreadsheets().batchUpdate(
-                    spreadsheetId=spreadsheet_id,
-                    body={'requests': requests}
-                ).execute()
-                
-                headers = [
-                    'Timestamp', 'Question ID', 'Alias Email', 'Video Duration (s)',
-                    'Flash Check', 'Flash Details', 'Flash Detected Text',
-                    'Alias Check', 'Alias Details', 'Alias Detected Text',
-                    'Eval Mode Check', 'Eval Mode Details', 'Eval Mode Detected Text',
-                    'Language Check', 'Language Details', 'Detected Language', 'Transcribed Audio',
-                    'Voice Check', 'Voice Details', 'Number of Voices', 'Voice Debug Info',
-                    'Total Detections', 'Positive Detections', 'QA Score', 'Submission Status', 'Overall Status'
-                ]
-                
-                range_name = f"{sheet_name}!A1:Z1"
-                body = {
-                    'values': [headers]
-                }
-                
-                self.service.spreadsheets().values().update(
-                    spreadsheetId=spreadsheet_id,
-                    range=range_name,
-                    valueInputOption='USER_ENTERED',
-                    body=body
-                ).execute()
-                
-                return 0
-            else:
+            if target_sheet:
                 return target_sheet['properties']['sheetId']
+            
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={'requests': [{'addSheet': {'properties': {'title': sheet_name}}}]}
+            ).execute()
+            
+            headers = [
+                'Timestamp', 'Question ID', 'Alias Email', 'Video Duration (s)',
+                'Flash Check', 'Flash Details', 'Flash Detected Text',
+                'Alias Check', 'Alias Details', 'Alias Detected Text', 
+                'Eval Mode Check', 'Eval Mode Details', 'Eval Mode Detected Text',
+                'Language Check', 'Language Details', 'Detected Language', 'Transcribed Audio',
+                'Voice Check', 'Voice Details', 'Number of Voices', 'Voice Debug Info',
+                'Total Detections', 'Positive Detections', 'QA Score', 'Submission Status', 'Overall Status'
+            ]
+            
+            self.service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!A1:Z1",
+                valueInputOption='USER_ENTERED',
+                body={'values': [headers]}
+            ).execute()
+            
+            return 0
                 
         except Exception as e:
             logger.error(f"Error ensuring results sheet exists: {e}")
@@ -1699,16 +1455,9 @@ class GoogleDriveIntegration:
         except ImportError:
             logger.error("Google API client libraries not installed")
             return None
-        except json.JSONDecodeError:
-            logger.error("Invalid JSON format in GOOGLE_SERVICE_ACCOUNT_JSON environment variable")
-            return None
         except Exception as e:
             logger.error(f"Failed to initialize Google Drive service: {e}")
             return None
-    
-    def _initialize_service(self):
-        """Initialize Google Drive service using service account."""
-        self.service = self._get_drive_service()
     
     def create_submission_folder(self, question_id: str, alias_email: str) -> Optional[str]:
         """Create a Google Drive folder for video submission."""
@@ -1720,27 +1469,22 @@ class GoogleDriveIntegration:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             folder_name = f"Video_Submission_{question_id}_{alias_email.split('@')[0]}_{timestamp}"
             
-            folder_metadata = {
-                'name': folder_name,
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': []
-            }
-            
-            folder = self.service.files().create(body=folder_metadata, fields='id,name,webViewLink').execute()
-            
-            permission_metadata = {
-                'role': 'writer',
-                'type': 'anyone'
-            }
+            folder = self.service.files().create(
+                body={
+                    'name': folder_name,
+                    'mimeType': 'application/vnd.google-apps.folder',
+                    'parents': []
+                },
+                fields='id,name,webViewLink'
+            ).execute()
             
             self.service.permissions().create(
                 fileId=folder.get('id'),
-                body=permission_metadata
+                body={'role': 'writer', 'type': 'anyone'}
             ).execute()
             
             folder_link = folder.get('webViewLink')
             logger.info(f"Created Google Drive folder: {folder_name}")
-            
             return folder_link
             
         except Exception as e:
@@ -1762,14 +1506,15 @@ class VideoSubmissionScreen:
     @staticmethod
     def _initialize_submission_state():
         """Initialize session state for submission screen."""
-        if 'drive_folder_link' not in st.session_state:
-            st.session_state.drive_folder_link = ""
-        if 'folder_generated' not in st.session_state:
-            st.session_state.folder_generated = False
-        if 'task_submitted' not in st.session_state:
-            st.session_state.task_submitted = False
-        if 'submission_locked' not in st.session_state:
-            st.session_state.submission_locked = False
+        defaults = {
+            'drive_folder_link': "",
+            'folder_generated': False,
+            'task_submitted': False,
+            'submission_locked': False
+        }
+        for key, value in defaults.items():
+            if key not in st.session_state:
+                st.session_state[key] = value
 
     @staticmethod
     def _render_submission_content():
@@ -1790,27 +1535,23 @@ class VideoSubmissionScreen:
         st.subheader("🔗 Google Drive Folder Generation")
         
         col1, col2 = st.columns([3, 1])
-        
         with col1:
-            drive_link = st.text_input(
+            st.text_input(
                 "Google Drive Folder Link",
                 value=st.session_state.drive_folder_link,
                 disabled=True,
-                placeholder="Click 'Generate' to create a Google Drive folder link",
+                placeholder="Click 'Generate' to create folder link",
                 label_visibility="collapsed"
             )
         
         with col2:
-            if not st.session_state.folder_generated:
-                if st.button("🔄 Generate", use_container_width=True, type="primary"):
-                    VideoSubmissionScreen._generate_drive_folder()
-            else:
+            if st.session_state.folder_generated:
                 st.button("✅ Generated", use_container_width=True, type="secondary", disabled=True)
+            elif st.button("🔄 Generate", use_container_width=True, type="primary"):
+                VideoSubmissionScreen._generate_drive_folder()
         
         if st.session_state.folder_generated:
             st.markdown(f'🔗 [Open Google Drive Folder]({st.session_state.drive_folder_link})')
-        
-        if st.session_state.folder_generated:
             st.divider()
             
             if not st.session_state.submission_locked:
@@ -1901,69 +1642,6 @@ class VideoSubmissionScreen:
         ScreenManager.reset_session_for_new_analysis()
 
 
-class ConfigurationManager:
-    """Centralized configuration management."""
-    
-    _config_cache: Optional[Dict[str, str]] = None
-    _cache_lock = threading.Lock()
-    _cache_timestamp: float = 0
-    _cache_ttl: float = 300
-    
-    @classmethod
-    def get_secure_config(cls, force_refresh: bool = False) -> Dict[str, str]:
-        """Get secure configuration from Streamlit secrets."""
-        current_time = time.time()
-        
-        if (not force_refresh and cls._config_cache is not None and 
-            (current_time - cls._cache_timestamp) < cls._cache_ttl):
-            return cls._config_cache.copy()
-        
-        with cls._cache_lock:
-            if (not force_refresh and cls._config_cache is not None and 
-                (current_time - cls._cache_timestamp) < cls._cache_ttl):
-                return cls._config_cache.copy()
-            
-            try:
-                if "google" not in st.secrets:
-                    raise ValueError("Google configuration missing from secrets")
-                    
-                google_config = st.secrets["google"]
-                required_keys = ["apps_script_url", "verifier_sheet_url", "verifier_sheet_id"]
-                
-                for key in required_keys:
-                    if key not in google_config:
-                        raise ValueError(f"Required configuration missing: {key}")
-                
-                config = {
-                    "apps_script_url": google_config["apps_script_url"],
-                    "verifier_sheet_url": google_config["verifier_sheet_url"],
-                    "verifier_sheet_id": google_config["verifier_sheet_id"],
-                    "verifier_sheet_name": google_config["verifier_sheet_name"],
-                    "results_export_sheet_id": google_config.get("submission_sheet_id", google_config["verifier_sheet_id"])
-                }
-                
-                cls._config_cache = config
-                cls._cache_timestamp = current_time
-                
-                return config.copy()
-                
-            except Exception as e:
-                logger.error(f"Secure configuration error: {e}")
-                raise RuntimeError(f"Cannot load secure configuration: {e}") from e
-    
-    @classmethod
-    @st.cache_data(ttl=300, show_spinner=False)
-    def get_google_service_account_info(cls) -> Optional[Dict[str, Any]]:
-        """Get Google service account credentials from secrets."""
-        try:
-            if "google_service_account" in st.secrets:
-                return dict(st.secrets["google_service_account"])
-            return None
-        except Exception as e:
-            logger.error(f"Failed to load Google service account info: {e}")
-            return None
-
-
 class TextMatcher:
     """Text matching with OCR error correction and fuzzy matching."""
     SIMILARITY_THRESHOLDS = {
@@ -1974,16 +1652,12 @@ class TextMatcher:
     }
     
     OCR_CORRECTIONS: Dict[str, str] = {
-        '2s flash': '2.5 flash', '2.s flash': '2.5 flash', '2,5 flash': '2.5 flash',
-        '25 flash': '2.5 flash',
-        '2s pro': '2.5 pro', '2.s pro': '2.5 pro', '2,5 pro': '2.5 pro',
-        '25 pro': '2.5 pro', '2.5pro': '2.5 pro', '2.5-pro': '2.5 pro',
-        '2.5fro': '2.5 pro', '2.5 pr0': '2.5 pro', '2.5 prc': '2.5 pro',
-        'fiash': 'flash', 'flasb': 'flash', 'fash': 'flash',
-        'flashy': 'flash', 'flast': 'flash', 'flach': 'flash',
+        '2s flash': '2.5 flash', '2.s flash': '2.5 flash', '2,5 flash': '2.5 flash', '25 flash': '2.5 flash',
+        '2s pro': '2.5 pro', '2.s pro': '2.5 pro', '2,5 pro': '2.5 pro', '25 pro': '2.5 pro', 
+        '2.5pro': '2.5 pro', '2.5-pro': '2.5 pro', '2.5fro': '2.5 pro', '2.5 pr0': '2.5 pro', '2.5 prc': '2.5 pro',
+        'fiash': 'flash', 'flasb': 'flash', 'fash': 'flash', 'flashy': 'flash', 'flast': 'flash', 'flach': 'flash',
         'pno': 'pro', 'prn': 'pro', 'pro.': 'pro',
         'evai mode': 'eval mode', 'eval rode': 'eval mode',
-        'native audio output': 'native audio output',
         'roannng tiger': 'roaring tiger', 'roaring tiqer': 'roaring tiger', 'roaring tigee': 'roaring tiger',
         'roaring tger': 'roaring tiger', 'roaring ticer': 'roaring tiger', 'roanng tiger': 'roaring tiger',
         'roarmg tiger': 'roaring tiger', 'roarrng tiger': 'roaring tiger', 'roarirg tiger': 'roaring tiger',
@@ -2050,33 +1724,33 @@ class TextMatcher:
         detected_lower = detected.lower().strip()
         expected_lower = expected.lower().strip()
         
-        if expected_lower == "roaring tiger":
-            if cls._match_roaring_tiger_variants(detected_lower):
-                return True, 'roaring_tiger_variant_match'
+        # Special case: roaring tiger variants
+        if expected_lower == "roaring tiger" and cls._match_roaring_tiger_variants(detected_lower):
+            return True, 'roaring_tiger_variant_match'
         
-        # Strategy 1: Exact phrase match (word boundaries respected)
+        # Exact phrase match
         if cls._exact_phrase_match(detected_lower, expected_lower):
             return True, 'exact_phrase_match'
-        # Strategy 2: OCR error correction with word boundaries
+            
+        # OCR error correction
         corrected_detected = cls.apply_ocr_corrections(detected_lower)
         if cls._exact_phrase_match(corrected_detected, expected_lower):
             return True, 'ocr_corrected_phrase'
-        # Strategy 3: Reverse check for very specific cases
-        if (len(detected_lower) >= 6 and
-            len(expected_lower) > len(detected_lower) * 1.5 and
-            detected_lower in expected_lower and
-            ' ' not in detected_lower):
-            word_significance = len(detected_lower) / len(expected_lower)
-            if word_significance >= 0.25:
-                return True, 'reverse_substring'
-        if not enable_fuzzy:
-            return False, 'no_fuzzy_match'
-        expected_words = expected_lower.split()
-        detected_words = detected_lower.split()
-        overall_similarity = cls.calculate_similarity(detected_lower, expected_lower)
-        if overall_similarity >= cls.SIMILARITY_THRESHOLDS['character_strict']:
-            return True, f'character_similarity_{overall_similarity:.2f}'
-        return False, f'no_match_similarity_{overall_similarity:.2f}'
+            
+        # Reverse substring check for specific cases
+        if (len(detected_lower) >= 6 and len(expected_lower) > len(detected_lower) * 1.5 and
+            detected_lower in expected_lower and ' ' not in detected_lower and
+            len(detected_lower) / len(expected_lower) >= 0.25):
+            return True, 'reverse_substring'
+            
+        # Fuzzy matching if enabled
+        if enable_fuzzy:
+            similarity = cls.calculate_similarity(detected_lower, expected_lower)
+            if similarity >= cls.SIMILARITY_THRESHOLDS['character_strict']:
+                return True, f'character_similarity_{similarity:.2f}'
+            return False, f'no_match_similarity_{similarity:.2f}'
+        
+        return False, 'no_fuzzy_match'
 
     @classmethod
     @st.cache_data(show_spinner=False)
@@ -2088,14 +1762,10 @@ class TextMatcher:
     @classmethod
     @st.cache_data(show_spinner=False)
     def _exact_phrase_match(cls, detected: str, expected: str) -> bool:
-        expected_words = expected.split()
-        if len(expected_words) == 1:
-            pattern = r'\b' + re.escape(expected) + r'\b'
-            return bool(re.search(pattern, detected))
-        else:
-            escaped_words = [re.escape(word) for word in expected_words]
-            pattern = r'\b' + r'\s+'.join(escaped_words) + r'\b'
-            return bool(re.search(pattern, detected))
+        """Check for exact phrase match with word boundaries."""
+        escaped_words = [re.escape(word) for word in expected.split()]
+        pattern = r'\b' + r'\s+'.join(escaped_words) + r'\b'
+        return bool(re.search(pattern, detected))
 
 
 class AudioAnalyzer:
@@ -2103,7 +1773,7 @@ class AudioAnalyzer:
     
     def __init__(self):
         self.whisper_model = None
-        self.supported_languages = Config.get_supported_languages()
+        self.supported_languages = {locale: display_name for locale, (display_name, _) in Config.LANGUAGE_CONFIG.items()}
         self.voice_features_cache = {}
     
     @staticmethod
@@ -2116,9 +1786,8 @@ class AudioAnalyzer:
     def load_whisper_model(self, model_size: str = "base") -> bool:
         """Load Whisper transcription model using Streamlit caching."""
         try:
-            model_size = "base"  # Force base model
-            self.whisper_model = AudioAnalyzer._load_whisper_model_cached(model_size)
-            logger.info(f"Whisper model '{model_size}' loaded successfully")
+            self.whisper_model = AudioAnalyzer._load_whisper_model_cached("base")  # Force base model
+            logger.info("Whisper model 'base' loaded successfully")
             return True
         except Exception as e:
             logger.error(f"Whisper model load failed: {e}")
@@ -2198,26 +1867,39 @@ class AudioAnalyzer:
             }
     
     @st.cache_data(show_spinner=False)
+    def _load_audio_data(_self, audio_path: str) -> Tuple[np.ndarray, int]:
+        """Load audio data once and cache it for reuse across analysis methods."""
+        return librosa.load(audio_path, sr=None)
+
+    @st.cache_data(show_spinner=False) 
+    def _extract_basic_audio_features(_self, audio_path: str, frame_length: int = 2048, hop_length: int = 512) -> Dict[str, Any]:
+        """Extract and cache basic audio features used across multiple analysis methods."""
+        y, sr = _self._load_audio_data(audio_path)
+        
+        features = {
+            'audio_data': y,
+            'sample_rate': sr,
+            'rms': librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0],
+            'zcr': librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0],
+            'spectral_centroid': librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0],
+            'mfccs': librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13),
+            'spectral_bandwidth': librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
+        }
+        return features
+
+    @st.cache_data(show_spinner=False)
     def detect_voice_activity(_self, audio_path: str, frame_length: int = 2048, 
                              hop_length: int = 512) -> Dict[str, Any]:
         """Detect voice activity in audio using multi-feature approach."""
         try:
-            # Load audio
-            y, sr = librosa.load(audio_path, sr=None)
-            
-            # Calculate multiple features for robust VAD
-            # 1. RMS energy
-            rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-            
-            # 2. Zero-crossing rate
-            zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
-            
-            # 3. Spectral centroid
-            spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
-            
-            # 4. Spectral rolloff
-            spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop_length)[0]
-            
+            # Get cached audio features
+            features = _self._extract_basic_audio_features(audio_path, frame_length, hop_length)
+            y = features['audio_data']
+            sr = features['sample_rate']
+            rms = features['rms']
+            zcr = features['zcr']
+            spectral_centroid = features['spectral_centroid']
+
             # Use adaptive threshold based on noise floor estimation
             sorted_rms = np.sort(rms)
             noise_floor = np.mean(sorted_rms[:int(len(sorted_rms) * 0.1)])  # Bottom 10% as noise
@@ -2337,8 +2019,10 @@ class AudioAnalyzer:
         Uses improved approach based on spectral features, pitch, and temporal analysis.
         """
         try:
-            # Load audio
-            y, sr = librosa.load(audio_path, sr=None)
+            # Get cached audio features  
+            features = _self._extract_basic_audio_features(audio_path)
+            y = features['audio_data']
+            sr = features['sample_rate']
             
             # First check if there's any substantial audio
             if len(y) < sr * 0.5:  # Less than 0.5 seconds
@@ -2350,19 +2034,13 @@ class AudioAnalyzer:
                     'audio_features': {}
                 }
             
-            # Extract MFCC features for speaker characteristics
-            mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-            
-            # Calculate spectral features
-            spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-            spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
-            spectral_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
+            mfccs = features['mfccs']
+            spectral_centroids = features['spectral_centroid']
+            spectral_bandwidth = features['spectral_bandwidth']
             
             # Calculate temporal variations in MFCCs (speaker changes)
             mfcc_delta = librosa.feature.delta(mfccs)
-            mfcc_delta2 = librosa.feature.delta(mfccs, order=2)
             
-            # Combine features for analysis
             # Focus on MFCC variations which are good for speaker discrimination
             mfcc_temporal_var = np.var(mfccs, axis=1)
             mfcc_delta_var = np.var(mfcc_delta, axis=1)
@@ -2391,7 +2069,6 @@ class AudioAnalyzer:
                     # High distance variance indicates speaker changes
                     distance_variance = np.var(distances) if distances else 0
                     max_distance = np.max(distances) if distances else 0
-                    mean_distance = np.mean(distances) if distances else 0
                     
                 else:
                     distance_variance = 0
@@ -2399,10 +2076,6 @@ class AudioAnalyzer:
             else:
                 distance_variance = 0
                 max_distance = 0
-            
-            # Calculate feature statistics
-            spectral_var = np.var(spectral_centroids)
-            bandwidth_var = np.var(spectral_bandwidth)
             
             # Normalize variations
             mfcc_norm_var = mfcc_temporal_var / (np.max(mfcc_temporal_var) + 1e-8)
@@ -2549,7 +2222,7 @@ class AudioAnalyzer:
                 'audio_features': {
                     'mfcc_variance': float(np.mean(mfcc_temporal_var)),
                     'mfcc_delta_variance': float(np.mean(mfcc_delta_var)),
-                    'spectral_variance': float(spectral_var),
+                    'spectral_variance': float(np.var(spectral_centroids)),
                     'pitch_variance': float(pitch_variance),
                     'pitch_range': float(pitch_range),
                     'num_pitch_values': len(pitch_values)
@@ -2576,17 +2249,7 @@ class AudioAnalyzer:
             vad_results = _self.detect_voice_activity(audio_path)
             
             if not vad_results['has_voice'] or (vad_results['voice_ratio'] < 0.02 and vad_results['num_segments'] == 0):
-                return {
-                    'num_audible_voices': 0,
-                    'passed_qa': False,
-                    'confidence': 0.9,
-                    'details': 'No audible voices detected',
-                    'vad_info': vad_results,
-                    'speaker_info': None,
-                    'voice_ratio': vad_results['voice_ratio'],
-                    'total_voice_duration': vad_results['total_voice_duration'],
-                    'has_multiple_speakers': False
-                }
+                return _self._create_voice_analysis_result(0, False, 0.9, 'No audible voices detected', vad_results, None)
             
             speaker_results = _self.analyze_speaker_count(audio_path, vad_info=vad_results)
             
@@ -2621,44 +2284,38 @@ class AudioAnalyzer:
                 confidence = min(0.95, confidence * 1.1)
             
             # Generate detailed description
-            if num_voices == 0:
-                details = 'No audible voices detected'
-            elif num_voices == 1:
-                details = 'Only one audible voice detected'
-            elif num_voices == 2:
-                details = 'Two audible voices detected'
-            else:
-                details = f'{num_voices} voices detected (expected 2)'
+            voice_descriptions = {
+                0: 'No audible voices detected',
+                1: 'Only one audible voice detected', 
+                2: 'Two audible voices detected'
+            }
+            details = voice_descriptions.get(num_voices, f'{num_voices} voices detected (expected 2)')
             
             # Add voice activity info to description
             if vad_results['voice_ratio'] > 0:
                 details += f' - {vad_results["voice_ratio"]:.1%} voice activity'
             
-            return {
-                'num_audible_voices': num_voices,
-                'passed_qa': passed_qa,
-                'confidence': float(confidence),
-                'details': details,
-                'vad_info': vad_results,
-                'speaker_info': speaker_results,
-                'voice_ratio': vad_results['voice_ratio'],
-                'total_voice_duration': vad_results['total_voice_duration'],
-                'has_multiple_speakers': speaker_results.get('has_multiple_speakers', False)
-            }
+            return _self._create_voice_analysis_result(num_voices, (num_voices == 2), float(confidence), details, vad_results, speaker_results)
             
         except Exception as e:
             logger.error(f"Voice audibility analysis failed: {e}")
-            return {
-                'num_audible_voices': 0,
-                'passed_qa': False,
-                'confidence': 0.0,
-                'details': f'Analysis failed: {str(e)}',
-                'vad_info': None,
-                'speaker_info': None,
-                'voice_ratio': 0.0,
-                'total_voice_duration': 0.0,
-                'has_multiple_speakers': False
-            }
+            return _self._create_voice_analysis_result(0, False, 0.0, f'Analysis failed: {str(e)}', None, None)
+    
+    @staticmethod
+    def _create_voice_analysis_result(num_voices: int, passed_qa: bool, confidence: float, 
+                                     details: str, vad_info: Dict = None, speaker_info: Dict = None) -> Dict[str, Any]:
+        """Helper method to create consistent voice analysis result structure."""
+        return {
+            'num_audible_voices': num_voices,
+            'passed_qa': passed_qa,
+            'confidence': confidence,
+            'details': details,
+            'vad_info': vad_info,
+            'speaker_info': speaker_info,
+            'voice_ratio': vad_info.get('voice_ratio', 0.0) if vad_info else 0.0,
+            'total_voice_duration': vad_info.get('total_voice_duration', 0.0) if vad_info else 0.0,
+            'has_multiple_speakers': speaker_info.get('has_multiple_speakers', False) if speaker_info else False
+        }
 
 
 class VideoContentAnalyzer:
@@ -2687,12 +2344,10 @@ class VideoContentAnalyzer:
         
         self.performance_metrics = {
             'flash_detection_time': 0.0,
-            'alias_detection_time': 0.0,
             'eval_mode_detection_time': 0.0,
             'audio_analysis_time': 0.0,
             'total_analysis_time': 0.0,
             'frames_analyzed': 0,
-            'audio_extraction_time': 0.0,
             'ocr_processing_time': 0.0
         }
         
@@ -2856,12 +2511,10 @@ class VideoContentAnalyzer:
             self.total_frames_processed = 0
             self.performance_metrics = {
                 'flash_detection_time': 0.0,
-                'alias_detection_time': 0.0,
                 'eval_mode_detection_time': 0.0,
                 'audio_analysis_time': 0.0,
                 'total_analysis_time': 0.0,
                 'frames_analyzed': 0,
-                'audio_extraction_time': 0.0,
                 'ocr_processing_time': 0.0
             }
     
@@ -2906,34 +2559,18 @@ class VideoContentAnalyzer:
             )
             
             self._update_progress(10, "Starting audio analysis...")
-
             audio_start_time = time.time()
             if context['audio_path']:
-                self._process_audio_analysis(
-                    context['audio_path'], 
-                    frame_params['start_time'], 
-                    frame_params['end_time'], 
-                    frame_interval
-                )
-            else:
-                self._update_progress(20, "No audio analysis needed")
+                self._process_audio_analysis(context['audio_path'], frame_params['start_time'], frame_params['end_time'], frame_interval)
             self.performance_metrics['audio_analysis_time'] = time.time() - audio_start_time
             
-            self._update_progress(25, "Audio analysis complete, starting video frame processing...")
-
+            self._update_progress(25, "Starting video frame processing...")
             video_start_time = time.time()
             self._process_video_frames(context, frame_params, frame_interval)
-            video_processing_time = time.time() - video_start_time
             
             self._update_progress(95, "Finalizing analysis results...")
-
             self.analysis_end_time = datetime.now().timestamp()
             self.performance_metrics['total_analysis_time'] = self.analysis_end_time - (self.analysis_start_time or 0)
-            
-            logger.info(f"Performance breakdown - Flash: {self.performance_metrics['flash_detection_time']:.2f}s, "
-                       f"Alias Name: {self.performance_metrics['alias_detection_time']:.2f}s, "
-                       f"Eval Mode: {self.performance_metrics['eval_mode_detection_time']:.2f}s, "
-                       f"Audio: {self.performance_metrics['audio_analysis_time']:.2f}s")
             
         finally:
             if context.get('cap'):
@@ -2990,42 +2627,31 @@ class VideoContentAnalyzer:
                                                eval_mode_rules: List[DetectionRule],
                                                frame_params: Dict[str, Any]) -> None:
         """Process text detection rules."""        
-        flash_detected = False
-        flash_detection_timestamp = None
-        
         alias_name_rules = [rule for rule in self.rules if "Alias Name" in rule.name]
         
+        # Process flash and alias detection in first 5 seconds
+        flash_detection_timestamp = None
         if flash_rules:
             self._update_progress(30, "Analyzing first 5 seconds for '2.5 Flash' and 'Alias Name' detection...")
-            flash_start_time = time.time()
             flash_detection_timestamp = self._process_flash_and_alias_detection_frame_by_frame(cap, fps, flash_rules, alias_name_rules)
-            flash_detected = flash_detection_timestamp is not None
-            detection_time = time.time() - flash_start_time
-            self.performance_metrics['flash_detection_time'] = detection_time
-            self.performance_metrics['alias_detection_time'] = detection_time
             
-            if flash_detected:
-                self._update_progress(50, f"'2.5 Flash' detected at {flash_detection_timestamp:.1f}s! Searching for 'Eval Mode'...")
-            else:
-                self._update_progress(45, "'2.5 Flash' not found in first 5 seconds. Continuing with 'Eval Mode' search...")
+            progress_msg = f"'2.5 Flash' detected at {flash_detection_timestamp:.1f}s! Searching for 'Eval Mode'..." if flash_detection_timestamp else "'2.5 Flash' not found in first 5 seconds. Continuing with 'Eval Mode' search..."
+            self._update_progress(50 if flash_detection_timestamp else 45, progress_msg)
         
-        if flash_detected and self._check_if_eval_mode_already_detected():
+        # Check if both text elements already detected
+        if flash_detection_timestamp and self._check_if_eval_mode_already_detected():
             logger.info("Both 2.5 Flash and Eval Mode detected - stopping text analysis immediately")
             self._update_progress(90, "Both text elements detected! Analysis nearly complete...")
             return
         
+        # Process Eval Mode detection
         if eval_mode_rules:
-            eval_start_time = time.time()
-            if flash_detected:
-                logger.info(f"2.5 Flash found at {flash_detection_timestamp:.2f}s - starting Eval Mode search from this point")
-                self._update_progress(55, f"Searching for 'Eval Mode' starting from {flash_detection_timestamp:.1f}s...")
-                self._process_eval_mode_adaptive_search(cap, fps, eval_mode_rules, flash_detection_timestamp, frame_params)
-            else:
-                logger.info("2.5 Flash not detected in first 5 seconds - starting Eval Mode search from 5 seconds")
-                self._update_progress(50, "Searching for 'Eval Mode' starting from 5 seconds...")
-                self._process_eval_mode_adaptive_search(cap, fps, eval_mode_rules, 5.0, frame_params)
+            start_time = flash_detection_timestamp if flash_detection_timestamp else 5.0
+            self._update_progress(55 if flash_detection_timestamp else 50, 
+                                f"Searching for 'Eval Mode' starting from {start_time:.1f}s...")
             
-            self.performance_metrics['eval_mode_detection_time'] = time.time() - eval_start_time
+            logger.info(f"Starting Eval Mode search from {start_time:.2f}s")
+            self._process_eval_mode_adaptive_search(cap, fps, eval_mode_rules, start_time, frame_params)
             self._update_progress(85, "Text detection analysis completed.")
     
     def _check_if_eval_mode_already_detected(self) -> bool:
@@ -3158,8 +2784,6 @@ class VideoContentAnalyzer:
         
         logger.info("Processing 2.5 Flash and Alias Name detection using frame-by-frame analysis in first 5 seconds...")
         
-        combined_rules = flash_rules + alias_name_rules
-        
         flash_detection_timestamp = self._search_frames_for_combined_text(
             cap, fps, flash_rules, alias_name_rules, 0.0, 5.0, 1.0, 30, 45
         )
@@ -3168,9 +2792,9 @@ class VideoContentAnalyzer:
             logger.info(f"2.5 Flash analysis completed: analyzed 5 frames (at 0s, 1s, 2s, 3s, 4s) - NOT DETECTED")
             
             with self._lock:
-                for flash_rule in flash_rules:
-                    summary_result = DetectionResult(
-                        rule_name=flash_rule.name,
+                for rule in flash_rules + alias_name_rules:
+                    self.results.append(DetectionResult(
+                        rule_name=rule.name,
                         timestamp=5.0,
                         frame_number=int(4.0 * fps),
                         detected=False,
@@ -3180,23 +2804,7 @@ class VideoContentAnalyzer:
                             'frames_analyzed': 5,
                             'search_method': 'selective_frame_sampling'
                         }
-                    )
-                    self.results.append(summary_result)
-                
-                for alias_rule in alias_name_rules:
-                    summary_result = DetectionResult(
-                        rule_name=alias_rule.name,
-                        timestamp=5.0,
-                        frame_number=int(4.0 * fps),
-                        detected=False,
-                        details={
-                            'frame_by_frame_analysis': True,
-                            'analysis_window': '0-5 seconds (5 frames at 0s, 1s, 2s, 3s, 4s)',
-                            'frames_analyzed': 5,
-                            'search_method': 'selective_frame_sampling'
-                        }
-                    )
-                    self.results.append(summary_result)
+                    ))
         
         return flash_detection_timestamp
 
@@ -3327,34 +2935,23 @@ class VideoContentAnalyzer:
         
         try:
             self._update_progress(6, "Extracting audio from video...")
-            audio_extraction_start = time.time()
             audio_path = self.session_manager.create_temp_file(self.session_id, "temp_audio", ".wav")
             
             if self.audio_analyzer.extract_audio(video_path, audio_path):
-                self.performance_metrics['audio_extraction_time'] = time.time() - audio_extraction_start
-                
                 if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
                     self.temp_files.append(audio_path)
                     
                     self._update_progress(8, "Loading Whisper model for language analysis...")
                     try:
-                        whisper_load_start = time.time()
                         self.audio_analyzer.load_whisper_model()
-                        self.performance_metrics['whisper_model_load_time'] = time.time() - whisper_load_start
                         self._update_progress(9, "Whisper model loaded successfully")
                     except Exception as e:
                         logger.warning(f"Whisper model load failed: {e}")
-                        self.performance_metrics['whisper_model_load_time'] = 0.0
                     
                     return audio_path
-                else:
-                    return None
-            else:
-                self.performance_metrics['audio_extraction_time'] = time.time() - audio_extraction_start
-                return None
+            return None
                 
         except Exception as e:
-            self.performance_metrics['audio_extraction_time'] = time.time() - audio_extraction_start if 'audio_extraction_start' in locals() else 0.0
             return None
     
     def _save_frame(self, frame: np.ndarray, rule_name: str, timestamp: float) -> Optional[str]:
@@ -3481,7 +3078,7 @@ class VideoContentAnalyzer:
         """Process language fluency rules."""
         try:
             try:
-                y, sr = librosa.load(audio_path, sr=None)
+                y, sr = self.audio_analyzer._load_audio_data(audio_path)
                 audio_duration = len(y) / sr
             except:
                 audio_duration = 0
@@ -3734,13 +3331,13 @@ class VideoContentAnalyzer:
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
         preprocess_config = params.get('preprocess', {})
-        if preprocess_config.get('denoise', Config.OCR_DENOISING_ENABLED):
+        if preprocess_config.get('denoise', True):
             gray = cv2.fastNlMeansDenoising(gray)
-        if preprocess_config.get('threshold', Config.OCR_THRESHOLD_ENABLED):
+        if preprocess_config.get('threshold', True):
             gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         
-        text = pytesseract.image_to_string(gray, config=Config.OCR_CONFIG).strip()
-        boxes = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=Config.OCR_CONFIG)
+        text = pytesseract.image_to_string(gray, config='--psm 3').strip()
+        boxes = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config='--psm 3')
         return text, boxes
     
     def _analyze_ocr_results(self, text: str, boxes: Dict[str, Any], params: Dict[str, Any], 
@@ -3843,26 +3440,26 @@ class VideoContentAnalyzer:
         x1, y1, w, h = text_bounding_box
         x2, y2 = x1 + w, y1 + h
         
-        color = Config.ANNOTATION_COLORS['GREEN'] if is_correct else Config.ANNOTATION_COLORS['RED']
+        color = (0, 255, 0) if is_correct else (0, 0, 255)  # GREEN or RED
         
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, Config.ANNOTATION_THICKNESS)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         
         text_label = f"Detected: {detected_text}"
         if not is_correct:
             text_label = f"Wrong Model: {detected_text}"
             
         cv2.putText(frame, text_label, (x1, y1-10), 
-                   Config.ANNOTATION_FONT, Config.ANNOTATION_FONT_SCALE, 
-                   color, Config.ANNOTATION_THICKNESS)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
+                   color, 2)
     
     def _apply_search_annotations(self, frame: np.ndarray, expected_text: str, timestamp: float) -> None:
         """Apply annotations for search context (no detection)."""
         cv2.putText(frame, f"Searching for: {expected_text}", (10, 30), 
-                   Config.ANNOTATION_FONT, Config.ANNOTATION_FONT_SCALE, 
-                   Config.ANNOTATION_COLORS['YELLOW'], Config.ANNOTATION_THICKNESS)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
+                   (0, 255, 255), 2)  # YELLOW
         cv2.putText(frame, f"Frame @ {timestamp:.2f}s", (10, 60), 
-                   Config.ANNOTATION_FONT, 0.5, 
-                   Config.ANNOTATION_COLORS['WHITE'], 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
+                   (255, 255, 255), 1)  # WHITE
     
     def export_results(self, output_path: str) -> bool:
         """Export analysis results to session directory."""
@@ -3890,7 +3487,6 @@ class VideoContentAnalyzer:
                     'flash_detection_time': self.performance_metrics['flash_detection_time'],
                     'eval_mode_detection_time': self.performance_metrics['eval_mode_detection_time'],
                     'audio_analysis_time': self.performance_metrics['audio_analysis_time'],
-                    'audio_extraction_time': self.performance_metrics['audio_extraction_time'],
                     'ocr_processing_time': self.performance_metrics['ocr_processing_time'],
                     'frames_analyzed': self.performance_metrics['frames_analyzed'],
                     'analysis_efficiency': {
@@ -3922,59 +3518,49 @@ def create_detection_rules(target_language: str) -> List[DetectionRule]:
     target_language = target_language.strip()
     language_name = Config.get_language_display_name(target_language)
 
+    text_preprocess_config = {
+        'denoise': True,
+        'threshold': True
+    }
+    
+    text_rules_config = [
+        (f"Text Detection: {TargetTexts.FLASH_TEXT}", TargetTexts.FLASH_TEXT),
+        ("Text Detection: Alias Name", TargetTexts.ALIAS_NAME_TEXT),
+        (f"Text Detection: {TargetTexts.EVAL_MODE_TEXT}", TargetTexts.EVAL_MODE_TEXT)
+    ]
+    
     rules = []
-    rules.append(DetectionRule(
-        name=f"Text Detection: {TargetTexts.FLASH_TEXT}",
-        detection_type=DetectionType.TEXT,
-        parameters={
-            'expected_text': TargetTexts.FLASH_TEXT,
-            'save_screenshot': True,
-            'preprocess': {
-                'denoise': Config.OCR_DENOISING_ENABLED,
-                'threshold': Config.OCR_THRESHOLD_ENABLED
+    
+    for rule_name, expected_text in text_rules_config:
+        rules.append(DetectionRule(
+            name=rule_name,
+            detection_type=DetectionType.TEXT,
+            parameters={
+                'expected_text': expected_text,
+                'save_screenshot': True,
+                'preprocess': text_preprocess_config
             }
-        }
-    ))
-    rules.append(DetectionRule(
-        name=f"Text Detection: Alias Name",
-        detection_type=DetectionType.TEXT,
-        parameters={
-            'expected_text': TargetTexts.ALIAS_NAME_TEXT,
-            'save_screenshot': True,
-            'preprocess': {
-                'denoise': Config.OCR_DENOISING_ENABLED,
-                'threshold': Config.OCR_THRESHOLD_ENABLED
+        ))
+    
+    rules.extend([
+        DetectionRule(
+            name=f"Language Detection: Fluent {language_name}",
+            detection_type=DetectionType.LANGUAGE_FLUENCY,
+            parameters={
+                'target_language': target_language,
+                'min_fluency_score': Config.DEFAULT_MIN_FLUENCY_SCORE
             }
-        }
-    ))
-    rules.append(DetectionRule(
-        name=f"Text Detection: {TargetTexts.EVAL_MODE_TEXT}",
-        detection_type=DetectionType.TEXT,
-        parameters={
-            'expected_text': TargetTexts.EVAL_MODE_TEXT,
-            'save_screenshot': True,
-            'preprocess': {
-                'denoise': Config.OCR_DENOISING_ENABLED,
-                'threshold': Config.OCR_THRESHOLD_ENABLED
+        ),
+        DetectionRule(
+            name="Voice Audibility: Both Voices Audible",
+            detection_type=DetectionType.VOICE_AUDIBILITY,
+            parameters={
+                'min_confidence': Config.DEFAULT_MIN_CONFIDENCE,
+                'min_duration': Config.DEFAULT_MIN_DURATION
             }
-        }
-    ))
-    rules.append(DetectionRule(
-        name=f"Language Detection: Fluent {language_name}",
-        detection_type=DetectionType.LANGUAGE_FLUENCY,
-        parameters={
-            'target_language': target_language,
-            'min_fluency_score': 0.6
-        }
-    ))
-    rules.append(DetectionRule(
-        name="Voice Audibility: Both Voices Audible",
-        detection_type=DetectionType.VOICE_AUDIBILITY,
-        parameters={
-            'min_confidence': 0.3,
-            'min_duration': 3.0
-        }
-    ))
+        )
+    ])
+    
     return rules
 
 
@@ -4040,8 +3626,36 @@ class StreamlitInterface:
         """, unsafe_allow_html=True)
 
     @staticmethod
+    @st.cache_data(show_spinner=False)
+    def _create_temp_video_simple(video_bytes: bytes, video_name: str, session_id: str) -> str:
+        """Simple video upload with caching to prevent re-uploads."""
+        try:
+            video_suffix = Path(video_name).suffix.lower()
+            temp_path = None
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=video_suffix, prefix=f"video_{session_id}_") as tmp:
+                temp_path = tmp.name
+                tmp.write(video_bytes)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            
+            if not os.path.exists(temp_path):
+                raise RuntimeError("File was not created successfully")
+                
+            logger.info(f"Upload completed: {len(video_bytes)} bytes")
+            return temp_path
+            
+        except Exception as e:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+            raise e
+
+    @staticmethod
     def create_temp_video(video_file, session_id: str = None):
-        """Create temporary video file with enhanced memory management and chunking. Returns (path, [path]) or (None, [])."""
+        """Create temporary video file with simple caching. Returns (path, [path]) or (None, [])."""
         if not video_file:
             return None, []
         
@@ -4050,46 +3664,24 @@ class StreamlitInterface:
                 st.error(f"File too large: {video_file.size / 1024 / 1024:.1f}MB (max: {Config.MAX_FILE_SIZE / 1024 / 1024:.1f}MB)")
                 return None, []
             
-            video_suffix = Path(video_file.name).suffix.lower()
-            if video_suffix not in Config.SUPPORTED_VIDEO_FORMATS:
-                st.error(f"Unsupported file format: {video_suffix}")
-                return None, []
-            
             session_id = session_id or get_session_manager().generate_session_id()
-            safe_filename = re.sub(r'[^\w.-]', '_', video_file.name)[:100]
             
-            file_size = getattr(video_file, 'size', 0)
-            available_memory = StreamlitInterface._get_available_memory()
-            optimal_chunk_size = StreamlitInterface._calculate_optimal_chunk_size(file_size, available_memory)
+            video_file.seek(0)
+            video_bytes = video_file.read()
             
-            logger.info(f"Processing video upload: {file_size / 1024 / 1024:.1f}MB, chunk size: {optimal_chunk_size / 1024:.0f}KB")
+            temp_path = StreamlitInterface._create_temp_video_simple(
+                video_bytes, video_file.name, session_id
+            )
             
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    temp_path = StreamlitInterface._attempt_upload_with_recovery(
-                        video_file, session_id, video_suffix, file_size, optimal_chunk_size, attempt
-                    )
-                    
-                    if temp_path:
-                        logger.info(f"Successfully uploaded video to: {temp_path}")
-                        return temp_path, [temp_path]
-                    
-                except Exception as upload_error:
-                    logger.warning(f"Upload attempt {attempt + 1} failed: {upload_error}")
-                    if attempt == max_retries - 1:
-                        raise upload_error
-                    
-                    time.sleep(0.5 * (attempt + 1))
-                    optimal_chunk_size = max(optimal_chunk_size // 2, 32 * 1024)
-                    gc.collect()
-            
-            st.error("❌ Upload failed after multiple attempts. Please try with a smaller file.")
-            return None, []
+            if temp_path:
+                return temp_path, [temp_path]
+            else:
+                st.error("❌ Upload failed. Please try again.")
+                return None, []
                     
         except MemoryError:
             st.error("❌ Insufficient memory to process this video file. Please try with a smaller file.")
-            logger.error(f"Memory error during video upload: {file_size / 1024 / 1024:.1f}MB")
+            logger.error(f"Memory error during video upload")
             return None, []
         except Exception as e:
             logger.error(f"Video upload failed: {e}")
@@ -4097,208 +3689,6 @@ class StreamlitInterface:
             return None, []
         finally:
             gc.collect()
-
-    @staticmethod
-    def _attempt_upload_with_recovery(video_file, session_id: str, video_suffix: str, 
-                                     file_size: int, chunk_size: int, attempt: int) -> Optional[str]:
-        """Attempt to upload file with recovery capabilities."""
-        temp_path = None
-        
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=video_suffix, prefix=f"video_{session_id}_") as tmp:
-                temp_path = tmp.name
-                
-                success = StreamlitInterface._stream_upload_with_monitoring(
-                    video_file, tmp, file_size, chunk_size
-                )
-                
-                if not success:
-                    raise RuntimeError("Streaming upload failed")
-                
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            
-            if not StreamlitInterface._verify_uploaded_file(temp_path, file_size):
-                raise RuntimeError("File integrity check failed after upload")
-            
-            return temp_path
-            
-        except Exception as e:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception as cleanup_error:
-                    logger.warning(f"Failed to cleanup temp file {temp_path}: {cleanup_error}")
-            
-            raise e
-
-    @staticmethod
-    def _get_available_memory():
-        """Get available memory in bytes. Returns conservative estimate if unable to determine."""
-        try:
-            import psutil
-            memory = psutil.virtual_memory()
-            available = memory.available - (200 * 1024 * 1024)
-            return max(50 * 1024 * 1024, available)
-        except ImportError:
-            return 256 * 1024 * 1024
-        except Exception as e:
-            logger.warning(f"Could not determine available memory: {e}")
-            return 256 * 1024 * 1024
-
-    @staticmethod
-    def _calculate_optimal_chunk_size(file_size: int, available_memory: int) -> int:
-        """Calculate optimal chunk size based on file size and available memory."""
-        max_chunk_from_memory = min(available_memory // 10, 8 * 1024 * 1024)  # Max 8MB or 10% of memory
-        
-        if file_size < 10 * 1024 * 1024:  # < 10MB
-            optimal_chunk = min(512 * 1024, max_chunk_from_memory)  # 512KB
-        elif file_size < 50 * 1024 * 1024:  # < 50MB
-            optimal_chunk = min(1024 * 1024, max_chunk_from_memory)  # 1MB
-        elif file_size < 200 * 1024 * 1024:  # < 200MB
-            optimal_chunk = min(2 * 1024 * 1024, max_chunk_from_memory)  # 2MB
-        else:  # >= 200MB
-            optimal_chunk = min(4 * 1024 * 1024, max_chunk_from_memory)  # 4MB
-        
-        return max(64 * 1024, optimal_chunk)
-
-    @staticmethod
-    def _stream_upload_with_monitoring(video_file, tmp_file, file_size: int, chunk_size: int) -> bool:
-        """Stream upload with memory monitoring and progress tracking."""
-        total_written = 0
-        chunks_processed = 0
-        video_file.seek(0)
-        
-        show_progress = file_size > 20 * 1024 * 1024  # > 20MB
-        progress_bar = None
-        progress_container = None
-        
-        if show_progress:
-            progress_container = st.empty()
-            with progress_container:
-                progress_bar = st.progress(0, text="Uploading video...")
-        
-        memory_check_interval = 10
-        gc_interval = 50
-        
-        try:
-            while total_written < file_size:
-                if chunks_processed % memory_check_interval == 0:
-                    current_memory = StreamlitInterface._get_current_memory_usage()
-                    if current_memory > 0.8:
-                        gc.collect()
-                        
-                        chunk_size = max(chunk_size // 2, 32 * 1024)
-                        logger.warning(f"High memory usage ({current_memory:.1%}), reducing chunk size to {chunk_size // 1024}KB")
-                        
-                        memory_check_interval = max(5, memory_check_interval // 2)
-                
-                remaining_bytes = file_size - total_written
-                current_chunk_size = min(chunk_size, remaining_bytes)
-                
-                chunk = None
-                try:
-                    chunk = video_file.read(current_chunk_size)
-                except Exception as read_error:
-                    logger.error(f"Error reading chunk at position {total_written}: {read_error}")
-                    return False
-                
-                if not chunk:
-                    if total_written < file_size:
-                        logger.warning(f"Unexpected end of file: {total_written}/{file_size} bytes read")
-                    break
-                
-                bytes_written = len(chunk)
-                total_written += bytes_written
-                
-                if total_written > Config.MAX_FILE_SIZE:
-                    logger.error(f"File size exceeded during upload: {total_written} > {Config.MAX_FILE_SIZE}")
-                    return False
-                
-                try:
-                    tmp_file.write(chunk)
-                    if chunks_processed % 25 == 0 and file_size > 100 * 1024 * 1024:
-                        tmp_file.flush()
-                except Exception as write_error:
-                    logger.error(f"Error writing chunk: {write_error}")
-                    return False
-                finally:
-                    chunk = None
-                
-                chunks_processed += 1
-                
-                if show_progress and progress_bar:
-                    progress = min(1.0, total_written / file_size)
-                    progress_text = f"Uploading video... {progress*100:.1f}% ({total_written // 1024 // 1024}MB/{file_size // 1024 // 1024}MB)"
-                    progress_bar.progress(progress, text=progress_text)
-                
-                if chunks_processed % gc_interval == 0:
-                    gc.collect()
-            
-            tmp_file.flush()
-            
-            if progress_container:
-                progress_container.empty()
-            
-            logger.info(f"Upload completed: {total_written} bytes in {chunks_processed} chunks")
-            return total_written > 0
-            
-        except MemoryError as mem_error:
-            logger.error(f"Memory error during streaming upload: {mem_error}")
-            if progress_container:
-                progress_container.empty()
-            st.error("❌ Out of memory while processing video. Please try a smaller file.")
-            return False
-        except Exception as stream_error:
-            logger.error(f"Streaming upload error: {stream_error}")
-            if progress_container:
-                progress_container.empty()
-            return False
-        finally:
-            if progress_container:
-                progress_container.empty()
-            gc.collect()
-
-    @staticmethod
-    def _get_current_memory_usage() -> float:
-        """Get current memory usage as a ratio (0.0 to 1.0). Returns 0.5 if unable to determine."""
-        try:
-            import psutil
-            memory = psutil.virtual_memory()
-            return memory.percent / 100.0
-        except ImportError:
-            return 0.5
-        except Exception as e:
-            logger.debug(f"Could not get memory usage: {e}")
-            return 0.5
-
-    @staticmethod 
-    def _verify_uploaded_file(file_path: str, expected_size: int) -> bool:
-        """Verify the uploaded file integrity."""
-        try:
-            if not os.path.exists(file_path):
-                logger.error(f"Uploaded file not found: {file_path}")
-                return False
-            
-            actual_size = os.path.getsize(file_path)
-            if actual_size != expected_size:
-                logger.error(f"File size mismatch: expected {expected_size}, got {actual_size}")
-                return False
-            
-            with open(file_path, 'rb') as f:
-                header = f.read(12)
-                if len(header) >= 8:
-                    if header[4:8] in [b'ftyp', b'mdat', b'moov']:
-                        return True
-                    elif header[:4] == b'\x00\x00\x00\x18' or header[:4] == b'\x00\x00\x00\x20':
-                        return True
-            
-            logger.warning(f"File header validation failed for: {file_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"File verification error: {e}")
-            return False
 
 
 class QualityAssuranceChecker:
@@ -4701,29 +4091,29 @@ class ApplicationRunner:
                         <h3 style="color: #1565C0; margin-top: 0; display: flex; align-items: center;">
                             📖 Analysis Information
                         </h3>
+                        <div style="display: flex; gap: 20px; margin-top: 15px;">
+                            <div style="flex: 1;">
+                                <p style="margin: 0; color: #333;"><strong>What will be analyzed from your video:</strong></p>
+                                <ul style="margin: 10px 0; color: #333;">
+                                    <li><strong>Text Detection</strong>: Keyword recognition using OCR for "2.5 Flash", "Roaring Tiger", and "Eval Mode: Native Audio Output" to verify proper model and alias usage</li>
+                                    <li><strong>Language Fluency</strong>: Multi-language speech verification ensures the spoken language matches the expected language, with a minimum fluency score required</li>
+                                    <li><strong>Voice Audibility</strong>: Detection of multiple distinct voices to confirm both user and model voices are clearly audible</li>
+                                </ul>
+                            </div>
+                            <div style="flex: 1;">
+                                <p style="margin: 0; color: #333;"><strong>Process:</strong></p>
+                                <ol style="margin: 10px 0; color: #333;">
+                                    <li>Input your unique Question ID and Alias Email</li>
+                                    <li>Upload your video file in MP4 format with a maximum size of 1GB, a minimum duration of 30 seconds, and a portrait mobile resolution</li>
+                                    <li>The system will automatically analyze the video for text, language, and audio quality</li>
+                                    <li>View detailed results and quality assurance checks</li>
+                                    <li>A Google Drive link will be provided for you to submit your video for further processing</li>
+                                    <li>If any issues are detected, you will be prompted to re-record and upload a new video</li>
+                                </ol>
+                            </div>
+                        </div>
                     </div>
                     """, unsafe_allow_html=True)
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.markdown("""
-                        **What will be analyzed from your video:**
-                        - **Text Detection**: Keyword recognition using OCR for "2.5 Flash", "Roaring Tiger", and "Eval Mode: Native Audio Output" to verify proper model and alias usage
-                        - **Language Fluency**: Multi-language speech verification ensures the spoken language matches the expected language, with a minimum fluency score required
-                        - **Voice Audibility**: Detection of multiple distinct voices to confirm both user and model voices are clearly audible
-                        """)
-                    
-                    with col2:
-                        st.markdown("""
-                        **Process:**
-                        1. Input your unique Question ID and Alias Email
-                        2. Upload your video file in MP4 format with a maximum size of 1GB, a minimum duration of 30 seconds, and a portrait mobile resolution
-                        3. The system will automatically analyze the video for text, language, and audio quality
-                        4. View detailed results and quality assurance checks
-                        5. A Google Drive link will be provided for you to submit your video for further processing
-                        6. If any issues are detected, you will be prompted to re-record and upload a new video
-                        """)
                     
                     st.divider()
                 
