@@ -23,3 +23,5 @@ libasound2-dev
 portaudio19-dev
 
 build-essential
+
+gfortran
