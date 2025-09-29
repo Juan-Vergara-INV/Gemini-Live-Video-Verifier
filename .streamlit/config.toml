@@ -9,3 +9,6 @@ gatherUsageStats = false
 
 [runner]
 enumCoercion = "off"
+
+[theme]
+base="dark"
