@@ -753,7 +753,7 @@ class InputScreen:
 
     @staticmethod
     def _render_video_preview(video_file):
-        """Render video preview using st.video component."""
+        """Render video preview."""
         try:
             st.video(
                 video_file,
@@ -1042,8 +1042,6 @@ class AnalysisScreen:
                 st.session_state.feedback_submitted = True
             elif feedback_rating == 0:
                 AnalysisScreen._render_feedback_issues_selection()
-        
-        st.divider()
         
     @staticmethod
     def _render_feedback_issues_selection():
@@ -1335,17 +1333,17 @@ class GoogleSheetsService:
             return None
 
 
-class GoogleSheetsResultsExporter:
-    """Export video analysis results to Google Sheets."""
+class BaseGoogleSheetsExporter:
+    """Base class for Google Sheets export operations."""
     
     def __init__(self):
         self.service = GoogleSheetsService.get_sheets_service()
     
-    def export_results(self, question_id: str, alias_email: str, analysis_results: List[DetectionResult], 
-                      qa_checker: 'QualityAssuranceChecker', video_duration: float = 0.0) -> bool:
-        """Export analysis results to Google Sheets."""
+    def _export_to_sheet(self, sheet_name: str, row_data: List[str], 
+                        operation_name: str, identifier: str = "") -> bool:
+        """Export data to Google Sheets."""
         if not self.service:
-            logger.error("Google Sheets service not available for export")
+            logger.error(f"Google Sheets service not available for {operation_name}")
             return False
         
         try:
@@ -1353,12 +1351,9 @@ class GoogleSheetsResultsExporter:
             spreadsheet_id = config.get("verifier_sheet_id")
                 
             if not spreadsheet_id:
-                logger.error("No spreadsheet ID configured for results export")
+                logger.error(f"No spreadsheet ID configured for {operation_name}")
                 return False
             
-            row_data = self._prepare_export_data(question_id, alias_email, analysis_results, qa_checker, video_duration)
-            
-            sheet_name = "Video Analysis Results"
             range_name = f"{sheet_name}!A:Z"
             
             body = {
@@ -1368,21 +1363,40 @@ class GoogleSheetsResultsExporter:
             result = self.service.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
                 range=range_name,
-                valueInputOption='USER_ENTERED',
+                valueInputOption='RAW',
                 insertDataOption='INSERT_ROWS',
                 body=body
             ).execute()
             
+            if identifier:
+                logger.info(f"{operation_name} exported successfully for {identifier}")
+            else:
+                logger.info(f"{operation_name} exported successfully")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to export results to Google Sheets: {e}")
+            logger.error(f"Failed to export {operation_name} to Google Sheets: {e}")
             return False
+
+
+class GoogleSheetsResultsExporter(BaseGoogleSheetsExporter):
+    """Export video analysis results to Google Sheets."""
+    
+    def export_results(self, question_id: str, alias_email: str, analysis_results: List[DetectionResult], 
+                      qa_checker: 'QualityAssuranceChecker', video_duration: float = 0.0) -> bool:
+        """Export analysis results to Google Sheets."""
+        row_data = self._prepare_export_data(question_id, alias_email, analysis_results, qa_checker, video_duration)
+        return self._export_to_sheet(
+            sheet_name="Video Analysis Results",
+            row_data=row_data,
+            operation_name="results export",
+            identifier=question_id
+        )
     
     def _prepare_export_data(self, question_id: str, alias_email: str, analysis_results: List[DetectionResult], 
                            qa_checker: 'QualityAssuranceChecker', video_duration: float) -> List[str]:
         """Prepare data row for export."""
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
         
         qa_results = qa_checker.get_detailed_results()
         overall_qa = qa_checker.get_qa_summary()
@@ -1471,57 +1485,26 @@ class GoogleSheetsResultsExporter:
         return " | ".join(debug_parts)
     
 
-class FeedbackExporter:
+class FeedbackExporter(BaseGoogleSheetsExporter):
     """Export user feedback on analysis quality to Google Sheets."""
-    
-    def __init__(self):
-        self.service = GoogleSheetsService.get_sheets_service()
     
     def export_feedback(self, question_id: str, alias_email: str, session_id: str,
                        feedback_rating: int, feedback_issues: List[str] = None, qa_results: 'QualityAssuranceChecker' = None) -> bool:
         """Export user feedback to Google Sheets."""
-        if not self.service:
-            logger.error("Google Sheets service not available for feedback export")
-            return False
-        
-        try:
-            config = ConfigurationManager.get_secure_config()
-            spreadsheet_id = config.get("verifier_sheet_id")
-                
-            if not spreadsheet_id:
-                logger.error("No spreadsheet ID configured for feedback export")
-                return False
-            
-            row_data = self._prepare_feedback_data(
-                question_id, alias_email, session_id, feedback_rating, feedback_issues or [], qa_results
-            )
-            
-            sheet_name = "User Feedback"
-            range_name = f"{sheet_name}!A:Z"
-            
-            body = {
-                'values': [row_data]
-            }
-            
-            result = self.service.spreadsheets().values().append(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-                valueInputOption='USER_ENTERED',
-                insertDataOption='INSERT_ROWS',
-                body=body
-            ).execute()
-            
-            logger.info(f"Feedback exported successfully for session {session_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to export feedback to Google Sheets: {e}")
-            return False
+        row_data = self._prepare_feedback_data(
+            question_id, alias_email, session_id, feedback_rating, feedback_issues or [], qa_results
+        )
+        return self._export_to_sheet(
+            sheet_name="User Feedback",
+            row_data=row_data,
+            operation_name="feedback export",
+            identifier=f"session {session_id}"
+        )
     
     def _prepare_feedback_data(self, question_id: str, alias_email: str, session_id: str,
                               feedback_rating: int, feedback_issues: List[str], qa_results: 'QualityAssuranceChecker' = None) -> List[str]:
         """Prepare feedback data row for export."""
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
         feedback_text = "Positive" if feedback_rating == 1 else "Negative"
         
         issues_text = ", ".join(feedback_issues) if feedback_issues else "None"
@@ -1934,11 +1917,11 @@ class AudioAnalyzer:
     @staticmethod
     @st.cache_resource(show_spinner=False)
     def _load_whisper_model_cached(model_size: str = "base") -> 'whisper.Whisper':
-        """Load Whisper transcription model with Streamlit caching."""
+        """Load Whisper transcription model."""
         return whisper.load_model(model_size)
     
     def load_whisper_model(self, model_size: str = "base") -> bool:
-        """Load Whisper transcription model using Streamlit caching."""
+        """Load Whisper transcription model."""
         try:
             self.whisper_model = AudioAnalyzer._load_whisper_model_cached("base")
             logger.info("Whisper model 'base' loaded successfully")
@@ -2491,10 +2474,7 @@ class AudioAnalyzer:
     
     @st.cache_data(show_spinner=False)
     def analyze_voice_audibility(_self, audio_path: str) -> Dict[str, Any]:
-        """
-        Comprehensive voice audibility analysis combining VAD and speaker detection.
-        Returns whether there are 0, 1, or 2 audible voices.
-        """
+        """Voice audibility analysis combining VAD and speaker detection. Returns whether there are 0, 1, or 2 audible voices."""
         try:
             vad_results = _self.detect_voice_activity(audio_path)
             
@@ -2627,7 +2607,7 @@ class VideoContentAnalyzer:
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit with enhanced cleanup."""
+        """Context manager exit with cleanup."""
         try:
             with self._lock:
                 self._is_processing = False
@@ -3871,13 +3851,29 @@ class StreamlitInterface:
         """, unsafe_allow_html=True)
 
     @staticmethod
-    @st.cache_data(show_spinner=False)
-    def _create_temp_video_simple(video_bytes: bytes, video_name: str, session_id: str) -> str:
-        """Simple video upload with caching to prevent re-uploads."""
+    def create_temp_video(video_file, session_id: str = None):
+        """Create temporary video file. Returns (path, [path]) or (None, [])."""
+        if not video_file:
+            return None, []
+        
+        session_id = session_id or get_session_manager().generate_session_id()
+        
+        video_key = f"temp_video_{session_id}_{video_file.name}_{getattr(video_file, 'size', 0)}"
+        if video_key in st.session_state and os.path.exists(st.session_state[video_key]):
+            cached_path = st.session_state[video_key]
+            logger.debug(f"Using cached video file: {cached_path}")
+            return cached_path, [cached_path]
+        
+        temp_path = None
         try:
-            video_suffix = Path(video_name).suffix.lower()
-            temp_path = None
+            if hasattr(video_file, 'size') and video_file.size > Config.MAX_FILE_SIZE:
+                st.error(f"File too large: {video_file.size / 1024 / 1024:.1f}MB (max: {Config.MAX_FILE_SIZE / 1024 / 1024:.1f}MB)")
+                return None, []
             
+            video_file.seek(0)
+            video_bytes = video_file.read()
+            
+            video_suffix = Path(video_file.name).suffix.lower()
             with tempfile.NamedTemporaryFile(delete=False, suffix=video_suffix, prefix=f"video_{session_id}_") as tmp:
                 temp_path = tmp.name
                 tmp.write(video_bytes)
@@ -3886,43 +3882,10 @@ class StreamlitInterface:
             
             if not os.path.exists(temp_path):
                 raise RuntimeError("File was not created successfully")
-                
+            
+            st.session_state[video_key] = temp_path
             logger.info(f"Upload completed: {len(video_bytes)} bytes")
-            return temp_path
-            
-        except Exception as e:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
-            raise e
-
-    @staticmethod
-    def create_temp_video(video_file, session_id: str = None):
-        """Create temporary video file with simple caching. Returns (path, [path]) or (None, [])."""
-        if not video_file:
-            return None, []
-        
-        try:
-            if hasattr(video_file, 'size') and video_file.size > Config.MAX_FILE_SIZE:
-                st.error(f"File too large: {video_file.size / 1024 / 1024:.1f}MB (max: {Config.MAX_FILE_SIZE / 1024 / 1024:.1f}MB)")
-                return None, []
-            
-            session_id = session_id or get_session_manager().generate_session_id()
-            
-            video_file.seek(0)
-            video_bytes = video_file.read()
-            
-            temp_path = StreamlitInterface._create_temp_video_simple(
-                video_bytes, video_file.name, session_id
-            )
-            
-            if temp_path:
-                return temp_path, [temp_path]
-            else:
-                st.error("❌ Upload failed. Please try again.")
-                return None, []
+            return temp_path, [temp_path]
                     
         except MemoryError:
             st.error("❌ Insufficient memory to process this video file. Please try with a smaller file.")
@@ -3933,6 +3896,11 @@ class StreamlitInterface:
             st.error(f"Failed to process uploaded video: {str(e)}")
             return None, []
         finally:
+            if temp_path and not os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
             gc.collect()
 
 
@@ -4300,7 +4268,7 @@ class ApplicationRunner:
             
             st.markdown("""
             <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 30px;">
-                <h1 style="color: white; margin: 0; font-size: 2.5rem;">🎥 Gemini Live Video Verifier</h1>
+                <h1 style="color: white; margin: 0; font-size: 2.5rem;">Gemini Live Video Verifier</h1>
                 <p style="color: white; font-size: 1.1rem; margin: 10px 0 0 0; opacity: 0.9;">
                     Multi-modal video analysis tool for content detection, language fluency, and quality assurance validation
                 </p>
@@ -4325,29 +4293,30 @@ class ApplicationRunner:
             with main_content_area:
                 if current_screen == 'input':
                     st.markdown("""
-                    <div style="background: linear-gradient(135deg, #e8f4f8 0%, #f0f9ff 100%); padding: 20px; border-radius: 10px; margin-bottom: 20px; border-left: 4px solid #2196F3;">
-                        <h3 style="color: #1565C0; margin-top: 0; display: flex; align-items: center;">
-                            📖 Analysis Information
+                    <div style="background: linear-gradient(135deg, #334155 0%, #475569 100%); padding: 24px; border-radius: 12px; margin-bottom: 20px; border-left: 4px solid #60a5fa; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); border: 1px solid rgba(96, 165, 250, 0.2);">
+                        <h3 style="color: #e0f2fe; margin-top: 0; margin-bottom: 15px; display: flex; align-items: center; font-size: 1.2em;">
+                            📋 Process
                         </h3>
-                        <div style="display: flex; gap: 20px; margin-top: 15px;">
-                            <div style="flex: 1;">
-                                <p style="margin: 0; color: #333;"><strong>What will be analyzed from your video:</strong></p>
-                                <ul style="margin: 10px 0; color: #333;">
-                                    <li><strong>Text Detection</strong>: Keyword recognition using OCR for "2.5 Flash", "Roaring Tiger", and "Eval Mode: Native Audio Output" to verify proper model and alias usage</li>
-                                    <li><strong>Language Fluency</strong>: Multi-language speech verification ensures the spoken language matches the expected language, with a minimum fluency score required</li>
-                                    <li><strong>Voice Audibility</strong>: Detection of multiple distinct voices to confirm both user and model voices are clearly audible</li>
-                                </ul>
+                        <div style="margin: 0; color: #e2e8f0; line-height: 1.7;">
+                            <div style="margin-bottom: 12px; display: flex; align-items: flex-start; gap: 12px;">
+                                <div style="background: linear-gradient(135deg, #2196F3, #1976D2); color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; flex-shrink: 0; margin-top: 2px;">1</div>
+                                <div>Enter your unique <strong>Question ID</strong> and authorized <strong>Alias Email</strong> address. The system will automatically verify these credentials and infer the target language from your Question ID.</div>
                             </div>
-                            <div style="flex: 1;">
-                                <p style="margin: 0; color: #333;"><strong>Process:</strong></p>
-                                <ol style="margin: 10px 0; color: #333;">
-                                    <li>Input your unique <strong>Question ID</strong> and <strong>Alias Email</strong></li>
-                                    <li>Upload your video file in <strong>MP4</strong> format with a maximum size of <strong>500mb</strong>, a minimum duration of <strong>30 seconds</strong>, and a <strong>portrait mobile resolution</strong></li>
-                                    <li>The system will automatically analyze the video for <strong>text</strong>, <strong>language</strong>, and <strong>audio quality</strong></li>
-                                    <li>View <strong>detailed results</strong> and <strong>quality assurance</strong> checks</li>
-                                    <li>A <strong>Google Drive link</strong> will be provided for you to <strong>submit your video</strong> for further processing</li>
-                                    <li>If any <strong>issues</strong> are detected, you will be prompted to <strong>re-record and upload a new video</strong></li>
-                                </ol>
+                            <div style="margin-bottom: 12px; display: flex; align-items: flex-start; gap: 12px;">
+                                <div style="background: linear-gradient(135deg, #2196F3, #1976D2); color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; flex-shrink: 0; margin-top: 2px;">2</div>
+                                <div>Upload your video file in <strong>MP4 format</strong> with a maximum size of <strong>500MB</strong>, minimum duration of <strong>30 seconds</strong>, and <strong>portrait mobile resolution</strong>. The system will validate these requirements before proceeding.</div>
+                            </div>
+                            <div style="margin-bottom: 12px; display: flex; align-items: flex-start; gap: 12px;">
+                                <div style="background: linear-gradient(135deg, #2196F3, #1976D2); color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; flex-shrink: 0; margin-top: 2px;">3</div>
+                                <div>The system will automatically analyze your video for <strong>text detection</strong>, <strong>language fluency verification</strong>, and <strong>voice audibility quality</strong> to ensure all requirements are met.</div>
+                            </div>
+                            <div style="margin-bottom: 12px; display: flex; align-items: flex-start; gap: 12px;">
+                                <div style="background: linear-gradient(135deg, #2196F3, #1976D2); color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; flex-shrink: 0; margin-top: 2px;">4</div>
+                                <div>Review the comprehensive <strong>analysis results</strong> and <strong>quality assurance checks</strong>. The system will indicate whether your video passes all requirements or if any issues need to be addressed.</div>
+                            </div>
+                            <div style="margin-bottom: 12px; display: flex; align-items: flex-start; gap: 12px;">
+                                <div style="background: linear-gradient(135deg, #2196F3, #1976D2); color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; flex-shrink: 0; margin-top: 2px;">5</div>
+                                <div>If your video passes all checks, you'll receive a <strong>Google Drive folder link</strong> where you can upload your video for final submission and processing.</div>
                             </div>
                         </div>
                     </div>
@@ -4385,7 +4354,7 @@ class ApplicationRunner:
         with st.sidebar:
             st.markdown("""
             <div style="text-align: center; padding: 10px; margin-bottom: 20px;">
-                <h2 style="color: #1f77b4; margin: 0;">🎥 Gemini Live Video Verifier</h2>
+                <h2 style="color: #1f77b4; margin: 0;">Gemini Live Video Verifier</h2>
                 <p style="color: #666; margin: 5px 0 0 0; font-size: 0.9em;">Multi-Modal Analysis Tool</p>
             </div>
             """, unsafe_allow_html=True)
@@ -4395,7 +4364,9 @@ class ApplicationRunner:
             st.divider()
             
             ApplicationRunner._render_sidebar_session_info()
-    
+
+            st.logo("assets/inv_logo.jpg", size="large")
+
     @staticmethod
     @st.cache_data(show_spinner=False)
     def _render_sidebar_help():
