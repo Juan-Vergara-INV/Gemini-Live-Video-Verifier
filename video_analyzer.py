@@ -466,6 +466,8 @@ class ScreenManager:
             st.session_state.feedback_submitted = False
         if 'feedback_issues' not in st.session_state:
             st.session_state.feedback_issues = []
+        if 'feedback_processed' not in st.session_state:
+            st.session_state.feedback_processed = False
         
         if 'session_id' not in st.session_state:
             st.session_state.session_id = get_session_manager().generate_session_id()
@@ -723,7 +725,8 @@ class InputScreen:
             'validation_error_shown': False,
             'feedback_rating': None,
             'feedback_submitted': False,
-            'feedback_issues': []
+            'feedback_issues': [],
+            'feedback_processed': False
         })
 
     @staticmethod
@@ -1086,12 +1089,58 @@ class AnalysisScreen:
             if st.button("🔄 New Analysis", use_container_width=True):
                 AnalysisScreen._cleanup_and_reset_for_new_analysis()
         with col2:
-            if st.button("Submit Video", type="primary", use_container_width=True, disabled=not submit_enabled):
-                if submit_enabled:
+            if submit_enabled:
+                if st.button("Submit Video", type="primary", use_container_width=True):
                     ScreenManager.navigate_to_screen('qa')
+            else:
+                feedback_processed = st.session_state.get('feedback_processed', False)
+                button_text = "✅ Feedback Submitted" if feedback_processed else "📝 Submit Feedback"
+                if st.button(button_text, type="primary", use_container_width=True, disabled=feedback_processed):
+                    if not feedback_processed:
+                        AnalysisScreen._handle_submit_feedback()
                     
         if not submit_enabled and submit_message:
             st.warning(f"⚠️ {submit_message}")
+
+    @staticmethod
+    def _handle_submit_feedback():
+        """Handle the submission of feedback when QA checks fail."""
+        try:
+            question_id = st.session_state.get('question_id', '')
+            alias_email = st.session_state.get('alias_email', '')
+            session_id = st.session_state.get('session_id', '')
+            feedback_rating = st.session_state.get('feedback_rating')
+            feedback_issues = st.session_state.get('feedback_issues', [])
+            qa_checker = st.session_state.get('qa_checker')
+            
+            if feedback_rating is None:
+                st.error("❌ Please provide feedback rating before submitting.")
+                return
+            
+            feedback_exporter = FeedbackExporter()
+            export_success = feedback_exporter.export_feedback(
+                question_id=question_id,
+                alias_email=alias_email,
+                session_id=session_id,
+                feedback_rating=feedback_rating,
+                feedback_issues=feedback_issues,
+                qa_results=qa_checker
+            )
+            
+            if export_success:
+                logger.info(f"Feedback submitted successfully for {question_id}")
+                
+                st.session_state.feedback_processed = True
+                
+                time.sleep(2)
+                st.rerun()
+            else:
+                st.error("❌ Failed to submit feedback. Please try again.")
+                logger.error(f"Failed to export feedback for {question_id}")
+                
+        except Exception as e:
+            st.error(f"❌ An error occurred while submitting feedback: {str(e)}")
+            logger.error(f"Error handling feedback submission: {e}")
 
     @staticmethod
     def _cleanup_and_reset_for_new_analysis():
