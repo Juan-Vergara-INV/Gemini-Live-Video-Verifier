@@ -428,6 +428,33 @@ def get_session_manager() -> SessionManager:
     return _session_manager
 
 
+class AdminAuth:
+    """Admin authentication management."""
+    
+    ADMIN_EMAIL = "juan.vergara@invisible.email"
+    
+    @staticmethod
+    def is_admin_authenticated() -> bool:
+        """Check if current user is authenticated admin."""
+        return st.session_state.get('admin_authenticated', False) and \
+               st.session_state.get('admin_email', '').lower() == AdminAuth.ADMIN_EMAIL.lower()
+    
+    @staticmethod
+    def authenticate_admin(email: str) -> bool:
+        """Authenticate admin user."""
+        if email.lower().strip() == AdminAuth.ADMIN_EMAIL.lower():
+            st.session_state.admin_authenticated = True
+            st.session_state.admin_email = email.lower().strip()
+            return True
+        return False
+    
+    @staticmethod
+    def logout_admin():
+        """Logout admin user."""
+        st.session_state.admin_authenticated = False
+        st.session_state.admin_email = ""
+
+
 class ScreenManager:
     """Screen interface state management."""
     
@@ -468,6 +495,14 @@ class ScreenManager:
             st.session_state.feedback_issues = []
         if 'feedback_processed' not in st.session_state:
             st.session_state.feedback_processed = False
+        if 'submission_locked' not in st.session_state:
+            st.session_state.submission_locked = False
+        
+        # Admin state
+        if 'admin_authenticated' not in st.session_state:
+            st.session_state.admin_authenticated = False
+        if 'admin_email' not in st.session_state:
+            st.session_state.admin_email = ""
         
         if 'session_id' not in st.session_state:
             st.session_state.session_id = get_session_manager().generate_session_id()
@@ -495,6 +530,44 @@ class ScreenManager:
         st.rerun()
     
     @staticmethod
+    def clear_user_inputs_for_admin():
+        """Clear user input state when navigating to admin dashboard."""
+        # Clear user inputs but preserve admin state and session id
+        user_input_keys = [
+            'question_id', 'alias_email', 'video_file', 'selected_language',
+            'task_type', 'frame_interval', 'analysis_results', 'analyzer_instance',
+            'qa_checker', 'analysis_in_progress', 'analysis_started',
+            'validation_error_shown', 'feedback_rating', 'feedback_submitted',
+            'feedback_issues', 'feedback_processed', 'submission_locked'
+        ]
+        
+        for key in user_input_keys:
+            if key in st.session_state:
+                try:
+                    del st.session_state[key]
+                except:
+                    pass
+        
+        # Reinitialize user input defaults
+        st.session_state.question_id = ""
+        st.session_state.alias_email = ""
+        st.session_state.video_file = None
+        st.session_state.selected_language = ""
+        st.session_state.task_type = ""
+        st.session_state.frame_interval = Config.DEFAULT_FRAME_INTERVAL
+        st.session_state.analysis_results = None
+        st.session_state.analyzer_instance = None
+        st.session_state.qa_checker = None
+        st.session_state.analysis_in_progress = False
+        st.session_state.analysis_started = False
+        st.session_state.validation_error_shown = False
+        st.session_state.feedback_rating = None
+        st.session_state.feedback_submitted = False
+        st.session_state.feedback_issues = []
+        st.session_state.feedback_processed = False
+        st.session_state.submission_locked = False
+    
+    @staticmethod
     def get_current_screen() -> str:
         """Get the current screen."""
         return st.session_state.get('current_screen', 'input')
@@ -508,6 +581,351 @@ class ScreenManager:
                 get_session_manager().cleanup_session(current_session_id)
         except Exception as e:
             logger.error(f"Session cleanup error: {e}")
+    
+    @staticmethod
+    def clear_admin_state_for_user():
+        """Clear admin authentication when returning to user workflow."""
+        st.session_state.admin_authenticated = False
+        st.session_state.admin_email = ""
+    
+    @staticmethod
+    def ensure_session_consistency():
+        """Ensure session state is consistent and clean up orphaned sessions."""
+        try:
+            # Check if current session still exists
+            current_session_id = st.session_state.get('session_id')
+            if current_session_id:
+                session_manager = get_session_manager()
+                active_sessions = session_manager.get_active_sessions()
+                
+                # If session doesn't exist in active sessions, clear submission lock
+                if current_session_id not in active_sessions:
+                    if st.session_state.get('submission_locked', False):
+                        st.session_state.submission_locked = False
+                        logger.info(f"Cleared submission lock for orphaned session: {current_session_id}")
+                        
+        except Exception as e:
+            logger.error(f"Session consistency check error: {e}")
+
+
+class AdminDashboard:
+    """Admin dashboard for system metrics and management."""
+    
+    def __init__(self):
+        self.metrics_collector = AdminMetricsCollector()
+    
+    @staticmethod
+    def render():
+        """Render the admin dashboard screen."""
+        if not AdminAuth.is_admin_authenticated():
+            AdminDashboard._render_admin_login()
+            return
+        
+        AdminDashboard._render_authenticated_dashboard()
+    
+    @staticmethod
+    def _render_admin_login():
+        """Render admin login form."""
+        st.title("🔐 Admin Dashboard Login")
+        st.divider()
+        
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #334155 0%, #475569 100%); padding: 24px; border-radius: 12px; margin-bottom: 20px; border-left: 4px solid #ef4444; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);">
+            <h3 style="color: #fef2f2; margin-top: 0; margin-bottom: 15px; display: flex; align-items: center; font-size: 1.2em;">
+                🚨 Restricted Access
+            </h3>
+            <p style="margin: 0; color: #fecaca; line-height: 1.6;">
+                This admin dashboard contains sensitive system metrics and user data. 
+                Access is restricted to authorized administrators only.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        with st.form("admin_login_form"):
+            st.subheader("Administrator Authentication")
+            
+            admin_email = st.text_input(
+                "Admin Email Address",
+                placeholder="Enter your authorized admin email address",
+                help="Only specific email addresses have admin access to this dashboard"
+            )
+            
+            submitted = st.form_submit_button("🔓 Access Dashboard", type="primary", use_container_width=True)
+            
+            if submitted:
+                if admin_email:
+                    if AdminAuth.authenticate_admin(admin_email):
+                        st.success(f"✅ Welcome, Admin! Redirecting to dashboard...")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Access denied. Email '{admin_email}' is not authorized for admin access.")
+                        st.warning("Only specific email addresses have admin privileges. Please contact the system administrator if you believe this is an error.")
+                else:
+                    st.error("❌ Please enter your email address.")
+        
+        # Back to main app button
+        st.divider()
+        if st.button("⬅️ Back to Video Analyzer", use_container_width=True):
+            ScreenManager.navigate_to_screen('input')
+    
+    @staticmethod
+    def _render_authenticated_dashboard():
+        """Render the authenticated admin dashboard."""
+        dashboard = AdminDashboard()
+        
+        # Header with logout
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.title("📊 Admin Dashboard")
+            st.caption(f"Logged in as: {st.session_state.admin_email}")
+        with col2:
+            if st.button("🔓 Logout", type="secondary"):
+                AdminAuth.logout_admin()
+                st.rerun()
+        
+        st.divider()
+        
+        # Refresh button and last update
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("🔄 Refresh Data", type="secondary"):
+                # Clear cache to force refresh
+                AdminMetricsCollector._read_sheet_data.clear()
+                st.rerun()
+        
+        # Load metrics
+        with st.spinner("Loading dashboard metrics..."):
+            feedback_metrics = dashboard.metrics_collector.get_user_feedback_metrics()
+            analysis_metrics = dashboard.metrics_collector.get_video_analysis_metrics()
+            system_metrics = dashboard.metrics_collector.get_system_performance_metrics()
+        
+        # Summary cards
+        AdminDashboard._render_summary_cards(feedback_metrics, analysis_metrics, system_metrics)
+        
+        # Detailed sections
+        tab1, tab2, tab3 = st.tabs(["📈 Analysis Metrics", "💭 User Feedback", "🔧 System Status"])
+        
+        with tab1:
+            AdminDashboard._render_analysis_metrics(analysis_metrics)
+        
+        with tab2:
+            AdminDashboard._render_feedback_metrics(feedback_metrics)
+        
+        with tab3:
+            AdminDashboard._render_system_metrics(system_metrics)
+        
+        # Navigation
+        st.divider()
+        if st.button("⬅️ Back to Video Analyzer", use_container_width=True):
+            ScreenManager.clear_admin_state_for_user()
+            ScreenManager.navigate_to_screen('input')
+    
+    @staticmethod
+    def _render_summary_cards(feedback_metrics, analysis_metrics, system_metrics):
+        """Render summary metric cards."""
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #e8f5e8 0%, #f0f8f0 100%); padding: 20px; border-radius: 10px; border-left: 4px solid #4CAF50; text-align: center;">
+                <h3 style="margin: 0; color: #2e7d32; font-size: 2rem;">{analysis_metrics.get('total_submissions', 0)}</h3>
+                <p style="margin: 5px 0 0 0; color: #333; font-weight: 500;">Total Videos</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            qa_pass_rate = analysis_metrics.get('qa_pass_rate', 0)
+            color = "#4CAF50" if qa_pass_rate >= 80 else "#FF9800" if qa_pass_rate >= 60 else "#f44336"
+            bg_color = "#e8f5e8" if qa_pass_rate >= 80 else "#fff3e0" if qa_pass_rate >= 60 else "#ffebee"
+            
+            st.markdown(f"""
+            <div style="background: {bg_color}; padding: 20px; border-radius: 10px; border-left: 4px solid {color}; text-align: center;">
+                <h3 style="margin: 0; color: {color}; font-size: 2rem;">{qa_pass_rate:.1f}%</h3>
+                <p style="margin: 5px 0 0 0; color: #333; font-weight: 500;">QA Pass Rate</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            positive_rate = feedback_metrics.get('positive_rate', 0)
+            color = "#4CAF50" if positive_rate >= 80 else "#FF9800" if positive_rate >= 60 else "#f44336"
+            bg_color = "#e8f5e8" if positive_rate >= 80 else "#fff3e0" if positive_rate >= 60 else "#ffebee"
+            
+            st.markdown(f"""
+            <div style="background: {bg_color}; padding: 20px; border-radius: 10px; border-left: 4px solid {color}; text-align: center;">
+                <h3 style="margin: 0; color: {color}; font-size: 2rem;">{positive_rate:.1f}%</h3>
+                <p style="margin: 5px 0 0 0; color: #333; font-weight: 500;">Positive Feedback</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            active_sessions = system_metrics.get('active_sessions', 0)
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #e3f2fd 0%, #f0f8ff 100%); padding: 20px; border-radius: 10px; border-left: 4px solid #2196F3; text-align: center;">
+                <h3 style="margin: 0; color: #1565C0; font-size: 2rem;">{active_sessions}</h3>
+                <p style="margin: 5px 0 0 0; color: #333; font-weight: 500;">Active Sessions</p>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    @staticmethod
+    def _render_analysis_metrics(analysis_metrics):
+        """Render detailed analysis metrics."""
+        st.subheader("📊 Video Analysis Performance")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**QA Check Performance**")
+            detection_rates = analysis_metrics.get('detection_rates', {})
+            
+            # Create a simple bar chart using text
+            for check_name, rate in detection_rates.items():
+                check_display = {
+                    'flash_detected': '2.5 Flash Detection',
+                    'alias_detected': 'Alias Name Detection', 
+                    'eval_detected': 'Eval Mode Detection',
+                    'language_passed': 'Language Fluency',
+                    'voice_passed': 'Voice Audibility'
+                }.get(check_name, check_name)
+                
+                color = "#4CAF50" if rate >= 80 else "#FF9800" if rate >= 60 else "#f44336"
+                
+                st.markdown(f"""
+                <div style="margin: 10px 0;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                        <span style="font-weight: 500;">{check_display}</span>
+                        <span style="color: {color}; font-weight: bold;">{rate:.1f}%</span>
+                    </div>
+                    <div style="background: #f0f0f0; height: 8px; border-radius: 4px;">
+                        <div style="background: {color}; height: 8px; width: {rate}%; border-radius: 4px;"></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("**Language Distribution**")
+            language_dist = analysis_metrics.get('language_distribution', {})
+            
+            if language_dist:
+                # Sort languages by count
+                sorted_languages = sorted(language_dist.items(), key=lambda x: x[1], reverse=True)[:10]
+                
+                total_count = sum(language_dist.values())
+                
+                for lang, count in sorted_languages:
+                    percentage = (count / total_count * 100) if total_count > 0 else 0
+                    
+                    st.markdown(f"""
+                    <div style="margin: 8px 0; padding: 8px; background: #f8f9fa; border-radius: 6px;">
+                        <div style="display: flex; justify-content: space-between;">
+                            <span style="font-weight: 500;">{lang}</span>
+                            <span style="color: #666;">{count} ({percentage:.1f}%)</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No language data available yet.")
+        
+        # Summary stats
+        st.markdown("**Submission Summary**")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Total Submissions", analysis_metrics.get('total_submissions', 0))
+        with col2:
+            st.metric("Eligible Submissions", analysis_metrics.get('eligible_submissions', 0))
+        with col3:
+            st.metric("QA Pass Rate", f"{analysis_metrics.get('qa_pass_rate', 0):.1f}%")
+    
+    @staticmethod
+    def _render_feedback_metrics(feedback_metrics):
+        """Render user feedback metrics."""
+        st.subheader("💭 User Feedback Analysis")
+        
+        if feedback_metrics.get('total_feedback', 0) == 0:
+            st.info("No user feedback data available yet.")
+            return
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Feedback Overview**")
+            
+            total = feedback_metrics.get('total_feedback', 0)
+            positive = feedback_metrics.get('positive_feedback', 0)
+            negative = feedback_metrics.get('negative_feedback', 0)
+            positive_rate = feedback_metrics.get('positive_rate', 0)
+            
+            st.metric("Total Feedback", total)
+            st.metric("Positive Feedback", f"{positive} ({positive_rate:.1f}%)")
+            st.metric("Negative Feedback", f"{negative} ({100 - positive_rate:.1f}%)")
+        
+        with col2:
+            st.markdown("**Common Issues**")
+            
+            common_issues = feedback_metrics.get('common_issues', {})
+            if common_issues:
+                total_feedback = feedback_metrics.get('total_feedback', 1)  # Avoid division by zero
+                for issue, count in common_issues:
+                    percentage = (count / total_feedback * 100)
+                    
+                    issue_display = {
+                        'flash_presence': '2.5 Flash Detection Issues',
+                        'alias_name_presence': 'Alias Name Detection Issues',
+                        'eval_mode_presence': 'Eval Mode Detection Issues',
+                        'language_fluency': 'Language Fluency Issues',
+                        'voice_audibility': 'Voice Audibility Issues'
+                    }.get(issue, issue)
+                    
+                    st.markdown(f"""
+                    <div style="margin: 8px 0; padding: 8px; background: #fff3cd; border-radius: 6px; border-left: 3px solid #ffc107;">
+                        <div style="display: flex; justify-content: space-between;">
+                            <span style="font-weight: 500;">{issue_display}</span>
+                            <span style="color: #856404;">{count} ({percentage:.1f}%)</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No specific issues reported.")
+    
+    @staticmethod 
+    def _render_system_metrics(system_metrics):
+        """Render system status and performance metrics."""
+        st.subheader("🔧 System Status")
+        
+        status = system_metrics.get('system_status', 'Unknown')
+        status_color = "#4CAF50" if status == "Operational" else "#f44336"
+        
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #e8f5e8 0%, #f0f8f0 100%); padding: 20px; border-radius: 10px; border-left: 4px solid {status_color}; margin-bottom: 20px;">
+            <h4 style="margin: 0 0 10px 0; color: #2e7d32;">System Status: <span style="color: {status_color};">{status}</span></h4>
+            <p style="margin: 5px 0; color: #333;"><strong>Active Sessions:</strong> {system_metrics.get('active_sessions', 0)}</p>
+            <p style="margin: 5px 0; color: #333;"><strong>Last Updated:</strong> {system_metrics.get('last_updated', 'Unknown')}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Basic system information
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Current Session Info**")
+            current_sessions = system_metrics.get('active_sessions', 0)
+            
+            if current_sessions > 0:
+                st.success(f"✅ {current_sessions} active session(s)")
+            else:
+                st.info("ℹ️ No active sessions")
+        
+        with col2:
+            st.markdown("**Performance Notes**")
+            st.markdown("""
+            - System monitoring is basic
+            - Session management is operational
+            - Google Sheets integration active
+            - File cleanup running automatically
+            """)
+    
+
 
 
 class InputScreen:
@@ -1533,6 +1951,240 @@ class GoogleSheetsResultsExporter(BaseGoogleSheetsExporter):
         
         return " | ".join(debug_parts)
     
+
+class AdminMetricsCollector:
+    """Collect and analyze metrics for admin dashboard."""
+    
+    def __init__(self):
+        self.service = GoogleSheetsService.get_sheets_service()
+        config = ConfigurationManager.get_secure_config()
+        self.spreadsheet_id = config.get("verifier_sheet_id")
+    
+    @st.cache_data(ttl=300, show_spinner=False)  # Cache for 5 minutes
+    def _read_sheet_data(_self, sheet_name: str) -> List[List[str]]:
+        """Read data from a specific sheet."""
+        if not _self.service or not _self.spreadsheet_id:
+            return []
+        
+        try:
+            range_name = f"{sheet_name}!A:Z"
+            result = _self.service.spreadsheets().values().get(
+                spreadsheetId=_self.spreadsheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            return values
+            
+        except Exception as e:
+            logger.error(f"Error reading sheet {sheet_name}: {e}")
+            return []
+    
+    def get_user_feedback_metrics(self) -> Dict[str, Any]:
+        """Get user feedback analysis metrics."""
+        try:
+            feedback_data = self._read_sheet_data("User Feedback")
+            
+            if len(feedback_data) <= 1:  # Only header or empty
+                return {
+                    'total_feedback': 0,
+                    'positive_feedback': 0,
+                    'negative_feedback': 0,
+                    'positive_rate': 0.0,
+                    'common_issues': [],
+                    'recent_feedback': []
+                }
+            
+            # Skip header row
+            feedback_rows = feedback_data[1:]
+            
+            total_feedback = len(feedback_rows)
+            positive_feedback = 0
+            negative_feedback = 0
+            issue_counts = {}
+            recent_feedback = []
+            
+            for row in feedback_rows:
+                if len(row) >= 6:  # Ensure enough columns
+                    try:
+                        timestamp = row[0]
+                        feedback_rating = int(row[4]) if row[4].isdigit() else 0
+                        feedback_text = row[5] if len(row) > 5 else ""
+                        issues = row[6] if len(row) > 6 else ""
+                        
+                        if feedback_rating == 1:
+                            positive_feedback += 1
+                        elif feedback_rating == 0:
+                            negative_feedback += 1
+                        
+                        # Count issues
+                        if issues and issues != "None":
+                            for issue in issues.split(", "):
+                                issue = issue.strip()
+                                if issue:
+                                    issue_counts[issue] = issue_counts.get(issue, 0) + 1
+                        
+                        # Collect recent feedback (last 10)
+                        if len(recent_feedback) < 10:
+                            recent_feedback.append({
+                                'timestamp': timestamp,
+                                'rating': feedback_text,
+                                'issues': issues
+                            })
+                            
+                    except (ValueError, IndexError):
+                        continue
+            
+            positive_rate = (positive_feedback / total_feedback * 100) if total_feedback > 0 else 0
+            
+            # Sort issues by frequency
+            common_issues = sorted(issue_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            
+            return {
+                'total_feedback': total_feedback,
+                'positive_feedback': positive_feedback,
+                'negative_feedback': negative_feedback,
+                'positive_rate': positive_rate,
+                'common_issues': common_issues,
+                'recent_feedback': recent_feedback
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting user feedback metrics: {e}")
+            return {
+                'total_feedback': 0,
+                'positive_feedback': 0,
+                'negative_feedback': 0,
+                'positive_rate': 0.0,
+                'common_issues': [],
+                'recent_feedback': []
+            }
+    
+    def get_video_analysis_metrics(self) -> Dict[str, Any]:
+        """Get video analysis results metrics."""
+        try:
+            analysis_data = self._read_sheet_data("Video Analysis Results")
+            
+            if len(analysis_data) <= 1:  # Only header or empty
+                return {
+                    'total_submissions': 0,
+                    'qa_pass_rate': 0.0,
+                    'language_distribution': {},
+                    'detection_rates': {},
+                    'recent_submissions': []
+                }
+            
+            # Skip header row
+            analysis_rows = analysis_data[1:]
+            
+            total_submissions = len(analysis_rows)
+            passed_qa = 0
+            language_counts = {}
+            detection_stats = {
+                'flash_detected': 0,
+                'alias_detected': 0,
+                'eval_detected': 0,
+                'language_passed': 0,
+                'voice_passed': 0
+            }
+            recent_submissions = []
+            
+            for row in analysis_rows:
+                if len(row) >= 20:  # Ensure enough columns
+                    try:
+                        timestamp = row[0]
+                        question_id = row[1]
+                        submission_status = row[20] if len(row) > 20 else ""
+                        
+                        if submission_status == "ELIGIBLE":
+                            passed_qa += 1
+                        
+                        # Language distribution
+                        detected_language = row[15] if len(row) > 15 else ""
+                        if detected_language and detected_language != "Unknown":
+                            language_counts[detected_language] = language_counts.get(detected_language, 0) + 1
+                        
+                        # Detection rates
+                        flash_status = row[4] if len(row) > 4 else ""
+                        alias_status = row[7] if len(row) > 7 else ""
+                        eval_status = row[10] if len(row) > 10 else ""
+                        language_status = row[13] if len(row) > 13 else ""
+                        voice_status = row[17] if len(row) > 17 else ""
+                        
+                        if flash_status == "PASS":
+                            detection_stats['flash_detected'] += 1
+                        if alias_status == "PASS":
+                            detection_stats['alias_detected'] += 1
+                        if eval_status == "PASS":
+                            detection_stats['eval_detected'] += 1
+                        if language_status == "PASS":
+                            detection_stats['language_passed'] += 1
+                        if voice_status == "PASS":
+                            detection_stats['voice_passed'] += 1
+                        
+                        # Recent submissions
+                        if len(recent_submissions) < 10:
+                            recent_submissions.append({
+                                'timestamp': timestamp,
+                                'question_id': question_id,
+                                'status': submission_status,
+                                'language': detected_language
+                            })
+                            
+                    except (ValueError, IndexError):
+                        continue
+            
+            qa_pass_rate = (passed_qa / total_submissions * 100) if total_submissions > 0 else 0
+            
+            # Calculate detection rates as percentages
+            detection_rates = {}
+            for key, count in detection_stats.items():
+                detection_rates[key] = (count / total_submissions * 100) if total_submissions > 0 else 0
+            
+            return {
+                'total_submissions': total_submissions,
+                'qa_pass_rate': qa_pass_rate,
+                'eligible_submissions': passed_qa,
+                'language_distribution': language_counts,
+                'detection_rates': detection_rates,
+                'recent_submissions': recent_submissions
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting video analysis metrics: {e}")
+            return {
+                'total_submissions': 0,
+                'qa_pass_rate': 0.0,
+                'eligible_submissions': 0,
+                'language_distribution': {},
+                'detection_rates': {},
+                'recent_submissions': []
+            }
+    
+    def get_system_performance_metrics(self) -> Dict[str, Any]:
+        """Get system performance and usage metrics."""
+        try:
+            # Get current session stats
+            session_manager = get_session_manager()
+            active_sessions = session_manager.get_active_sessions()
+            
+            # Basic system metrics
+            return {
+                'active_sessions': len(active_sessions),
+                'total_active_sessions': len(active_sessions),
+                'system_status': 'Operational',
+                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting system performance metrics: {e}")
+            return {
+                'active_sessions': 0,
+                'total_active_sessions': 0,
+                'system_status': 'Unknown',
+                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+            }
+
 
 class FeedbackExporter(BaseGoogleSheetsExporter):
     """Export user feedback on analysis quality to Google Sheets."""
@@ -4312,6 +4964,7 @@ class ApplicationRunner:
         try:
             StreamlitInterface.setup_page()
             ScreenManager.initialize_session_state()
+            ScreenManager.ensure_session_consistency()
             
             ApplicationRunner._render_sidebar()
             
@@ -4326,14 +4979,19 @@ class ApplicationRunner:
             
             StreamlitInterface.render_progress_indicator()
 
-            if st.session_state.get('submission_locked', False):
-                st.markdown("""
-                <div style="background-color: #fff8dc; padding: 15px; border-radius: 8px; margin: 20px 0; border: 1px solid #f0e68c;">
-                    <p style="color: #b8860b; margin: 0; font-size: 16px; text-align: center;">
-                        🔒 This session is now locked. Start a new session for another video analysis.
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
+            if st.session_state.get('submission_locked', False) and ScreenManager.get_current_screen() != 'admin':
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.markdown("""
+                    <div style="background-color: #fff8dc; padding: 15px; border-radius: 8px; margin: 20px 0; border: 1px solid #f0e68c;">
+                        <p style="color: #b8860b; margin: 0; font-size: 16px; text-align: center;">
+                            🔒 This session is now locked. Start a new session for another video analysis.
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with col2:
+                    if st.button("🔄 New Session", use_container_width=True, help="Start a fresh session"):
+                        ScreenManager.reset_session_for_new_analysis()
             
             current_screen = ScreenManager.get_current_screen()
             
@@ -4383,6 +5041,9 @@ class ApplicationRunner:
                 elif current_screen == 'qa':
                     main_content_area.empty()
                     VideoSubmissionScreen.render()
+                elif current_screen == 'admin':
+                    main_content_area.empty()
+                    AdminDashboard.render()
                 else:
                     ScreenManager.navigate_to_screen('input')
             
@@ -4413,6 +5074,12 @@ class ApplicationRunner:
             st.divider()
             
             ApplicationRunner._render_sidebar_session_info()
+            
+            # Admin access link
+            st.divider()
+            if st.button("🔐 Admin Dashboard", use_container_width=True, help="Admin access for system metrics"):
+                ScreenManager.clear_user_inputs_for_admin()
+                ScreenManager.navigate_to_screen('admin')
 
             st.logo("assets/inv_logo.jpg", size="large")
 
